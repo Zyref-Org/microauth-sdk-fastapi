@@ -15,7 +15,7 @@ from .exceptions import (
 from .models import Customer
 from .sdk import MicroAuth
 
-__version__ = "0.1.0"
+__version__ = "2.0.0"
 
 __all__ = [
     "MicroAuth",

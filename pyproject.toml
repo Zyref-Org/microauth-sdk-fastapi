@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "microauth-fastapi"
-version = "0.1.0"
+version = "2.0.0"
 description = "MicroAuth SDK for FastAPI - API key auth, rate limiting and metered billing in one dependency"
 readme = "README.md"
 license = "MIT"
@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 authors = [{ name = "Zyref, LLC" }]
 keywords = ["fastapi", "api-keys", "authentication", "billing", "rate-limiting", "microauth"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Framework :: FastAPI",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
