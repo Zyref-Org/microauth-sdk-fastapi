@@ -22,10 +22,17 @@ jobs:
             exit 1
           fi
 
-      - name: Build sdist and wheel
+      - name: Test release source
         run: |
-          python -m pip install --quiet build
-          python -m build
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check -e ".[dev,redis]"
+          python -m pytest
+          python -m ruff check .
+          python -m mypy microauth_fastapi
+          python -m pip_audit
+
+      - name: Build sdist and wheel
+        run: python -m build
 
       - uses: actions/upload-artifact@v4
         with:

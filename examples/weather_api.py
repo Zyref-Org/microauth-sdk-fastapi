@@ -66,4 +66,6 @@ async def account(customer: Customer = Security(auth)):
         "credit_balance_usd": customer.credit_balance_micro / 1_000_000,
         "rps": customer.rps,
         "monthly_quota": customer.monthly_quota,
+        "platform_monthly_limit": customer.platform_monthly_limit,
+        "platform_monthly_remaining": customer.platform_monthly_remaining,
     }

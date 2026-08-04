@@ -6,28 +6,53 @@ from .exceptions import (
     AuthUnavailable,
     CustomerSuspended,
     InvalidAPIKey,
+    LimitBackendUnavailable,
     MicroAuthAPIError,
+    MicroAuthAuthorizationError,
+    MicroAuthConfigurationError,
     MicroAuthError,
+    MicroAuthResponseError,
     PaymentRequired,
+    PlatformAllowanceExceeded,
     QuotaExceeded,
     RateLimited,
+    SnapshotValidationError,
+    UsageAcknowledgementError,
+    UsageDrainError,
+    UsageItemRejected,
+    UsageQueueFull,
+    UsageReportingError,
+    UsageStoreError,
 )
-from .models import Customer
+from .models import Customer, PlatformMonthlyAllowance
 from .sdk import MicroAuth
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 __all__ = [
-    "MicroAuth",
-    "Customer",
     "AuthDenied",
     "AuthUnavailable",
+    "Customer",
     "CustomerSuspended",
     "InvalidAPIKey",
+    "LimitBackendUnavailable",
+    "MicroAuth",
     "MicroAuthAPIError",
+    "MicroAuthAuthorizationError",
+    "MicroAuthConfigurationError",
     "MicroAuthError",
+    "MicroAuthResponseError",
     "PaymentRequired",
+    "PlatformAllowanceExceeded",
+    "PlatformMonthlyAllowance",
     "QuotaExceeded",
     "RateLimited",
+    "SnapshotValidationError",
+    "UsageAcknowledgementError",
+    "UsageDrainError",
+    "UsageItemRejected",
+    "UsageQueueFull",
+    "UsageReportingError",
+    "UsageStoreError",
     "__version__",
 ]

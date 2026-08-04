@@ -10,18 +10,17 @@ Exit code 0 = all assertions passed.
 """
 
 import asyncio
-import hashlib
 import os
 import sys
 import time
 
 import httpx
 
-APP = os.environ["APP_URL"].rstrip("/")
-MA = os.environ["MICROAUTH_BASE_URL"].rstrip("/")
-SECRET = os.environ["MICROAUTH_SECRET_KEY"]
-API_KEY = os.environ["TEST_API_KEY"]
-EXPECT_RPS = int(os.environ.get("EXPECT_RPS", "25"))
+APP = ""
+MA = ""
+SECRET = ""
+API_KEY = ""
+EXPECT_RPS = 25
 
 PASS = 0
 
@@ -45,6 +44,13 @@ async def month_requests(client: httpx.AsyncClient, customer_id: str) -> int:
 
 
 async def main() -> None:
+    global APP, MA, SECRET, API_KEY, EXPECT_RPS
+    APP = os.environ["APP_URL"].rstrip("/")
+    MA = os.environ["MICROAUTH_BASE_URL"].rstrip("/")
+    SECRET = os.environ["MICROAUTH_SECRET_KEY"]
+    API_KEY = os.environ["TEST_API_KEY"]
+    EXPECT_RPS = int(os.environ.get("EXPECT_RPS", "25"))
+
     async with httpx.AsyncClient(timeout=10) as c:
         # --- basics ---
         r = await c.get(f"{APP}/public")
@@ -87,7 +93,7 @@ async def main() -> None:
         retry = next((r for r in results if r.status_code == 429), None)
         ok("429 carries Retry-After", retry is not None and "retry-after" in retry.headers)
 
-        # --- billing: 200s billable, 404s not ---
+        # --- usage: every status counts, only configured statuses charge ---
         await asyncio.sleep(4)  # let the reporter flush the burst
         base = await month_requests(c, customer_id)
 
@@ -104,9 +110,9 @@ async def main() -> None:
         while time.time() < deadline:
             await asyncio.sleep(1.5)
             delta = await month_requests(c, customer_id) - base
-            if delta >= 5:
+            if delta >= 8:
                 break
-        ok("exactly the 5 billable requests were reported", delta == 5, f"delta={delta}")
+        ok("all 8 authenticated requests were reported", delta == 8, f"delta={delta}")
 
         # --- brand-new key resolves on demand (not in the cached snapshot) ---
         new_key = os.environ.get("FRESH_API_KEY")
@@ -117,4 +123,5 @@ async def main() -> None:
     print(f"\nAll {PASS} assertions passed.")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
