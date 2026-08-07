@@ -675,6 +675,12 @@ class RedisLimiter:
         self._prefix = key_prefix.rstrip(":")
         self._down_until = 0.0
 
+    @property
+    def redis_client(self) -> Any:
+        """Return the client shared with other SDK coordination primitives."""
+
+        return self._redis
+
     async def allow(self, customer_id: str, credential_id: str, rps: int) -> bool:
         if rps <= 0:
             return True

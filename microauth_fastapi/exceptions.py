@@ -38,6 +38,10 @@ class SnapshotValidationError(MicroAuthResponseError):
     """A snapshot failed schema or range validation."""
 
 
+class SnapshotCacheError(MicroAuthError):
+    """The shared snapshot cache could not be read or updated."""
+
+
 class UsageReportingError(MicroAuthError):
     """Base class for durable usage reporting failures."""
 

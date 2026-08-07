@@ -258,6 +258,46 @@ def test_every_completed_authenticated_status_is_reported() -> None:
     assert all(item["usage_policy_id"] == POLICY_ID for item in items)
 
 
+def test_vercel_auto_flushes_usage_before_the_response_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VERCEL", "1")
+    plane = ControlPlane(snapshot_payload())
+
+    async def exercise() -> None:
+        control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
+        app = FastAPI()
+        auth = MicroAuth(
+            app,
+            secret_key="mas_test",
+            http_client=control,
+            persist_usage=False,
+            enforce_rps=False,
+        )
+        auth._snapshot = _parse_snapshot(plane.snapshot)
+        auth._started = True
+
+        @app.get("/protected")
+        async def protected(customer: Customer = Security(auth)) -> dict[str, bool]:
+            return {"ok": True}
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as caller:
+            response = await caller.get(
+                "/protected",
+                headers={"X-API-Key": API_KEY},
+            )
+            assert response.status_code == 200
+            assert len(plane.usage_calls) == 1
+
+        await auth.aclose()
+        await control.aclose()
+
+    run(exercise())
+
+
 def test_nonbillable_outcomes_release_money_but_consume_quota() -> None:
     plane = ControlPlane(
         snapshot_payload(

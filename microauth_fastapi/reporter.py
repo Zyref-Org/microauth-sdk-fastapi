@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
@@ -125,8 +126,11 @@ class UsageReporter:
         self._pending: deque[str] = deque()
         self._reservations: set[str] = set()
         self._task: asyncio.Task[None] | None = None
+        self._response_flush_task: asyncio.Task[None] | None = None
         self._flush_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
+        self._wake = asyncio.Event()
+        self._flush_deadline: float | None = None
         self._restored = False
         self._store_error: UsageStoreError | None = None
 
@@ -225,6 +229,7 @@ class UsageReporter:
             self._consume_reservation(reservation)
         self._events[event.idempotency_key] = event
         self._pending.append(event.idempotency_key)
+        self._schedule_flush()
         return event.idempotency_key
 
     async def start(self) -> None:
@@ -240,13 +245,45 @@ class UsageReporter:
 
     async def _loop(self) -> None:
         while True:
-            await asyncio.sleep(self._interval)
+            deadline = self._flush_deadline
+            if deadline is None:
+                await self._wake.wait()
+                self._wake.clear()
+                continue
+            delay = deadline - time.monotonic()
+            if delay > 0:
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+                else:
+                    self._wake.clear()
+                    continue
             try:
                 await self.flush()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("microauth: usage flush failed; stable items remain queued")
+                self._defer_pending()
+
+    async def flush_on_response(self, event_id: str | None = None) -> None:
+        """Deliver a response's event, coalescing concurrent callers."""
+
+        targets = {event_id} if event_id is not None else set(self._events)
+        while any(target in self._events for target in targets):
+            task = self._response_flush_task
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    self.flush(),
+                    name="microauth-usage-response-flush",
+                )
+                self._response_flush_task = task
+            try:
+                await asyncio.shield(task)
+            finally:
+                if self._response_flush_task is task and task.done():
+                    self._response_flush_task = None
 
     async def flush(self) -> None:
         """Deliver all selected events while retaining only transient failures."""
@@ -254,42 +291,48 @@ class UsageReporter:
         async with self._flush_lock:
             selected = list(self._pending)
             if not selected:
+                self._flush_deadline = None
                 return
             self._pending.clear()
+            self._flush_deadline = None
 
             first_error: Exception | None = None
-            for offset in range(0, len(selected), self._batch_size):
-                chunk_ids = [
-                    event_id
-                    for event_id in selected[offset : offset + self._batch_size]
-                    if event_id in self._events
-                ]
-                if not chunk_ids:
-                    continue
-                try:
-                    retry_ids, error = await self._deliver(chunk_ids)
-                except MicroAuthAuthorizationError as exc:
-                    await self._notify_authorization_failure(exc)
-                    remaining = [
+            try:
+                for offset in range(0, len(selected), self._batch_size):
+                    chunk_ids = [
                         event_id
-                        for event_id in selected[offset:]
+                        for event_id in selected[offset : offset + self._batch_size]
                         if event_id in self._events
                     ]
-                    self._requeue_back(remaining)
-                    raise
-                except BaseException:
-                    remaining = [
-                        event_id
-                        for event_id in selected[offset:]
-                        if event_id in self._events
-                    ]
-                    self._requeue_back(remaining)
-                    raise
-                self._requeue_back(retry_ids)
-                if first_error is None and error is not None:
-                    first_error = error
-            if first_error is not None:
-                raise first_error
+                    if not chunk_ids:
+                        continue
+                    try:
+                        retry_ids, error = await self._deliver(chunk_ids)
+                    except MicroAuthAuthorizationError as exc:
+                        await self._notify_authorization_failure(exc)
+                        remaining = [
+                            event_id
+                            for event_id in selected[offset:]
+                            if event_id in self._events
+                        ]
+                        self._requeue_back(remaining)
+                        raise
+                    except BaseException:
+                        remaining = [
+                            event_id
+                            for event_id in selected[offset:]
+                            if event_id in self._events
+                        ]
+                        self._requeue_back(remaining)
+                        raise
+                    self._requeue_back(retry_ids)
+                    if first_error is None and error is not None:
+                        first_error = error
+                if first_error is not None:
+                    raise first_error
+            finally:
+                if self._pending:
+                    self._defer_pending()
 
     async def _deliver(
         self,
@@ -376,7 +419,9 @@ class UsageReporter:
                 timeout=self._shutdown_timeout,
             )
         except Exception as exc:
+            await self._cancel_response_flush()
             raise UsageDrainError(self.pending_items, str(exc)) from exc
+        await self._cancel_response_flush()
         if self._events or self._reservations:
             raise UsageDrainError(
                 len(self._events) + len(self._reservations),
@@ -384,10 +429,34 @@ class UsageReporter:
             )
 
     async def _drain(self) -> None:
+        response_task = self._response_flush_task
+        if response_task is not None and response_task is not asyncio.current_task():
+            try:
+                await response_task
+            finally:
+                if self._response_flush_task is response_task:
+                    self._response_flush_task = None
         if not self._restored:
             await self._restore()
             self._restored = True
         await self.flush()
+
+    async def _cancel_response_flush(self) -> None:
+        task = self._response_flush_task
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception(
+                    "microauth: response-bound usage flush stopped with an error"
+                )
+        if self._response_flush_task is task:
+            self._response_flush_task = None
 
     def _consume_reservation(self, reservation: UsageReservation) -> None:
         if reservation.token not in self._reservations:
@@ -411,6 +480,20 @@ class UsageReporter:
             event_id for event_id in requested if event_id not in existing
         )
 
+    def _schedule_flush(self) -> None:
+        if self._flush_deadline is None:
+            self._flush_deadline = time.monotonic() + self._interval
+        self._wake.set()
+
+    def _defer_pending(self) -> None:
+        if not self._pending:
+            self._flush_deadline = None
+            return
+        now = time.monotonic()
+        if self._flush_deadline is None or self._flush_deadline <= now:
+            self._flush_deadline = now + self._interval
+        self._wake.set()
+
     async def _restore(self) -> None:
         if self._spool_path is None:
             return
@@ -432,6 +515,8 @@ class UsageReporter:
         for event in unseen:
             self._events[event.idempotency_key] = event
             self._pending.append(event.idempotency_key)
+        if unseen:
+            self._schedule_flush()
 
     def _persist_now(self, events: list[_UsageEvent]) -> None:
         if self._spool_path is None or not events:

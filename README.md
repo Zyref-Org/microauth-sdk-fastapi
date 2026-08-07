@@ -40,10 +40,10 @@ request to `/forecast` is now authenticated, rate-limited and billed.
 
 ## Designed for the hot path
 
-The SDK never calls MicroAuth while serving a request:
-
 - A **snapshot** of your customers, keys and limits is cached in memory and
-  refreshed in the background (default every 30s).
+  refreshed in the background (default every 30s). With Redis, validated
+  snapshots are shared across instances and one distributed refresh lock
+  prevents autoscaling cold starts from stampeding the control plane.
 - Keys not in the snapshot yet (created seconds ago) are resolved once via
   a **single-flight** on-demand lookup; invalid keys are negatively cached
   so a flood of bad keys can't reach MicroAuth.
@@ -52,6 +52,12 @@ The SDK never calls MicroAuth while serving a request:
   one idempotency key across transport retries, requeues, concurrent workers,
   and process restarts.
 - Authentication itself is a SHA-256 and a couple of dict lookups.
+
+Long-lived processes report usage in background batches and do not call
+MicroAuth on the normal authentication hot path. Vercel and AWS Lambda can
+freeze the event loop as soon as a response completes, so the SDK automatically
+awaits usage delivery before releasing the final response there. Set
+`flush_on_response` explicitly to override environment detection.
 
 If MicroAuth is briefly unreachable, your API keeps serving with the last
 known data (`fail_open=True`, the default), but never forever. Stale data has
@@ -65,7 +71,8 @@ the SDK returns `503` rather than creating usage under stale billing terms.
 In-memory request limits are exact within one process. With 4 uvicorn workers,
 each process has independent RPS, quota, balance, and platform reservation
 state. Point the SDK at Redis for one atomic shared reservation across every
-worker and machine:
+worker and machine. The same Redis connection also shares snapshots and
+coordinates refreshes:
 
 ```python
 auth = MicroAuth(app, redis_url="redis://localhost:6379/0")
@@ -80,6 +87,18 @@ customer and credential, so traffic on one key does not throttle another key
 owned by the same customer. RPS fails open briefly if Redis is down. Quota,
 potential spend, and platform reservations fail closed because serving
 without an atomic decision could oversubscribe a hard limit.
+
+## Serverless runtimes
+
+On Vercel and AWS Lambda, `flush_on_response` defaults to `True`. This fixes the
+case where the report timer is frozen after a low-traffic request and only runs
+when the next invocation arrives. Delivery is attempted before the final body
+is released; transient failures remain in the configured journal for retry.
+
+Use Redis in autoscaling deployments so snapshots are shared across instances.
+SQLite journals are local to each instance, so configure a durable
+`usage_spool_path` only on platforms that provide a shared durable filesystem.
+You can also call `await auth.flush_usage()` from an explicit lifecycle or job.
 
 ## Optional authentication
 
@@ -100,9 +119,11 @@ Everything has a sensible default; override only what you need.
 | `secret_key` | `$MICROAUTH_SECRET_KEY` | Tenant secret key (`mas_...`) |
 | `base_url` | `https://api.microauth.com` | MicroAuth API (`$MICROAUTH_BASE_URL`) |
 | `header_name` | `X-API-Key` | Header customers send their key in |
-| `redis_url` | `$MICROAUTH_REDIS_URL` | Enable exact cross-worker rate limiting |
+| `redis_url` | `$MICROAUTH_REDIS_URL` | Share snapshots and enforce exact cross-worker limits |
+| `shared_snapshot_cache` | `True` | Share snapshots and refresh locks when Redis is configured |
 | `sync_interval` | `30` | Seconds between snapshot refreshes |
-| `report_interval` | `15` | Seconds between usage report flushes |
+| `report_interval` | `15` | Maximum active-runtime age of the oldest queued usage |
+| `flush_on_response` | Auto on Vercel/Lambda | Await usage delivery before final response |
 | `max_snapshot_age` | `300` | Fail-closed staleness threshold |
 | `max_stale_snapshot_age` | `3 × max_snapshot_age` | Absolute stale-data ceiling |
 | `fail_open` | `True` | Serve stale data only up to the absolute ceiling |

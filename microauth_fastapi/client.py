@@ -41,6 +41,7 @@ class APIClient:
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._authorization = f"Bearer {secret_key}"
+        self._timeout = timeout
         self._owns_http = http_client is None
         self._http = http_client or httpx.AsyncClient(
             timeout=timeout,
@@ -63,6 +64,7 @@ class APIClient:
                     method,
                     f"{self._base_url}{path}",
                     headers=headers,
+                    timeout=self._timeout,
                     **kwargs,
                 )
             except httpx.HTTPError as exc:

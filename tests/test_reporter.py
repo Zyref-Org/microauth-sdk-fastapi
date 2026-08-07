@@ -403,3 +403,116 @@ def test_status_code_validation(status: Any) -> None:
     reporter = UsageReporter(ScriptedClient([]), 60, spool_path=None)
     with pytest.raises((TypeError, ValueError)):
         reporter.record("11111111-1111-4111-8111-111111111111", status)
+
+
+def test_interval_flushes_without_a_follow_up_record() -> None:
+    client = ScriptedClient([acknowledge])
+    reporter = UsageReporter(client, 0.02, spool_path=None)
+
+    async def exercise() -> None:
+        await reporter.start()
+        reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while reporter.pending_items and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert reporter.pending_items == 0
+        await reporter.aclose()
+
+    run(exercise())
+    assert len(client.calls) == 1
+
+
+def test_response_flush_includes_an_event_recorded_during_delivery() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class BlockingClient:
+        def __init__(self) -> None:
+            self.calls: list[list[dict[str, Any]]] = []
+
+        async def report_usage(
+            self,
+            items: list[dict[str, Any]],
+        ) -> dict[str, Any]:
+            self.calls.append([dict(item) for item in items])
+            if len(self.calls) == 1:
+                first_started.set()
+                await release_first.wait()
+            return acknowledge(items)
+
+    async def exercise() -> list[list[dict[str, Any]]]:
+        client = BlockingClient()
+        reporter = UsageReporter(client, 60, spool_path=None)
+        reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        first = asyncio.create_task(reporter.flush_on_response())
+        await first_started.wait()
+        reporter.record("22222222-2222-4222-8222-222222222222", 201)
+        second = asyncio.create_task(reporter.flush_on_response())
+        release_first.set()
+        await asyncio.gather(first, second)
+        assert reporter.pending_items == 0
+        return client.calls
+
+    calls = run(exercise())
+    assert [len(call) for call in calls] == [1, 1]
+
+
+def test_explicit_drain_waits_for_an_already_inflight_event() -> None:
+    async def exercise() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingClient:
+            async def report_usage(
+                self,
+                items: list[dict[str, Any]],
+            ) -> dict[str, Any]:
+                started.set()
+                await release.wait()
+                return acknowledge(items)
+
+        reporter = UsageReporter(BlockingClient(), 60, spool_path=None)
+        reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        delivery = asyncio.create_task(reporter.flush())
+        await started.wait()
+        drain = asyncio.create_task(reporter.flush_on_response())
+        await asyncio.sleep(0)
+        assert not drain.done()
+        release.set()
+        await asyncio.gather(delivery, drain)
+        assert reporter.pending_items == 0
+
+    run(exercise())
+
+
+def test_shutdown_cancels_a_stuck_response_flush() -> None:
+    async def exercise() -> None:
+        started = asyncio.Event()
+
+        class StuckClient:
+            async def report_usage(
+                self,
+                items: list[dict[str, Any]],
+            ) -> dict[str, Any]:
+                del items
+                started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        reporter = UsageReporter(
+            StuckClient(),
+            60,
+            shutdown_timeout=0.02,
+            spool_path=None,
+        )
+        reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        response_flush = asyncio.create_task(reporter.flush_on_response())
+        await started.wait()
+        with pytest.raises(UsageDrainError):
+            await reporter.aclose()
+        await asyncio.gather(response_flush, return_exceptions=True)
+        assert response_flush.done()
+        assert reporter._response_flush_task is None
+        assert reporter.pending_items == 1
+
+    run(exercise())

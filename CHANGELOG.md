@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.2.0
+
+Serverless caching and reporting reliability release.
+
+- Added a Redis-backed shared snapshot cache. Cold starts now reuse validated
+  snapshots, and a distributed refresh lock prevents autoscaling workers from
+  stampeding the snapshot endpoint.
+- Made `report_interval` an oldest-pending-item deadline driven by an explicit
+  wake-up signal instead of a blind periodic sleep.
+- Added automatic response-bound usage flushing on Vercel and AWS Lambda so a
+  frozen event loop cannot strand the final request until another invocation.
+  This can be overridden with `flush_on_response`.
+- Added `flush_usage()` for explicit drains in jobs, tests, and custom
+  serverless lifecycle integrations.
+- Added concurrency and timing regressions for shared cold starts, timer-only
+  delivery, response-bound delivery, and arrivals during an active flush.
+
 ## 2.1.0
 
 Production reliability release.

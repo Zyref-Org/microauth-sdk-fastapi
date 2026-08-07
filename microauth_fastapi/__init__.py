@@ -16,6 +16,7 @@ from .exceptions import (
     PlatformAllowanceExceeded,
     QuotaExceeded,
     RateLimited,
+    SnapshotCacheError,
     SnapshotValidationError,
     UsageAcknowledgementError,
     UsageDrainError,
@@ -27,7 +28,7 @@ from .exceptions import (
 from .models import Customer, PlatformMonthlyAllowance
 from .sdk import MicroAuth
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 __all__ = [
     "AuthDenied",
@@ -47,6 +48,7 @@ __all__ = [
     "PlatformMonthlyAllowance",
     "QuotaExceeded",
     "RateLimited",
+    "SnapshotCacheError",
     "SnapshotValidationError",
     "UsageAcknowledgementError",
     "UsageDrainError",
