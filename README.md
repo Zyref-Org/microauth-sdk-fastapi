@@ -51,7 +51,7 @@ request to `/forecast` is now authenticated, rate-limited and billed.
   shared queue when Redis is configured, otherwise to a per-process
   append-only journal file (one fsynced line per request, group-committed
   across concurrent requests) — and requests sharing an API key, policy,
-  status and hour merge into one counted item (up to 500). Deliveries are
+  status and hour merge into one counted item (up to 10,000). Deliveries are
   batched: a flush happens when 500 requests accumulate or `report_interval`
   (default 5s) elapses since the last flush, whichever comes first, so a
   high-concurrency burst becomes one usage call with one counted item. Every

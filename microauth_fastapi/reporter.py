@@ -52,6 +52,14 @@ _MAX_EVENT_AGE_SECONDS = 45 * 86_400
 # the process into permanent 503s.
 _STORE_ERROR_COOLDOWN_SECONDS = 5.0
 
+# Requests sharing one identity merge into a single counted event up to this
+# many requests. The cap is deliberately much larger than the delivery batch
+# size: while the control plane is unreachable, open events keep absorbing
+# traffic instead of fragmenting, so the bounded queue holds hours of an
+# outage (max_items x merge cap requests) rather than minutes. The API
+# accepts counts up to MAX_USAGE_COUNT (10M) per item.
+_MERGE_CAP = 10_000
+
 
 UsageCallback = Callable[[list[dict[str, Any]]], Awaitable[None] | None]
 AuthorizationCallback = Callable[
@@ -180,7 +188,7 @@ class UsageReporter:
             tuple[str, str | None, int, str],
             asyncio.Future[None],
         ] = {}
-        self._merge_limit = min(batch_size, MAX_USAGE_COUNT)
+        self._merge_limit = min(_MERGE_CAP, MAX_USAGE_COUNT)
         self._pending: deque[str] = deque()
         self._reservations: set[str] = set()
         self._task: asyncio.Task[None] | None = None
@@ -196,6 +204,13 @@ class UsageReporter:
         # Anchor the "seconds since the last flush" batching rule so the
         # first request batches instead of flushing instantly.
         self._last_flush = time.monotonic()
+        # After a failed delivery, no flush may start before this time. This
+        # must hold against every trigger (background deadline, full-batch
+        # fast path, response-bound flushes): without it, a full backlog
+        # forces an immediate retry on every new request, and each rapid
+        # failed flush freezes the open event at a tiny count - fragmenting
+        # the queue to its item bound in minutes during an outage.
+        self._backoff_until = 0.0
         self._journal_writes: list[tuple[list[JournalOp], asyncio.Future[None]]] = []
         self._spool_writer_task: asyncio.Task[None] | None = None
         # Each process appends to its own WAL file (single writer, O(1)
@@ -876,6 +891,15 @@ class UsageReporter:
                         first_error = error
                 if first_error is not None:
                     raise first_error
+                # Deliveries succeeded end to end; retries resume immediately.
+                self._backoff_until = 0.0
+            except BaseException:
+                # Armed here, inside flush, so every trigger observes it -
+                # the background loop, explicit drains, and response-bound
+                # serverless flushes alike. Without it a failing delivery
+                # retries as fast as it fails, fragmenting the durable queue.
+                self._backoff_until = time.monotonic() + self._interval
+                raise
             finally:
                 if self._pending:
                     self._defer_pending()
@@ -1187,9 +1211,14 @@ class UsageReporter:
         if self._full_batch_pending():
             # A full batch of requests flushes immediately instead of waiting
             # out the interval deadline.
-            self._flush_deadline = now
+            deadline = now
         elif self._flush_deadline is None:
-            self._flush_deadline = now + self._interval
+            deadline = now + self._interval
+        else:
+            deadline = self._flush_deadline
+        # The failure backoff is authoritative: a permanently full backlog
+        # during an outage must not turn every request into a retry trigger.
+        self._flush_deadline = max(deadline, self._backoff_until)
         self._wake.set()
 
     def flush_is_due(self, event_id: str | None = None) -> bool:
@@ -1197,11 +1226,15 @@ class UsageReporter:
 
         A delivery is due when a full batch of requests has accumulated or
         the interval has elapsed since the last flush while events are queued.
+        Never during the failure backoff window: retrying on every response
+        while the control plane is down would fragment the durable queue.
         """
 
         if event_id is not None and event_id not in self._events:
             return False
         if not self._events:
+            return False
+        if time.monotonic() < self._backoff_until:
             return False
         if self._full_batch_pending():
             return True
@@ -1212,13 +1245,18 @@ class UsageReporter:
             self._flush_deadline = None
             return
         now = time.monotonic()
+        if backoff:
+            self._backoff_until = now + self._interval
         if not backoff and self._full_batch_pending():
             # A full batch completed while a flush was in flight; deliver it
             # immediately instead of waiting out another interval. Failed
             # flushes pass backoff=True and always wait the interval.
-            self._flush_deadline = now
+            deadline = now
         elif self._flush_deadline is None or self._flush_deadline <= now:
-            self._flush_deadline = now + self._interval
+            deadline = now + self._interval
+        else:
+            deadline = self._flush_deadline
+        self._flush_deadline = max(deadline, self._backoff_until)
         self._wake.set()
 
     async def _restore(self) -> None:

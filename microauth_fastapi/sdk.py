@@ -345,6 +345,7 @@ class MicroAuth:
         self._stale_recovery_blocked_until = 0.0
         self._request_refresh_task: asyncio.Task[None] | None = None
         self._request_refresh_blocked_until = 0.0
+        self._queue_full_logged_at = 0.0
         self._negative: dict[str, float] = {}  # key hash -> monotonic expiry
         self._verifying: dict[str, asyncio.Future[KeyRecord | None]] = {}
         self._authorization_invalid = False
@@ -512,7 +513,12 @@ class MicroAuth:
         try:
             usage_reservation = self._reporter.reserve()
         except UsageQueueFull as exc:
-            logger.error("microauth: refusing request because %s", exc)
+            # At thousands of rejected requests per second, one log line per
+            # request would drown the process in logging overhead.
+            now = time.monotonic()
+            if now - self._queue_full_logged_at >= 1.0:
+                self._queue_full_logged_at = now
+                logger.error("microauth: refusing request because %s", exc)
             raise AuthUnavailable() from exc
         except MicroAuthError as exc:
             logger.error("microauth: usage journal is unavailable (%s)", exc)

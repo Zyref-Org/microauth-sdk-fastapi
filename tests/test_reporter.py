@@ -477,6 +477,69 @@ def test_full_batch_of_requests_triggers_an_immediate_flush() -> None:
     assert client.calls[0][0]["count"] == 5
 
 
+def test_failure_backoff_holds_against_full_batches() -> None:
+    """A full retry backlog must not turn every request into a retry trigger.
+
+    During a control-plane outage the pending backlog permanently satisfies
+    the full-batch rule. Without an authoritative backoff, each new request
+    re-armed an immediate flush, and every rapid failed flush froze the open
+    event at a tiny count - fragmenting the bounded queue to its item limit
+    within minutes (observed as a storm of queue-full 503s in stress tests).
+    """
+
+    class DownClient:
+        async def report_usage(self, items: list[dict[str, Any]]) -> dict[str, Any]:
+            raise OSError("all connection attempts failed")
+
+    reporter = UsageReporter(DownClient(), 5, batch_size=2, spool_path=None)
+
+    async def exercise() -> None:
+        import time as time_module
+
+        await reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        await reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        with pytest.raises(OSError):
+            await reporter.flush()
+
+        # The backlog satisfies the full-batch rule, but the failure backoff
+        # wins: response-bound flushes stand down and the deadline stays out.
+        await reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        assert reporter.flush_is_due() is False
+        assert reporter._flush_deadline is not None
+        assert reporter._flush_deadline - time_module.monotonic() > 2.5
+
+        # Traffic during the backoff keeps merging into one open event
+        # instead of fragmenting: one frozen retry event plus one open event.
+        for _ in range(10):
+            await reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        assert reporter.pending_items == 2
+        assert reporter.pending_requests == 13
+
+    run(exercise())
+
+
+def test_merge_cap_is_independent_of_the_batch_size() -> None:
+    """Open events absorb far more requests than one delivery batch.
+
+    If the merge cap equalled the batch size, an outage would fragment
+    buffered traffic into one event per batch and exhaust the bounded queue
+    orders of magnitude earlier.
+    """
+
+    client = ScriptedClient([acknowledge])
+    reporter = UsageReporter(client, 3600, batch_size=2, spool_path=None)
+
+    async def exercise() -> None:
+        for _ in range(9):
+            await reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        assert reporter.pending_items == 1
+        assert reporter.pending_requests == 9
+        await reporter.flush()
+
+    run(exercise())
+    assert [item["count"] for item in client.calls[0]] == [9]
+
+
 def test_response_flush_defers_until_the_batch_is_due() -> None:
     client = ScriptedClient([acknowledge])
     reporter = UsageReporter(client, 60, spool_path=None)

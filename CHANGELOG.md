@@ -27,9 +27,24 @@ Redis-less journal rewrite and one-round-trip admission release.
   their full payload.
 - Cold-burst event coalescing: concurrent requests for the same API key,
   policy, status and hour now wait for the first in-flight event creation
-  and merge into it instead of opening one event per in-flight request. A
-  5,000-request burst at 150 concurrency now produces 5 counted items (the
-  500-per-item cap) instead of several hundred.
+  and merge into it instead of opening one event per in-flight request.
+- Outage resilience: the delivery-failure backoff is now armed inside
+  `flush()` itself and is authoritative against every flush trigger - the
+  background deadline, the full-batch fast path, and response-bound
+  serverless flushes. Previously a full retry backlog satisfied the
+  full-batch rule, so each new request re-armed an immediate retry; every
+  rapidly failing flush froze the open event at a tiny count and fragmented
+  the bounded queue to its 10,000-item limit within minutes of a
+  control-plane outage, after which requests were 503'd. Verified at 115k
+  requests/second against an unreachable control plane: zero rejections,
+  one delivery attempt per interval, and the queue stays at the merge-cap
+  minimum.
+- The per-event merge cap is now 10,000 requests (decoupled from the
+  500-request delivery batch trigger), so the bounded queue holds roughly
+  100M requests worth of usage during an outage instead of 5M. Healthy-state
+  batching is unchanged.
+- The queue-full rejection log is throttled to once per second instead of
+  once per rejected request.
 - The per-second rate check now rides inside the atomic reservation script
   (memory and Redis, script marker v4): the entire admission decision -
   RPS, quota, balance, platform cap and monetary hold - costs one Redis
