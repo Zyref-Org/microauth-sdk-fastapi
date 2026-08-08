@@ -46,6 +46,15 @@ _TERMINAL_ITEM_HTTP_STATUSES = frozenset({400, 402, 409, 422})
 # converts a delayed delivery into a guaranteed rejection.
 _MAX_EVENT_AGE_SECONDS = 45 * 86_400
 
+# After a journal failure the reporter fails fast for this long, then probes
+# the store again. A transient locked database or disk blip must not poison
+# the process into permanent 503s.
+_STORE_ERROR_COOLDOWN_SECONDS = 5.0
+
+
+class _SpoolFencedError(UsageStoreError):
+    """The journal row is owned by another process and must not be mutated."""
+
 UsageCallback = Callable[[list[dict[str, Any]]], Awaitable[None] | None]
 AuthorizationCallback = Callable[
     [MicroAuthAuthorizationError],
@@ -71,6 +80,8 @@ class _UsageEvent:
     # defers events with active merges so a delivery can never freeze a
     # payload halfway through a durable count increment.
     merging: int = 0
+    # Cached epoch seconds of period_start (filled lazily).
+    period_ts: float = 0.0
 
     def as_payload(self) -> dict[str, Any]:
         payload = {
@@ -131,6 +142,7 @@ class UsageReporter:
         batch_size: int = _DEFAULT_BATCH_SIZE,
         shutdown_timeout: float = 10.0,
         spool_path: str | os.PathLike[str] | None = None,
+        spool_claim_grace: float = 120.0,
         store: RedisUsageStore | None = None,
         on_acknowledged: UsageCallback | None = None,
         on_rejected: UsageCallback | None = None,
@@ -145,6 +157,8 @@ class UsageReporter:
             raise ValueError("batch_size must be between 1 and 1000")
         if shutdown_timeout <= 0:
             raise ValueError("shutdown_timeout must be positive")
+        if spool_claim_grace < 0:
+            raise ValueError("spool_claim_grace must not be negative")
         self._client = client
         self._interval = interval
         self._max_items = max_items
@@ -173,12 +187,22 @@ class UsageReporter:
         self._flush_deadline: float | None = None
         self._restored = False
         self._store_error: UsageStoreError | None = None
+        self._store_error_until = 0.0
         self._last_sweep = 0.0
         # Anchor the "seconds since the last flush" batching rule so the
         # first request batches instead of flushing instantly.
         self._last_flush = time.monotonic()
         self._spool_writes: list[tuple[list[_UsageEvent], asyncio.Future[None]]] = []
-        self._spool_writer_active = False
+        self._spool_writer_task: asyncio.Task[None] | None = None
+        # The default spool file is shared by every worker process on the
+        # host, so rows are owner-fenced like the Redis queue: each process
+        # claims rows under its own identity, and abandoned rows (owner not
+        # writing for spool_claim_grace) are recoverable by any process.
+        self._spool_owner = str(uuid.uuid4())
+        self._spool_grace = spool_claim_grace
+        # Requests awaiting delivery (an O(1) counter for the batch trigger);
+        # merged events contribute their full counts.
+        self._pending_requests = 0
 
     @property
     def pending_items(self) -> int:
@@ -204,7 +228,10 @@ class UsageReporter:
     def reserve(self) -> UsageReservation:
         """Reserve bounded queue capacity before the endpoint starts."""
 
-        if self._store_error is not None:
+        if (
+            self._store_error is not None
+            and time.monotonic() < self._store_error_until
+        ):
             raise self._store_error
         if len(self._events) + len(self._reservations) >= self._max_items:
             raise UsageQueueFull(self._max_items)
@@ -266,6 +293,7 @@ class UsageReporter:
         if merged_id is not None:
             if reservation is not None:
                 self._consume_reservation(reservation)
+            self._pending_requests += 1
             self._schedule_flush()
             return merged_id
 
@@ -288,6 +316,7 @@ class UsageReporter:
         self._events[event.idempotency_key] = event
         self._open_events[merge_key] = event.idempotency_key
         self._pending.append(event.idempotency_key)
+        self._pending_requests += 1
         self._schedule_flush()
         return event.idempotency_key
 
@@ -345,8 +374,32 @@ class UsageReporter:
                     period_start=event.period_start,
                     attachments=list(event.attachments),
                 )
+                future = self._submit_spool_write([snapshot])
                 try:
-                    await self._persist_batched([snapshot])
+                    if future is not None:
+                        await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    # The detached writer will still resolve the write. Keep
+                    # the merge latch held and reconcile the in-memory count
+                    # with the journal's actual outcome, so a crash can never
+                    # find the two disagreeing about this increment.
+                    assert future is not None
+                    event.merging += 1
+                    future.add_done_callback(
+                        self._merge_reconciler(event, attachment)
+                    )
+                    raise
+                except _SpoolFencedError:
+                    # Another process claimed this row during spool recovery;
+                    # fall back to an independent event.
+                    event.count -= 1
+                    if attachment:
+                        try:
+                            event.attachments.remove(attachment)
+                        except ValueError:
+                            pass
+                    self._open_events.pop(merge_key, None)
+                    return None
                 except BaseException:
                     event.count -= 1
                     if attachment:
@@ -363,6 +416,28 @@ class UsageReporter:
             return event_id
         finally:
             event.merging -= 1
+
+    def _merge_reconciler(
+        self,
+        event: _UsageEvent,
+        attachment: dict[str, Any],
+    ) -> Callable[[asyncio.Future[None]], None]:
+        def reconcile(future: asyncio.Future[None]) -> None:
+            try:
+                failed = future.cancelled() or future.exception() is not None
+                if failed:
+                    # The journal never took the increment; undo it so the
+                    # delivered count matches the durable copy.
+                    event.count -= 1
+                    if attachment:
+                        try:
+                            event.attachments.remove(attachment)
+                        except ValueError:
+                            pass
+            finally:
+                event.merging -= 1
+
+        return reconcile
 
     async def _persist_event(self, event: _UsageEvent) -> None:
         """Complete the durable handoff before the caller's response is final."""
@@ -395,50 +470,96 @@ class UsageReporter:
     async def _persist_batched(self, events: list[_UsageEvent]) -> None:
         """Group concurrent journal writes into one SQLite transaction."""
 
-        if self._spool_path is None or not events:
+        future = self._submit_spool_write(events)
+        if future is None:
             return
-        if self._store_error is not None:
+        # The shield keeps the shared future alive when this request is
+        # cancelled: the detached writer still resolves it, so its outcome
+        # remains observable and other waiters are unaffected.
+        await asyncio.shield(future)
+
+    def _submit_spool_write(
+        self,
+        events: list[_UsageEvent],
+    ) -> asyncio.Future[None] | None:
+        if self._spool_path is None or not events:
+            return None
+        if (
+            self._store_error is not None
+            and time.monotonic() < self._store_error_until
+        ):
+            # Fail fast during the cooldown; afterwards the next write probes
+            # the store again instead of staying poisoned until restart.
             raise self._store_error
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._spool_writes.append((events, future))
-        if not self._spool_writer_active:
-            self._spool_writer_active = True
+        writer = self._spool_writer_task
+        if writer is None or writer.done():
+            # A detached task owns the write loop, so cancelling any waiting
+            # request can never strand other requests' futures unresolved.
+            self._spool_writer_task = asyncio.create_task(
+                self._run_spool_writer(),
+                name="microauth-usage-journal-writer",
+            )
+        return future
+
+    async def _run_spool_writer(self) -> None:
+        spool_path = self._spool_path
+        assert spool_path is not None  # guarded by _submit_spool_write
+        while self._spool_writes:
+            batch = self._spool_writes
+            self._spool_writes = []
+            combined = [
+                event
+                for batch_events, _ in batch
+                for event in batch_events
+            ]
             try:
-                while self._spool_writes:
-                    batch = self._spool_writes
-                    self._spool_writes = []
-                    combined = [
-                        event
-                        for batch_events, _ in batch
+                fenced = await asyncio.to_thread(
+                    _persist_spool,
+                    spool_path,
+                    combined,
+                    self._max_items,
+                    self._spool_owner,
+                )
+            except BaseException as exc:
+                error: Exception
+                if isinstance(exc, (UsageQueueFull, UsageStoreError)):
+                    error = exc
+                elif isinstance(exc, asyncio.CancelledError):
+                    error = UsageStoreError("usage journal write was interrupted")
+                else:
+                    error = UsageStoreError(
+                        f"could not persist usage journal: {exc}"
+                    )
+                if isinstance(error, UsageStoreError):
+                    self._store_error = error
+                    self._store_error_until = (
+                        time.monotonic() + _STORE_ERROR_COOLDOWN_SECONDS
+                    )
+                for _, waiter in batch:
+                    if not waiter.done():
+                        waiter.set_exception(error)
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+            else:
+                self._store_error = None
+                for batch_events, waiter in batch:
+                    if waiter.done():
+                        continue
+                    if any(
+                        event.idempotency_key in fenced
                         for event in batch_events
-                    ]
-                    try:
-                        await asyncio.to_thread(
-                            _persist_spool,
-                            self._spool_path,
-                            combined,
-                            self._max_items,
-                        )
-                    except Exception as exc:  # noqa: BLE001 - storage boundary
-                        error: Exception
-                        if isinstance(exc, (UsageQueueFull, UsageStoreError)):
-                            error = exc
-                        else:
-                            error = UsageStoreError(
-                                f"could not persist usage journal: {exc}"
+                    ):
+                        # Not a store failure: the row belongs to another
+                        # process now. The caller opens an independent event.
+                        waiter.set_exception(
+                            _SpoolFencedError(
+                                "the journal row is owned by another process"
                             )
-                        if isinstance(error, UsageStoreError):
-                            self._store_error = error
-                        for _, waiter in batch:
-                            if not waiter.done():
-                                waiter.set_exception(error)
+                        )
                     else:
-                        for _, waiter in batch:
-                            if not waiter.done():
-                                waiter.set_result(None)
-            finally:
-                self._spool_writer_active = False
-        await future
+                        waiter.set_result(None)
 
     async def start(self) -> None:
         async with self._start_lock:
@@ -456,12 +577,13 @@ class UsageReporter:
         while True:
             deadline = self._flush_deadline
             if deadline is None:
-                if self._store is None:
+                if self._store is None and self._spool_path is None:
                     await self._wake.wait()
                     self._wake.clear()
                     continue
-                # Idle workers still sweep the shared queue so a dead worker's
-                # leases are recovered without waiting for local traffic.
+                # Idle workers still sweep the shared queue (or the shared
+                # spool file) so a dead worker's events are recovered without
+                # waiting for local traffic.
                 try:
                     await asyncio.wait_for(
                         self._wake.wait(),
@@ -488,17 +610,24 @@ class UsageReporter:
                 raise
             except Exception:
                 logger.exception("microauth: usage flush failed; stable items remain queued")
-                self._defer_pending()
+                self._defer_pending(backoff=True)
 
     async def _maybe_sweep(self) -> None:
-        """Claim due and abandoned events from the shared durable queue."""
+        """Claim due and abandoned events from the shared durable backend."""
 
-        if self._store is None:
+        if self._store is None and self._spool_path is None:
             return
         now = time.monotonic()
         if self._last_sweep and now - self._last_sweep < self._interval:
             return
         self._last_sweep = now
+        if self._store is not None:
+            await self._sweep_store()
+        elif self._restored:
+            await self._sweep_spool()
+
+    async def _sweep_store(self) -> None:
+        assert self._store is not None
         capacity = self._max_items - len(self._events) - len(self._reservations)
         if capacity <= 0:
             return
@@ -516,9 +645,6 @@ class UsageReporter:
                 continue
             try:
                 event = _event_from_store_payload(event_id, payload)
-                # A recovered event may already have been attempted by its
-                # dead owner; its payload is pinned by the server's receipt.
-                event.frozen = True
                 recovered.append(event)
             except UsageStoreError as exc:
                 logger.error(
@@ -528,18 +654,51 @@ class UsageReporter:
                     exc,
                 )
                 try:
-                    await self._store.dead_letter(event_id, str(exc))
+                    await self._store.dead_letter(event_id, str(exc), payload)
                 except UsageStoreError:
                     logger.exception(
                         "microauth: invalid durable usage event could not "
                         "be dead-lettered"
                     )
+        await self._absorb_recovered(recovered)
+
+    async def _sweep_spool(self) -> None:
+        """Reclaim abandoned rows other host processes left in the journal."""
+
+        assert self._spool_path is not None
+        try:
+            events = await asyncio.to_thread(
+                _restore_spool,
+                self._spool_path,
+                self._spool_owner,
+                self._spool_grace,
+            )
+        except Exception as exc:  # noqa: BLE001 - storage boundary
+            logger.warning(
+                "microauth: usage journal sweep failed (%s)",
+                exc,
+            )
+            return
+        capacity = self._max_items - len(self._events) - len(self._reservations)
+        recovered = [
+            event
+            for event in events
+            if event.idempotency_key not in self._events
+        ][: max(0, capacity)]
+        await self._absorb_recovered(recovered)
+
+    async def _absorb_recovered(self, recovered: list[_UsageEvent]) -> None:
         if not recovered:
             return
+        for event in recovered:
+            # A recovered event may already have been attempted by its dead
+            # owner; its payload is pinned by the server's receipt.
+            event.frozen = True
         await self._notify(self._on_restored, _event_attachments(recovered))
         for event in recovered:
             self._events[event.idempotency_key] = event
             self._pending.append(event.idempotency_key)
+            self._pending_requests += event.count
         self._schedule_flush()
 
     async def flush_on_response(
@@ -609,6 +768,13 @@ class UsageReporter:
                     del self._open_events[event.merge_key()]
                 selected.append(event_id)
             self._pending = deque(deferred)
+            # Exact recompute of the additive request counter (deferred lists
+            # are tiny: only events with a merge mid-flight).
+            self._pending_requests = sum(
+                event.count
+                for event_id in deferred
+                if (event := self._events.get(event_id)) is not None
+            )
             if not selected:
                 if deferred:
                     self._defer_pending()
@@ -665,10 +831,12 @@ class UsageReporter:
         for event_id, event in self._events.items():
             if event.merging:
                 continue
-            period = datetime.fromisoformat(
-                event.period_start.replace("Z", "+00:00")
-            )
-            if period.timestamp() < cutoff:
+            if event.period_ts == 0.0:
+                # Parsed once per event lifetime, not once per flush.
+                event.period_ts = datetime.fromisoformat(
+                    event.period_start.replace("Z", "+00:00")
+                ).timestamp()
+            if event.period_ts < cutoff:
                 expired.append(event_id)
         for event_id in expired:
             await self._dead_letter(
@@ -708,6 +876,10 @@ class UsageReporter:
             if not _is_terminal_item_error(exc):
                 raise
             if len(event_ids) > 1:
+                # Bisection over a poisoned chunk can outlive the original
+                # delivery lease; renew it so another worker does not start
+                # re-delivering the same frozen events mid-isolation.
+                await self._extend_store_leases(event_ids)
                 midpoint = len(event_ids) // 2
                 left_retry, left_error = await self._deliver(event_ids[:midpoint])
                 right_retry, right_error = await self._deliver(event_ids[midpoint:])
@@ -758,7 +930,14 @@ class UsageReporter:
         await self._notify(self._on_rejected, list(event.attachments))
         if self._store is not None:
             try:
-                await self._store.dead_letter(event_id, detail)
+                await self._store.dead_letter(
+                    event_id,
+                    detail,
+                    {
+                        "item": event.as_payload(),
+                        "attachments": event.attachments,
+                    },
+                )
             except UsageStoreError:
                 logger.exception(
                     "microauth: terminal usage item could not be moved to "
@@ -784,6 +963,19 @@ class UsageReporter:
             except Exception:
                 logger.exception("microauth: usage reporter task stopped with an error")
             self._task = None
+        writer = self._spool_writer_task
+        if writer is not None and not writer.done():
+            # The journal writer self-terminates once its queue drains; wait
+            # for in-flight writes so the drain below sees their outcome.
+            try:
+                await writer
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception(
+                    "microauth: usage journal writer stopped with an error"
+                )
+        self._spool_writer_task = None
         try:
             await asyncio.wait_for(
                 self._drain(),
@@ -804,31 +996,53 @@ class UsageReporter:
             )
 
     async def _release_store_claims(self) -> bool:
-        """Hand undelivered events back to the shared queue at shutdown.
+        """Hand undelivered events back to the shared backend at shutdown.
 
         Returns True when every locally queued event is durably owned by the
-        shared queue again, meaning shutdown lost nothing and need not raise.
+        shared queue (or shared journal) again, meaning shutdown lost nothing
+        and need not raise.
         """
 
-        if self._store is None:
+        if self._store is None and self._spool_path is None:
             return False
         event_ids = list(self._events)
         if not event_ids:
             return True
-        try:
-            released = await self._store.release(event_ids)
-        except UsageStoreError:
-            logger.exception(
-                "microauth: undelivered usage could not be handed back to "
-                "the durable queue during shutdown"
+        if self._store is not None:
+            try:
+                released = await self._store.release(event_ids)
+            except UsageStoreError:
+                logger.exception(
+                    "microauth: undelivered usage could not be handed back to "
+                    "the durable queue during shutdown"
+                )
+                return False
+            logger.warning(
+                "microauth: %d undelivered usage item(s) were handed back to "
+                "the durable queue for another worker (released %d lease(s))",
+                len(event_ids),
+                released,
             )
-            return False
-        logger.warning(
-            "microauth: %d undelivered usage item(s) were handed back to the "
-            "durable queue for another worker (released %d lease(s))",
-            len(event_ids),
-            released,
-        )
+        else:
+            assert self._spool_path is not None
+            try:
+                await asyncio.to_thread(
+                    _disown_spool,
+                    self._spool_path,
+                    event_ids,
+                    self._spool_owner,
+                )
+            except Exception:
+                logger.exception(
+                    "microauth: undelivered usage could not be handed back to "
+                    "the shared journal during shutdown"
+                )
+                return False
+            logger.warning(
+                "microauth: %d undelivered usage item(s) were handed back to "
+                "the shared journal for another process",
+                len(event_ids),
+            )
         self._remove_events(event_ids)
         self._pending.clear()
         return True
@@ -886,22 +1100,26 @@ class UsageReporter:
         if not requested:
             return
         existing = set(self._pending)
-        self._pending.extend(
-            event_id for event_id in requested if event_id not in existing
-        )
+        for event_id in requested:
+            if event_id in existing:
+                continue
+            self._pending.append(event_id)
+            self._pending_requests += self._events[event_id].count
 
-    def _pending_request_total(self) -> int:
-        """Requests (not events) awaiting delivery; merged events count fully."""
+    def _full_batch_pending(self) -> bool:
+        """True when at least one full batch of requests awaits delivery.
 
-        return sum(
-            event.count
-            for event_id in self._pending
-            if (event := self._events.get(event_id)) is not None
-        )
+        The running counter is maintained additively on the hot path and can
+        only over-approximate (removals do not decrement it); flush selection
+        recomputes it exactly. Over-approximation is harmless: it can only
+        trigger a slightly early flush.
+        """
+
+        return self._pending_requests >= self._batch_size
 
     def _schedule_flush(self) -> None:
         now = time.monotonic()
-        if self._pending_request_total() >= self._batch_size:
+        if self._full_batch_pending():
             # A full batch of requests flushes immediately instead of waiting
             # out the interval deadline.
             self._flush_deadline = now
@@ -920,16 +1138,21 @@ class UsageReporter:
             return False
         if not self._events:
             return False
-        if self._pending_request_total() >= self._batch_size:
+        if self._full_batch_pending():
             return True
         return time.monotonic() - self._last_flush >= self._interval
 
-    def _defer_pending(self) -> None:
+    def _defer_pending(self, *, backoff: bool = False) -> None:
         if not self._pending:
             self._flush_deadline = None
             return
         now = time.monotonic()
-        if self._flush_deadline is None or self._flush_deadline <= now:
+        if not backoff and self._full_batch_pending():
+            # A full batch completed while a flush was in flight; deliver it
+            # immediately instead of waiting out another interval. Failed
+            # flushes pass backoff=True and always wait the interval.
+            self._flush_deadline = now
+        elif self._flush_deadline is None or self._flush_deadline <= now:
             self._flush_deadline = now + self._interval
         self._wake.set()
 
@@ -937,7 +1160,12 @@ class UsageReporter:
         if self._spool_path is None:
             return
         try:
-            events = await asyncio.to_thread(_restore_spool, self._spool_path)
+            events = await asyncio.to_thread(
+                _restore_spool,
+                self._spool_path,
+                self._spool_owner,
+                self._spool_grace,
+            )
         except UsageStoreError:
             raise
         except Exception as exc:
@@ -958,6 +1186,7 @@ class UsageReporter:
         for event in unseen:
             self._events[event.idempotency_key] = event
             self._pending.append(event.idempotency_key)
+            self._pending_requests += event.count
         if unseen:
             self._schedule_flush()
 
@@ -965,7 +1194,12 @@ class UsageReporter:
         if self._spool_path is None or not event_ids:
             return
         try:
-            await asyncio.to_thread(_delete_spool, self._spool_path, event_ids)
+            await asyncio.to_thread(
+                _delete_spool,
+                self._spool_path,
+                event_ids,
+                self._spool_owner,
+            )
         except Exception as exc:
             raise UsageStoreError(f"could not update usage journal: {exc}") from exc
 
@@ -978,6 +1212,7 @@ class UsageReporter:
                 self._spool_path,
                 event,
                 detail,
+                self._spool_owner,
             )
         except Exception as exc:
             raise UsageStoreError(f"could not update usage dead letter: {exc}") from exc
@@ -1182,6 +1417,16 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
                     "ALTER TABLE usage_events "
                     "ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "owner" not in columns:
+                connection.execute(
+                    "ALTER TABLE usage_events "
+                    "ADD COLUMN owner TEXT NOT NULL DEFAULT ''"
+                )
+            if "claimed_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE usage_events "
+                    "ADD COLUMN claimed_at REAL NOT NULL DEFAULT 0"
+                )
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS usage_dead_letters (
@@ -1204,24 +1449,53 @@ def _create_usage_table(connection: sqlite3.Connection) -> None:
             status_code INTEGER NOT NULL,
             count INTEGER NOT NULL,
             period_start TEXT NOT NULL,
-            attachments_json TEXT NOT NULL
+            attachments_json TEXT NOT NULL,
+            owner TEXT NOT NULL DEFAULT '',
+            claimed_at REAL NOT NULL DEFAULT 0
         )
         """
     )
 
 
-def _restore_spool(path: Path) -> list[_UsageEvent]:
+def _restore_spool(
+    path: Path,
+    owner: str,
+    grace_seconds: float,
+) -> list[_UsageEvent]:
+    """Claim unowned or abandoned rows for this process and return them.
+
+    The default spool file is shared by every worker on the host. Rows whose
+    owner has not written for ``grace_seconds`` are considered abandoned and
+    are claimable, exactly like an expired Redis lease; a live worker's rows
+    are never stolen out from under it.
+    """
+
     connection = _connect_spool(path)
     try:
+        connection.execute("BEGIN IMMEDIATE")
+        now = time.time()
+        connection.execute(
+            """
+            UPDATE usage_events SET owner = ?, claimed_at = ?
+            WHERE owner = '' OR owner = ? OR claimed_at < ?
+            """,
+            (owner, now, owner, now - grace_seconds),
+        )
         rows = connection.execute(
             """
             SELECT idempotency_key, api_key_id, usage_policy_id,
                    status_code, count,
                    period_start, attachments_json
             FROM usage_events
+            WHERE owner = ?
             ORDER BY rowid
-            """
+            """,
+            (owner,),
         ).fetchall()
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
     return [_event_from_row(row) for row in rows]
@@ -1231,8 +1505,18 @@ def _persist_spool(
     path: Path,
     events: list[_UsageEvent],
     max_items: int,
-) -> None:
+    owner: str,
+) -> set[str]:
+    """Insert or merge owned rows; return the ids fenced off by another owner.
+
+    A row claimed by another process (spool recovery during a rolling
+    restart) is never modified: its id is reported back so the caller can
+    open an independent event instead of mutating a payload someone else may
+    already have delivered.
+    """
+
     connection = _connect_spool(path)
+    fenced: set[str] = set()
     try:
         connection.execute("BEGIN IMMEDIATE")
         existing_count = int(
@@ -1243,34 +1527,40 @@ def _persist_spool(
         for offset in range(0, len(event_ids), 900):
             id_chunk = event_ids[offset : offset + 900]
             placeholders = ",".join("?" for _ in id_chunk)
-            existing_ids.update(
-                str(row[0])
-                for row in connection.execute(
-                    f"SELECT idempotency_key FROM usage_events "
-                    f"WHERE idempotency_key IN ({placeholders})",
-                    id_chunk,
-                )
-            )
+            for row in connection.execute(
+                f"SELECT idempotency_key, owner FROM usage_events "
+                f"WHERE idempotency_key IN ({placeholders})",
+                id_chunk,
+            ):
+                existing_ids.add(str(row[0]))
+                if str(row[1]) not in ("", owner):
+                    fenced.add(str(row[0]))
         if existing_count + len(events) - len(existing_ids) > max_items:
             raise UsageQueueFull(max_items)
+        now = time.time()
         for event in events:
+            if event.idempotency_key in fenced:
+                continue
             connection.execute(
                 """
                 INSERT INTO usage_events
                     (idempotency_key, api_key_id, usage_policy_id,
                      status_code, count,
-                     period_start, attachments_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                     period_start, attachments_json, owner, claimed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(idempotency_key) DO UPDATE SET
                     count = excluded.count,
-                    attachments_json = excluded.attachments_json
+                    attachments_json = excluded.attachments_json,
+                    owner = excluded.owner,
+                    claimed_at = excluded.claimed_at
                 WHERE usage_events.api_key_id = excluded.api_key_id
                   AND usage_events.usage_policy_id IS excluded.usage_policy_id
                   AND usage_events.status_code = excluded.status_code
                   AND usage_events.period_start = excluded.period_start
                   AND excluded.count >= usage_events.count
+                  AND usage_events.owner IN ('', excluded.owner)
                 """,
-                _event_row(event),
+                (*_event_row(event), owner, now),
             )
             row = connection.execute(
                 """
@@ -1291,15 +1581,16 @@ def _persist_spool(
         raise
     finally:
         connection.close()
+    return fenced
 
 
-def _delete_spool(path: Path, event_ids: list[str]) -> None:
+def _delete_spool(path: Path, event_ids: list[str], owner: str) -> None:
     connection = _connect_spool(path)
     try:
         connection.execute("BEGIN IMMEDIATE")
         connection.executemany(
-            "DELETE FROM usage_events WHERE idempotency_key = ?",
-            [(event_id,) for event_id in event_ids],
+            "DELETE FROM usage_events WHERE idempotency_key = ? AND owner IN ('', ?)",
+            [(event_id, owner) for event_id in event_ids],
         )
         connection.commit()
     except Exception:
@@ -1309,7 +1600,33 @@ def _delete_spool(path: Path, event_ids: list[str]) -> None:
         connection.close()
 
 
-def _dead_letter_spool(path: Path, event: _UsageEvent, detail: str) -> None:
+def _disown_spool(path: Path, event_ids: list[str], owner: str) -> None:
+    """Hand this process's undelivered rows back for immediate reclaim."""
+
+    connection = _connect_spool(path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.executemany(
+            """
+            UPDATE usage_events SET owner = '', claimed_at = 0
+            WHERE idempotency_key = ? AND owner = ?
+            """,
+            [(event_id, owner) for event_id in event_ids],
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _dead_letter_spool(
+    path: Path,
+    event: _UsageEvent,
+    detail: str,
+    owner: str,
+) -> None:
     connection = _connect_spool(path)
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -1338,8 +1655,8 @@ def _dead_letter_spool(path: Path, event: _UsageEvent, detail: str) -> None:
             ),
         )
         connection.execute(
-            "DELETE FROM usage_events WHERE idempotency_key = ?",
-            (event.idempotency_key,),
+            "DELETE FROM usage_events WHERE idempotency_key = ? AND owner IN ('', ?)",
+            (event.idempotency_key, owner),
         )
         connection.commit()
     except Exception:

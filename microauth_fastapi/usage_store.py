@@ -50,8 +50,15 @@ if redis.call("HEXISTS", KEYS[1], id) == 1 then
     if redis.call("HGET", KEYS[4], id) ~= ARGV[4] then
         return -1
     end
+    -- The per-request token makes the merge idempotent: a retry after an
+    -- ambiguous timeout (executed, reply lost) must not double-count.
+    if redis.call("SADD", KEYS[7], ARGV[10]) == 0 then
+        redis.call("PEXPIRE", KEYS[7], ARGV[7])
+        return 2
+    end
     local count = tonumber(redis.call("HGET", KEYS[5], id) or "1")
     if count >= tonumber(ARGV[8]) then
+        redis.call("SREM", KEYS[7], ARGV[10])
         return -2
     end
     redis.call("HINCRBY", KEYS[5], id, 1)
@@ -72,6 +79,7 @@ else
     end
     redis.call("HSET", KEYS[1], id, ARGV[2])
     redis.call("HSET", KEYS[5], id, 1)
+    redis.call("SADD", KEYS[7], ARGV[10])
     if ARGV[3] ~= "" then
         redis.call("RPUSH", KEYS[6], ARGV[3])
     end
@@ -80,7 +88,7 @@ else
     redis.call("HSET", KEYS[4], id, ARGV[4])
     result = 1
 end
-for index = 1, 6 do
+for index = 1, 7 do
     redis.call("PEXPIRE", KEYS[index], ARGV[7])
 end
 return result
@@ -126,7 +134,7 @@ return claimed
 _ACK_SCRIPT = """
 local marker = "microauth-usage-ack-v3"
 local removed = 0
-for index = 4, #ARGV do
+for index = 5, #ARGV do
     local id = ARGV[index]
     if redis.call("HGET", KEYS[4], id) == ARGV[1] then
         redis.call("HDEL", KEYS[1], id)
@@ -135,6 +143,7 @@ for index = 4, #ARGV do
         redis.call("ZREM", KEYS[2], id)
         redis.call("ZREM", KEYS[3], id)
         redis.call("DEL", ARGV[3] .. id)
+        redis.call("DEL", ARGV[4] .. id)
         removed = removed + 1
     end
 end
@@ -198,6 +207,7 @@ redis.call("HDEL", KEYS[5], id)
 redis.call("ZREM", KEYS[2], id)
 redis.call("ZREM", KEYS[3], id)
 redis.call("DEL", ARGV[5] .. id)
+redis.call("DEL", ARGV[6] .. id)
 for index = 1, 6 do
     redis.call("PEXPIRE", KEYS[index], ARGV[4])
 end
@@ -255,6 +265,7 @@ class RedisUsageStore:
         self._counts_key = f"{root}:counts"
         self._dead_key = f"{root}:dead"
         self._att_prefix = f"{root}:att:"
+        self._tok_prefix = f"{root}:tok:"
         self._max_items = max_items
         self._lease_ms = lease_ms
         self.owner = str(uuid.uuid4())
@@ -265,6 +276,9 @@ class RedisUsageStore:
 
     def _att_key(self, event_id: str) -> str:
         return f"{self._att_prefix}{event_id}"
+
+    def _tok_key(self, event_id: str) -> str:
+        return f"{self._tok_prefix}{event_id}"
 
     async def enqueue_claimed(
         self,
@@ -318,32 +332,51 @@ class RedisUsageStore:
         encoded_attachment = (
             _encode_json(attachment, "usage attachment") if attachment else ""
         )
-        try:
-            result = int(
-                await self._redis.eval(
-                    _UPSERT_SCRIPT,
-                    6,
-                    self._events_key,
-                    self._ready_key,
-                    self._leases_key,
-                    self._owners_key,
-                    self._counts_key,
-                    self._att_key(event_id),
-                    event_id,
-                    encoded_static,
-                    encoded_attachment,
-                    self.owner,
-                    self._lease_ms,
-                    self._max_items,
-                    _RETENTION_MS,
-                    max_count,
-                    int(allow_create),
+        # A stable per-request token makes the whole operation idempotent: an
+        # ambiguous failure (the server executed the script but the reply was
+        # lost) is retried once and deduplicated instead of double-counting.
+        raw_token = attachment.get("token") if attachment else None
+        dedup_token = (
+            raw_token
+            if isinstance(raw_token, str) and raw_token
+            else str(uuid.uuid4())
+        )
+        last_error: Exception | None = None
+        result: int | None = None
+        for attempt in range(2):
+            try:
+                result = int(
+                    await self._redis.eval(
+                        _UPSERT_SCRIPT,
+                        7,
+                        self._events_key,
+                        self._ready_key,
+                        self._leases_key,
+                        self._owners_key,
+                        self._counts_key,
+                        self._att_key(event_id),
+                        self._tok_key(event_id),
+                        event_id,
+                        encoded_static,
+                        encoded_attachment,
+                        self.owner,
+                        self._lease_ms,
+                        self._max_items,
+                        _RETENTION_MS,
+                        max_count,
+                        int(allow_create),
+                        dedup_token,
+                    )
                 )
-            )
-        except Exception as exc:
+                break
+            except Exception as exc:  # noqa: BLE001 - transport boundary
+                last_error = exc
+                if attempt == 0:
+                    continue
+        if result is None:
             raise UsageStoreError(
                 "the durable usage queue could not store an event"
-            ) from exc
+            ) from last_error
         if result == 0:
             raise UsageQueueFull(self._max_items)
         if result == -1:
@@ -411,6 +444,7 @@ class RedisUsageStore:
                 self.owner,
                 _RETENTION_MS,
                 self._att_prefix,
+                self._tok_prefix,
                 *event_ids,
             )
         except Exception as exc:
@@ -465,10 +499,23 @@ class RedisUsageStore:
             ) from exc
         return int(extended)
 
-    async def dead_letter(self, event_id: str, detail: str) -> bool:
-        """Move a terminally rejected owned event to the dead-letter hash."""
+    async def dead_letter(
+        self,
+        event_id: str,
+        detail: str,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        """Move a terminally rejected owned event to the dead-letter hash.
 
-        record = _encode_json({"detail": detail[:2000]}, "dead-letter record")
+        The full payload is preserved alongside the rejection detail so
+        dead-lettered usage remains reconcilable, matching the SQLite
+        dead-letter table.
+        """
+
+        record_body: dict[str, Any] = {"detail": detail[:2000]}
+        if payload is not None:
+            record_body["event"] = payload
+        record = _encode_json(record_body, "dead-letter record")
         try:
             moved = await self._redis.eval(
                 _DEAD_LETTER_SCRIPT,
@@ -484,6 +531,7 @@ class RedisUsageStore:
                 record,
                 _RETENTION_MS,
                 self._att_prefix,
+                self._tok_prefix,
             )
         except Exception as exc:
             raise UsageStoreError(

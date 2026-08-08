@@ -726,6 +726,10 @@ class MicroAuth:
             return
         now = time.monotonic()
         self._negative = {h: exp for h, exp in self._negative.items() if exp > now}
+        # An invalid-key flood can outpace TTL expiry; hard-cap the cache by
+        # evicting the oldest entries so memory stays bounded.
+        while len(self._negative) >= 10_000:
+            del self._negative[next(iter(self._negative))]
 
     # -------------------------------------------------------------- syncing
 
@@ -1130,22 +1134,26 @@ class MicroAuth:
                     attachment=attachment,
                 )
                 context.recorded_event_id = recorded_event_id
-            except Exception:
+            except BaseException:
+                # BaseException, not Exception: request cancellation lands
+                # here too (servers cancel the ASGI task on client disconnect
+                # or timeouts). Without this, every cancelled request leaks a
+                # queue reservation forever, shrinking capacity until the
+                # process serves nothing but 503s.
                 self._reporter.release(context.usage_reservation)
                 context.usage_reservation = None
+                # The event was never committed to memory, so no
+                # acknowledgement can ever release a billable hold. Return
+                # the reserved spend in a shielded task that survives even
+                # if this request's cancellation continues.
+                cleanup = asyncio.create_task(
+                    self._release_monetary_hold(context.limit_reservation),
+                    name="microauth-cancelled-request-cleanup",
+                )
                 try:
-                    # The event was never journaled, so no acknowledgement can
-                    # ever release a billable hold. Finalize as non-billable to
-                    # return the reserved spend instead of leaking it until the
-                    # reservation TTL expires.
-                    await self._limiter.finalize_request(
-                        context.limit_reservation,
-                        billable=False,
-                    )
-                except LimitBackendUnavailable:
-                    logger.exception(
-                        "microauth: request journaling and reservation finalization failed"
-                    )
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    pass
                 raise
             context.usage_reservation = None
             if not billable:
@@ -1163,6 +1171,14 @@ class MicroAuth:
                         "microauth: could not finalize a request reservation"
                     )
         return recorded_event_id
+
+    async def _release_monetary_hold(self, reservation: LimitReservation) -> None:
+        try:
+            await self._limiter.finalize_request(reservation, billable=False)
+        except LimitBackendUnavailable:
+            logger.exception(
+                "microauth: request journaling and reservation finalization failed"
+            )
 
     async def _flush_after_response(self, event_id: str | None) -> None:
         if not self._flush_on_response or event_id is None:

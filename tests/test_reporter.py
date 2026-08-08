@@ -148,6 +148,9 @@ def test_record_is_journaled_before_flush_and_restored(tmp_path: Path) -> None:
         second_client,
         60,
         spool_path=spool,
+        # Journal rows are owner-fenced; zero grace simulates the previous
+        # process being long dead so its rows are immediately claimable.
+        spool_claim_grace=0,
         on_restored=on_restored,
     )
 
@@ -505,6 +508,45 @@ def test_explicit_response_flush_bypasses_the_batching_rule() -> None:
         await reporter.flush_on_response(event_id)
         assert reporter.pending_items == 0
         assert len(client.calls) == 1
+
+    run(exercise())
+
+
+def test_cancelling_one_recording_request_does_not_strand_another(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time as time_module
+
+    import microauth_fastapi.reporter as reporter_module
+
+    real_persist = reporter_module._persist_spool
+
+    def slow_persist(*args: Any, **kwargs: Any) -> Any:
+        time_module.sleep(0.05)
+        return real_persist(*args, **kwargs)
+
+    monkeypatch.setattr(reporter_module, "_persist_spool", slow_persist)
+    spool = tmp_path / "usage.sqlite3"
+    reporter = UsageReporter(ScriptedClient([]), 60, spool_path=spool)
+
+    async def exercise() -> None:
+        first = asyncio.create_task(
+            reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        )
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(
+            reporter.record("22222222-2222-4222-8222-222222222222", 201)
+        )
+        await asyncio.sleep(0.01)
+        # Cancelling the request that happened to submit first must not
+        # strand the second request's journal write: the detached writer
+        # resolves every waiter regardless.
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await asyncio.wait_for(second, timeout=2.0)
+        assert reporter.pending_items >= 1
 
     run(exercise())
 

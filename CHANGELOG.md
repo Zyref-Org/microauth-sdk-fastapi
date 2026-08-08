@@ -49,6 +49,22 @@ Durable delivery and distributed-coordination hardening release.
   acknowledgement cleanup is bounded, keeping the hot path O(1).
 - Snapshot cache waiters poll with jittered exponential backoff instead of a
   fixed 50 ms interval.
+- Hardened every audited failure path for exact accounting: request
+  cancellation during finalization releases the queue reservation and the
+  monetary hold instead of leaking them; the SQLite journal writer runs as a
+  detached task so a cancelled request can never strand other requests'
+  writes; Redis merges are idempotent (per-request dedup tokens with one
+  retry), so an ambiguous timeout cannot double-count after crash recovery;
+  a transient journal failure now heals after a 5-second cooldown instead of
+  poisoning the process into permanent 503s; and the shared SQLite journal is
+  owner-fenced with lease-style claims, so multi-worker hosts can no longer
+  steal a live worker's rows or dead-letter billed usage.
+- Performance under high cardinality: limiter acknowledgements and restores
+  are pipelined into single Redis round trips, the batch trigger is an O(1)
+  counter, a full batch completed during an in-flight flush now delivers
+  immediately, event age checks parse timestamps once, dead-lettered Redis
+  events retain their full payload for reconciliation, and the invalid-key
+  negative cache is hard-capped.
 
 ## 2.2.1
 

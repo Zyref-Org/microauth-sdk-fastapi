@@ -7,6 +7,7 @@ import logging
 import math
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -454,11 +455,12 @@ class MemoryLimiter:
             )
             if balance is None:
                 return
-            amount = balance.reservations.get(reservation.token)
+            # Tokens are single-use UUIDs; removing the entry (instead of
+            # zeroing it) lets idle balances be garbage collected.
+            amount = balance.reservations.pop(reservation.token, None)
             if amount is None:
                 return
             balance.reserved = max(0, balance.reserved - amount)
-            balance.reservations[reservation.token] = 0
 
     async def acknowledge(self, attachments: list[dict[str, Any]]) -> None:
         acknowledged_at = time.time()
@@ -480,10 +482,10 @@ class MemoryLimiter:
                 )
                 if balance is None:
                     continue
-                amount = balance.reservations.get(attachment.token)
+                amount = balance.reservations.pop(attachment.token, None)
                 if amount is not None:
                     balance.reserved = max(0, balance.reserved - amount)
-                    balance.reservations[attachment.token] = 0
+                balance.acknowledged.pop(attachment.token, None)
 
     async def restore(
         self,
@@ -836,17 +838,20 @@ class RedisLimiter:
                     max(existing[0], ttl),
                     existing[1] + [attachment.token],
                 )
+        calls = [
+            (
+                _ACKNOWLEDGE_SCRIPT,
+                2,
+                (reservations, acknowledgements),
+                (acknowledged_at, ttl, *tokens),
+            )
+            for (reservations, acknowledgements), (ttl, tokens) in grouped.items()
+        ]
         try:
-            for (reservations, acknowledgements), (ttl, tokens) in grouped.items():
-                await self._redis.eval(
-                    _ACKNOWLEDGE_SCRIPT,
-                    2,
-                    reservations,
-                    acknowledgements,
-                    acknowledged_at,
-                    ttl,
-                    *tokens,
-                )
+            # One pipelined round trip for the whole batch: sequential
+            # per-customer evals otherwise cap delivery throughput at high
+            # customer cardinality.
+            await self._eval_many(calls)
         except Exception as exc:
             raise LimitBackendUnavailable(
                 "Redis could not acknowledge usage reservations"
@@ -878,45 +883,56 @@ class RedisLimiter:
         snapshot: Snapshot,
     ) -> None:
         allowance = _required_allowance(snapshot)
-        try:
-            for raw in attachments:
-                attachment = _parse_attachment(raw)
-                keys = self._attachment_keys(attachment)
-                customer = snapshot.customers.get(attachment.customer_id)
-                customer_floor = (
-                    customer.month_requests
-                    if customer is not None
-                    and attachment.period_key == allowance.period_key
-                    else 0
-                )
-                credit_balance = (
-                    customer.credit_balance_micro if customer is not None else 0
-                )
-                platform_floor = (
-                    allowance.used
-                    if attachment.period_key == allowance.period_key
-                    else 0
-                )
-                restored = int(await self._redis.eval(
+        calls: list[tuple[str, int, tuple[str, ...], tuple[Any, ...]]] = []
+        for raw in attachments:
+            attachment = _parse_attachment(raw)
+            keys = self._attachment_keys(attachment)
+            customer = snapshot.customers.get(attachment.customer_id)
+            customer_floor = (
+                customer.month_requests
+                if customer is not None
+                and attachment.period_key == allowance.period_key
+                else 0
+            )
+            credit_balance = (
+                customer.credit_balance_micro if customer is not None else 0
+            )
+            platform_floor = (
+                allowance.used
+                if attachment.period_key == allowance.period_key
+                else 0
+            )
+            calls.append(
+                (
                     _RESTORE_SCRIPT,
                     5,
-                    keys.customer,
-                    keys.balance,
-                    keys.platform,
-                    keys.reservations,
-                    keys.acknowledgements,
-                    customer_floor,
-                    credit_balance,
-                    _snapshot_version_ms(snapshot),
-                    platform_floor,
-                    allowance.limit,
-                    int(allowance.hard_cap),
-                    attachment.spend_micro,
-                    attachment.token,
-                    _state_ttl_ms(attachment.period_end),
-                    MAX_SAFE_INTEGER,
-                ))
-                if restored < 0:
+                    (
+                        keys.customer,
+                        keys.balance,
+                        keys.platform,
+                        keys.reservations,
+                        keys.acknowledgements,
+                    ),
+                    (
+                        customer_floor,
+                        credit_balance,
+                        _snapshot_version_ms(snapshot),
+                        platform_floor,
+                        allowance.limit,
+                        int(allowance.hard_cap),
+                        attachment.spend_micro,
+                        attachment.token,
+                        _state_ttl_ms(attachment.period_end),
+                        MAX_SAFE_INTEGER,
+                    ),
+                )
+            )
+        try:
+            # A recovered batch can hold hundreds of attachments; one
+            # pipelined round trip keeps recovery off the critical path.
+            results = await self._eval_many(calls)
+            for restored in results:
+                if int(restored) < 0:
                     raise LimitBackendUnavailable(
                         "restored request counters exceeded the safe range"
                     )
@@ -924,6 +940,27 @@ class RedisLimiter:
             raise LimitBackendUnavailable(
                 "Redis could not restore durable usage reservations"
             ) from exc
+
+    async def _eval_many(
+        self,
+        calls: Sequence[tuple[str, int, Sequence[str], Sequence[Any]]],
+    ) -> list[Any]:
+        """Run several Lua evaluations in one round trip when supported."""
+
+        if not calls:
+            return []
+        pipeline_factory = getattr(self._redis, "pipeline", None)
+        if pipeline_factory is None or len(calls) == 1:
+            results = []
+            for script, key_count, keys, args in calls:
+                results.append(
+                    await self._redis.eval(script, key_count, *keys, *args)
+                )
+            return results
+        async with pipeline_factory(transaction=False) as pipe:
+            for script, key_count, keys, args in calls:
+                pipe.eval(script, key_count, *keys, *args)
+            return list(await pipe.execute())
 
     async def aclose(self) -> None:
         if not self._owns_redis:

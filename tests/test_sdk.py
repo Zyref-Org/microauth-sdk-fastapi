@@ -1006,6 +1006,82 @@ def test_dependency_only_use_is_rejected_without_status_middleware() -> None:
     run(exercise())
 
 
+def test_cancelled_finalization_releases_reservations() -> None:
+    from microauth_fastapi.models import LimitReservation
+    from microauth_fastapi.sdk import _RequestUsage
+
+    released: list[Any] = []
+    finalized: list[bool] = []
+    record_started = asyncio.Event()
+
+    class HangingReporter:
+        async def record(self, *args: Any, **kwargs: Any) -> str:
+            record_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        def release(self, reservation: Any) -> None:
+            released.append(reservation)
+
+    class RecordingLimiter:
+        async def finalize_request(
+            self,
+            reservation: LimitReservation,
+            *,
+            billable: bool,
+        ) -> None:
+            finalized.append(billable)
+
+    async def exercise() -> None:
+        auth = MicroAuth(
+            secret_key="mas_test",
+            persist_usage=False,
+            enforce_rps=False,
+        )
+        auth._reporter = HangingReporter()  # type: ignore[assignment]
+        auth._limiter = RecordingLimiter()  # type: ignore[assignment]
+        context = _RequestUsage(
+            principal=Customer(
+                id="customer-1",
+                key_id=KEY_ID,
+                status="active",
+                billing_model="payg",
+                rps=0,
+                price_per_request_micro=25,
+                monthly_quota=None,
+                credit_balance_micro=1_000_000,
+            ),
+            billable_statuses=frozenset({200}),
+            usage_policy_id=POLICY_ID,
+            usage_reservation=object(),  # type: ignore[arg-type]
+            limit_reservation=LimitReservation(
+                token="token-1",
+                tenant_scope="tenant-1",
+                customer_id="customer-1",
+                period_key="2026-08",
+                period_end=datetime.now(timezone.utc) + timedelta(days=1),
+                spend_micro=25,
+            ),
+            occurred_at=datetime.now(timezone.utc),
+        )
+        # Servers cancel the ASGI task on client disconnects and timeouts;
+        # the cancellation lands inside the durable record await.
+        task = asyncio.create_task(auth._finish_request(context, 200))
+        await record_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Let the shielded cleanup task run to completion.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    run(exercise())
+    # The queue reservation and the monetary hold were both returned; neither
+    # can leak capacity or prepaid credit until a TTL.
+    assert len(released) == 1
+    assert finalized == [False]
+
+
 def test_journal_failure_releases_the_billable_monetary_reservation() -> None:
     from microauth_fastapi.models import LimitReservation
     from microauth_fastapi.sdk import _RequestUsage
