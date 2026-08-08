@@ -26,6 +26,7 @@ from .exceptions import (
     UsageQueueFull,
     UsageStoreError,
 )
+from .journal import JournalOp, WalJournal, enforce_capacity
 from .models import MAX_USAGE_COUNT
 from .usage_store import (
     UPSERT_MERGED,
@@ -51,9 +52,6 @@ _MAX_EVENT_AGE_SECONDS = 45 * 86_400
 # the process into permanent 503s.
 _STORE_ERROR_COOLDOWN_SECONDS = 5.0
 
-
-class _SpoolFencedError(UsageStoreError):
-    """The journal row is owned by another process and must not be mutated."""
 
 UsageCallback = Callable[[list[dict[str, Any]]], Awaitable[None] | None]
 AuthorizationCallback = Callable[
@@ -176,6 +174,12 @@ class UsageReporter:
         # API key, policy, status and hour merge into one counted event
         # instead of one row per request.
         self._open_events: dict[tuple[str, str | None, int, str], str] = {}
+        # In-flight event creations by identity: followers in a cold burst
+        # wait for the first creation instead of opening one event each.
+        self._creating: dict[
+            tuple[str, str | None, int, str],
+            asyncio.Future[None],
+        ] = {}
         self._merge_limit = min(batch_size, MAX_USAGE_COUNT)
         self._pending: deque[str] = deque()
         self._reservations: set[str] = set()
@@ -192,13 +196,13 @@ class UsageReporter:
         # Anchor the "seconds since the last flush" batching rule so the
         # first request batches instead of flushing instantly.
         self._last_flush = time.monotonic()
-        self._spool_writes: list[tuple[list[_UsageEvent], asyncio.Future[None]]] = []
+        self._journal_writes: list[tuple[list[JournalOp], asyncio.Future[None]]] = []
         self._spool_writer_task: asyncio.Task[None] | None = None
-        # The default spool file is shared by every worker process on the
-        # host, so rows are owner-fenced like the Redis queue: each process
-        # claims rows under its own identity, and abandoned rows (owner not
-        # writing for spool_claim_grace) are recoverable by any process.
-        self._spool_owner = str(uuid.uuid4())
+        # Each process appends to its own WAL file (single writer, O(1)
+        # appends). Files whose owner stopped writing for spool_claim_grace
+        # are adopted by any other process via an atomic rename.
+        self._journal: WalJournal | None = None
+        self._journal_base: Path | None = None
         self._spool_grace = spool_claim_grace
         # Requests awaiting delivery (an O(1) counter for the batch trigger);
         # merged events contribute their full counts.
@@ -289,13 +293,29 @@ class UsageReporter:
             raise UsageQueueFull(self._max_items)
 
         merge_key = (api_key_id, usage_policy_id, status_code, period_start)
-        merged_id = await self._try_merge(merge_key, normalized_attachment)
-        if merged_id is not None:
-            if reservation is not None:
-                self._consume_reservation(reservation)
-            self._pending_requests += 1
-            self._schedule_flush()
-            return merged_id
+        for _ in range(2):
+            merged_id = await self._try_merge(merge_key, normalized_attachment)
+            if merged_id is not None:
+                if reservation is not None:
+                    self._consume_reservation(reservation)
+                self._pending_requests += 1
+                self._schedule_flush()
+                return merged_id
+            # A cold concurrent burst would otherwise open one event per
+            # in-flight request: the first request registers the open event
+            # only after its durable write completes. Followers wait for the
+            # in-flight creation and merge into it instead.
+            creating = self._creating.get(merge_key)
+            if creating is None:
+                break
+            try:
+                await asyncio.shield(creating)
+            except Exception:  # noqa: BLE001, S110 - creator failures are
+                # handled by each follower independently: the retry loop
+                # makes one of them the next creator, which surfaces the
+                # underlying persistence error through its own attempt.
+                pass
+            continue
 
         event = _UsageEvent(
             idempotency_key=str(uuid.uuid4()),
@@ -306,7 +326,20 @@ class UsageReporter:
             period_start=period_start,
             attachments=[normalized_attachment],
         )
-        await self._persist_event(event)
+        creation: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        if merge_key not in self._creating:
+            self._creating[merge_key] = creation
+        try:
+            await self._persist_event(event)
+        except BaseException as exc:
+            if not creation.done():
+                creation.set_exception(exc)
+                # Consume the exception if no follower awaited this future.
+                creation.exception()
+            raise
+        finally:
+            if self._creating.get(merge_key) is creation:
+                del self._creating[merge_key]
         if reservation is not None and reservation.token not in self._reservations:
             # Validated before the durable write; a concurrent consumer while
             # awaiting persistence indicates a caller bug.
@@ -318,6 +351,8 @@ class UsageReporter:
         self._pending.append(event.idempotency_key)
         self._pending_requests += 1
         self._schedule_flush()
+        if not creation.done():
+            creation.set_result(None)
         return event.idempotency_key
 
     async def _try_merge(
@@ -359,22 +394,21 @@ class UsageReporter:
                     self._open_events.pop(merge_key, None)
                     return None
             elif self._spool_path is not None:
-                # Commit in memory first and journal a synchronous snapshot of
-                # the merged state, so concurrent merges into the same event
-                # serialize correctly through the group-commit writer.
+                # Commit in memory first, then journal a constant-size merge
+                # record: one appended line per request, never a rewrite of
+                # the whole (growing) merged event.
                 event.count += 1
                 if attachment:
                     event.attachments.append(attachment)
-                snapshot = _UsageEvent(
-                    idempotency_key=event.idempotency_key,
-                    api_key_id=event.api_key_id,
-                    usage_policy_id=event.usage_policy_id,
-                    status_code=event.status_code,
-                    count=event.count,
-                    period_start=event.period_start,
-                    attachments=list(event.attachments),
+                future = self._submit_journal_ops(
+                    [
+                        JournalOp(
+                            op="merge",
+                            event_id=event_id,
+                            attachment=attachment or None,
+                        )
+                    ]
                 )
-                future = self._submit_spool_write([snapshot])
                 try:
                     if future is not None:
                         await asyncio.shield(future)
@@ -389,17 +423,6 @@ class UsageReporter:
                         self._merge_reconciler(event, attachment)
                     )
                     raise
-                except _SpoolFencedError:
-                    # Another process claimed this row during spool recovery;
-                    # fall back to an independent event.
-                    event.count -= 1
-                    if attachment:
-                        try:
-                            event.attachments.remove(attachment)
-                        except ValueError:
-                            pass
-                    self._open_events.pop(merge_key, None)
-                    return None
                 except BaseException:
                     event.count -= 1
                     if attachment:
@@ -465,12 +488,9 @@ class UsageReporter:
                     "falling back to the local journal",
                     exc,
                 )
-        await self._persist_batched([event])
-
-    async def _persist_batched(self, events: list[_UsageEvent]) -> None:
-        """Group concurrent journal writes into one SQLite transaction."""
-
-        future = self._submit_spool_write(events)
+        future = self._submit_journal_ops(
+            [JournalOp(op="create", event=_event_payload(event))]
+        )
         if future is None:
             return
         # The shield keeps the shared future alive when this request is
@@ -478,50 +498,59 @@ class UsageReporter:
         # remains observable and other waiters are unaffected.
         await asyncio.shield(future)
 
-    def _submit_spool_write(
+    def _ensure_journal(self) -> WalJournal | None:
+        if self._spool_path is None:
+            return None
+        if self._journal is None or self._journal_base != self._spool_path:
+            self._journal = WalJournal(
+                self._spool_path,
+                max_items=self._max_items,
+                grace_seconds=self._spool_grace,
+            )
+            self._journal_base = self._spool_path
+        return self._journal
+
+    def _submit_journal_ops(
         self,
-        events: list[_UsageEvent],
+        ops: list[JournalOp],
     ) -> asyncio.Future[None] | None:
-        if self._spool_path is None or not events:
+        journal = self._ensure_journal()
+        if journal is None or not ops:
             return None
         if (
             self._store_error is not None
             and time.monotonic() < self._store_error_until
         ):
             # Fail fast during the cooldown; afterwards the next write probes
-            # the store again instead of staying poisoned until restart.
+            # the journal again instead of staying poisoned until restart.
             raise self._store_error
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        self._spool_writes.append((events, future))
+        self._journal_writes.append((ops, future))
         writer = self._spool_writer_task
         if writer is None or writer.done():
             # A detached task owns the write loop, so cancelling any waiting
             # request can never strand other requests' futures unresolved.
             self._spool_writer_task = asyncio.create_task(
-                self._run_spool_writer(),
+                self._run_journal_writer(),
                 name="microauth-usage-journal-writer",
             )
         return future
 
-    async def _run_spool_writer(self) -> None:
-        spool_path = self._spool_path
-        assert spool_path is not None  # guarded by _submit_spool_write
-        while self._spool_writes:
-            batch = self._spool_writes
-            self._spool_writes = []
-            combined = [
-                event
-                for batch_events, _ in batch
-                for event in batch_events
-            ]
+    async def _run_journal_writer(self) -> None:
+        journal = self._journal
+        assert journal is not None  # guarded by _submit_journal_ops
+        while self._journal_writes:
+            batch = self._journal_writes
+            self._journal_writes = []
+            combined = [op for batch_ops, _ in batch for op in batch_ops]
+            # Live payload snapshot lets the journal rebuild itself if the
+            # file was adopted or removed out from under this process.
+            pending = {
+                event_id: _event_payload(event)
+                for event_id, event in self._events.items()
+            }
             try:
-                fenced = await asyncio.to_thread(
-                    _persist_spool,
-                    spool_path,
-                    combined,
-                    self._max_items,
-                    self._spool_owner,
-                )
+                await asyncio.to_thread(journal.apply, combined, pending)
             except BaseException as exc:
                 error: Exception
                 if isinstance(exc, (UsageQueueFull, UsageStoreError)):
@@ -544,21 +573,8 @@ class UsageReporter:
                     raise
             else:
                 self._store_error = None
-                for batch_events, waiter in batch:
-                    if waiter.done():
-                        continue
-                    if any(
-                        event.idempotency_key in fenced
-                        for event in batch_events
-                    ):
-                        # Not a store failure: the row belongs to another
-                        # process now. The caller opens an independent event.
-                        waiter.set_exception(
-                            _SpoolFencedError(
-                                "the journal row is owned by another process"
-                            )
-                        )
-                    else:
+                for _, waiter in batch:
+                    if not waiter.done():
                         waiter.set_result(None)
 
     async def start(self) -> None:
@@ -663,28 +679,70 @@ class UsageReporter:
         await self._absorb_recovered(recovered)
 
     async def _sweep_spool(self) -> None:
-        """Reclaim abandoned rows other host processes left in the journal."""
+        """Adopt journal files abandoned by other host processes."""
 
-        assert self._spool_path is not None
+        journal = self._ensure_journal()
+        if journal is None:
+            return
         try:
-            events = await asyncio.to_thread(
-                _restore_spool,
-                self._spool_path,
-                self._spool_owner,
-                self._spool_grace,
-            )
+            adopted, claimed_paths = await asyncio.to_thread(journal.adopt_orphans)
         except Exception as exc:  # noqa: BLE001 - storage boundary
             logger.warning(
                 "microauth: usage journal sweep failed (%s)",
                 exc,
             )
             return
-        capacity = self._max_items - len(self._events) - len(self._reservations)
-        recovered = [
-            event
-            for event in events
-            if event.idempotency_key not in self._events
-        ][: max(0, capacity)]
+        try:
+            await self._absorb_payloads(adopted)
+        except UsageStoreError as exc:
+            # The claimed files survive and stay adoptable by any process;
+            # nothing is lost, the adoption simply retries later.
+            logger.warning(
+                "microauth: could not re-journal adopted usage events (%s)",
+                exc,
+            )
+            return
+        # Reached only after the adopted events are durably re-journaled
+        # under our ownership (inside _absorb_payloads).
+        if claimed_paths:
+            await asyncio.to_thread(journal.remove_adopted, claimed_paths)
+
+    async def _absorb_payloads(self, payloads: dict[str, dict[str, Any]]) -> None:
+        """Validate adopted payloads, re-journal them as ours, absorb them."""
+
+        capacity = max(
+            0,
+            self._max_items - len(self._events) - len(self._reservations),
+        )
+        recovered: list[_UsageEvent] = []
+        for event_id, payload in payloads.items():
+            if event_id in self._events:
+                continue
+            if len(recovered) >= capacity:
+                logger.error(
+                    "microauth: usage queue is full; %d adopted events were "
+                    "dropped from this sweep",
+                    len(payloads) - len(recovered),
+                )
+                break
+            try:
+                recovered.append(_event_from_store_payload(event_id, payload))
+            except UsageStoreError as exc:
+                logger.error(
+                    "microauth: dropping an invalid adopted usage event %s (%s)",
+                    event_id,
+                    exc,
+                )
+        if not recovered:
+            return
+        future = self._submit_journal_ops(
+            [
+                JournalOp(op="create", event=_event_payload(event))
+                for event in recovered
+            ]
+        )
+        if future is not None:
+            await asyncio.shield(future)
         await self._absorb_recovered(recovered)
 
     async def _absorb_recovered(self, recovered: list[_UsageEvent]) -> None:
@@ -994,6 +1052,10 @@ class UsageReporter:
                 len(self._events) + len(self._reservations),
                 "queue changed while shutdown was draining",
             )
+        if self._journal is not None:
+            # A clean drain leaves nothing to recover; remove the journal so
+            # hosts do not accumulate one file per past process.
+            await asyncio.to_thread(self._journal.remove_if_empty, {})
 
     async def _release_store_claims(self) -> bool:
         """Hand undelivered events back to the shared backend at shutdown.
@@ -1024,23 +1086,26 @@ class UsageReporter:
                 released,
             )
         else:
-            assert self._spool_path is not None
+            journal = self._ensure_journal()
+            assert journal is not None
             try:
-                await asyncio.to_thread(
-                    _disown_spool,
-                    self._spool_path,
-                    event_ids,
-                    self._spool_owner,
-                )
+                # Compact first so the released file carries exactly the
+                # undelivered events, then backdate it for instant adoption.
+                pending = {
+                    event_id: _event_payload(event)
+                    for event_id, event in self._events.items()
+                }
+                await asyncio.to_thread(journal.compact, pending)
+                await asyncio.to_thread(journal.disown)
             except Exception:
                 logger.exception(
                     "microauth: undelivered usage could not be handed back to "
-                    "the shared journal during shutdown"
+                    "the journal during shutdown"
                 )
                 return False
             logger.warning(
-                "microauth: %d undelivered usage item(s) were handed back to "
-                "the shared journal for another process",
+                "microauth: %d undelivered usage item(s) were left in the "
+                "journal for adoption by another process",
                 len(event_ids),
             )
         self._remove_events(event_ids)
@@ -1157,30 +1222,57 @@ class UsageReporter:
         self._wake.set()
 
     async def _restore(self) -> None:
-        if self._spool_path is None:
+        journal = self._ensure_journal()
+        if journal is None:
             return
         try:
-            events = await asyncio.to_thread(
-                _restore_spool,
-                self._spool_path,
-                self._spool_owner,
-                self._spool_grace,
-            )
+            state = await asyncio.to_thread(journal.replay_own)
+            adopted, claimed_paths = await asyncio.to_thread(journal.adopt_orphans)
         except UsageStoreError:
             raise
         except Exception as exc:
             raise UsageStoreError(f"could not restore {self._spool_path}: {exc}") from exc
-        unseen = [
-            event
-            for event in events
-            if event.idempotency_key not in self._events
-        ]
-        for event in unseen:
+        migrated = await self._migrate_legacy_spool(journal)
+        for event_id, payload in adopted.items():
+            state.setdefault(event_id, payload)
+        for event_id, payload in migrated.items():
+            state.setdefault(event_id, payload)
+        enforce_capacity(state, self._max_items)
+        unseen: list[_UsageEvent] = []
+        for event_id, payload in state.items():
+            if event_id in self._events:
+                continue
+            try:
+                event = _event_from_store_payload(event_id, payload)
+            except UsageStoreError as exc:
+                logger.error(
+                    "microauth: dropping an invalid restored usage event %s (%s)",
+                    event_id,
+                    exc,
+                )
+                continue
             # A restored event may already have been attempted before the
             # previous process died; its payload is pinned by the receipt.
             event.frozen = True
-        if len(self._events) + len(unseen) > self._max_items:
-            raise UsageQueueFull(self._max_items)
+            unseen.append(event)
+        adopted_or_migrated = [
+            event
+            for event in unseen
+            if event.idempotency_key in adopted or event.idempotency_key in migrated
+        ]
+        if adopted_or_migrated:
+            # Events taken from other files live only in memory until they
+            # are re-journaled under our ownership.
+            future = self._submit_journal_ops(
+                [
+                    JournalOp(op="create", event=_event_payload(event))
+                    for event in adopted_or_migrated
+                ]
+            )
+            if future is not None:
+                await asyncio.shield(future)
+        if claimed_paths:
+            await asyncio.to_thread(journal.remove_adopted, claimed_paths)
         if unseen:
             await self._notify(self._on_restored, _event_attachments(unseen))
         for event in unseen:
@@ -1190,32 +1282,87 @@ class UsageReporter:
         if unseen:
             self._schedule_flush()
 
+    async def _migrate_legacy_spool(
+        self,
+        journal: WalJournal,
+    ) -> dict[str, dict[str, Any]]:
+        """One-way migration of a pre-2.5 shared SQLite spool.
+
+        Rows are claimed with the same owner-fenced grace rules the SQLite
+        implementation used (a 2.4 worker still writing its rows keeps them),
+        re-journaled into this process's WAL, and only then deleted from the
+        legacy database.
+        """
+
+        legacy = journal.legacy_sqlite_path()
+        if not legacy.exists():
+            return {}
+        try:
+            events = await asyncio.to_thread(
+                _restore_legacy_spool,
+                legacy,
+                journal.owner,
+                self._spool_grace,
+            )
+        except Exception as exc:  # noqa: BLE001 - storage boundary
+            logger.warning(
+                "microauth: legacy usage spool at %s could not be migrated (%s)",
+                legacy,
+                exc,
+            )
+            return {}
+        if not events:
+            return {}
+        migrated = {
+            event.idempotency_key: _event_payload(event) for event in events
+        }
+        try:
+            await asyncio.to_thread(
+                _delete_legacy_spool,
+                legacy,
+                list(migrated),
+                journal.owner,
+            )
+        except Exception as exc:  # noqa: BLE001 - storage boundary
+            # The rows stay claimed by us in the legacy file; if we crash
+            # before delivering, the grace expiry hands them to another
+            # process. Duplicates are settled by the server's receipts.
+            logger.warning(
+                "microauth: migrated legacy usage rows could not be removed "
+                "from %s (%s)",
+                legacy,
+                exc,
+            )
+        logger.info(
+            "microauth: migrated %d usage event(s) from the legacy SQLite "
+            "spool at %s",
+            len(migrated),
+            legacy,
+        )
+        return migrated
+
     async def _delete_persisted(self, event_ids: list[str]) -> None:
         if self._spool_path is None or not event_ids:
             return
-        try:
-            await asyncio.to_thread(
-                _delete_spool,
-                self._spool_path,
-                event_ids,
-                self._spool_owner,
-            )
-        except Exception as exc:
-            raise UsageStoreError(f"could not update usage journal: {exc}") from exc
+        future = self._submit_journal_ops([JournalOp(op="ack", event_ids=event_ids)])
+        if future is not None:
+            await asyncio.shield(future)
 
     async def _persist_dead_letter(self, event: _UsageEvent, detail: str) -> None:
         if self._spool_path is None:
             return
-        try:
-            await asyncio.to_thread(
-                _dead_letter_spool,
-                self._spool_path,
-                event,
-                detail,
-                self._spool_owner,
-            )
-        except Exception as exc:
-            raise UsageStoreError(f"could not update usage dead letter: {exc}") from exc
+        future = self._submit_journal_ops(
+            [
+                JournalOp(
+                    op="dead",
+                    event_id=event.idempotency_key,
+                    event=_event_payload(event),
+                    detail=detail,
+                )
+            ]
+        )
+        if future is not None:
+            await asyncio.shield(future)
 
     async def _notify(
         self,
@@ -1359,6 +1506,21 @@ def _event_attachments(events: Iterable[_UsageEvent]) -> list[dict[str, Any]]:
     ]
 
 
+def _event_payload(event: _UsageEvent) -> dict[str, Any]:
+    """The canonical durable envelope: full item plus request attachments."""
+
+    return {
+        "item": event.as_payload(),
+        "attachments": list(event.attachments),
+    }
+
+
+# --------------------------------------------------------------------------
+# Legacy SQLite spool (pre-2.5) - retained only to migrate leftover rows
+# into the append-only WAL journal on startup. No new writes ever land here.
+# --------------------------------------------------------------------------
+
+
 def _connect_spool(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=5.0)
@@ -1457,17 +1619,17 @@ def _create_usage_table(connection: sqlite3.Connection) -> None:
     )
 
 
-def _restore_spool(
+def _restore_legacy_spool(
     path: Path,
     owner: str,
     grace_seconds: float,
 ) -> list[_UsageEvent]:
-    """Claim unowned or abandoned rows for this process and return them.
+    """Claim unowned or abandoned legacy rows for this process.
 
-    The default spool file is shared by every worker on the host. Rows whose
+    The legacy spool file was shared by every worker on the host. Rows whose
     owner has not written for ``grace_seconds`` are considered abandoned and
-    are claimable, exactly like an expired Redis lease; a live worker's rows
-    are never stolen out from under it.
+    are claimable, exactly like an expired Redis lease; a 2.4 worker still
+    alive and writing keeps its rows until it drains them itself.
     """
 
     connection = _connect_spool(path)
@@ -1501,162 +1663,13 @@ def _restore_spool(
     return [_event_from_row(row) for row in rows]
 
 
-def _persist_spool(
-    path: Path,
-    events: list[_UsageEvent],
-    max_items: int,
-    owner: str,
-) -> set[str]:
-    """Insert or merge owned rows; return the ids fenced off by another owner.
-
-    A row claimed by another process (spool recovery during a rolling
-    restart) is never modified: its id is reported back so the caller can
-    open an independent event instead of mutating a payload someone else may
-    already have delivered.
-    """
-
-    connection = _connect_spool(path)
-    fenced: set[str] = set()
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        existing_count = int(
-            connection.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0]
-        )
-        event_ids = [event.idempotency_key for event in events]
-        existing_ids: set[str] = set()
-        for offset in range(0, len(event_ids), 900):
-            id_chunk = event_ids[offset : offset + 900]
-            placeholders = ",".join("?" for _ in id_chunk)
-            for row in connection.execute(
-                f"SELECT idempotency_key, owner FROM usage_events "
-                f"WHERE idempotency_key IN ({placeholders})",
-                id_chunk,
-            ):
-                existing_ids.add(str(row[0]))
-                if str(row[1]) not in ("", owner):
-                    fenced.add(str(row[0]))
-        if existing_count + len(events) - len(existing_ids) > max_items:
-            raise UsageQueueFull(max_items)
-        now = time.time()
-        for event in events:
-            if event.idempotency_key in fenced:
-                continue
-            connection.execute(
-                """
-                INSERT INTO usage_events
-                    (idempotency_key, api_key_id, usage_policy_id,
-                     status_code, count,
-                     period_start, attachments_json, owner, claimed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(idempotency_key) DO UPDATE SET
-                    count = excluded.count,
-                    attachments_json = excluded.attachments_json,
-                    owner = excluded.owner,
-                    claimed_at = excluded.claimed_at
-                WHERE usage_events.api_key_id = excluded.api_key_id
-                  AND usage_events.usage_policy_id IS excluded.usage_policy_id
-                  AND usage_events.status_code = excluded.status_code
-                  AND usage_events.period_start = excluded.period_start
-                  AND excluded.count >= usage_events.count
-                  AND usage_events.owner IN ('', excluded.owner)
-                """,
-                (*_event_row(event), owner, now),
-            )
-            row = connection.execute(
-                """
-                SELECT idempotency_key, api_key_id, usage_policy_id,
-                       status_code, count,
-                       period_start, attachments_json
-                FROM usage_events WHERE idempotency_key = ?
-                """,
-                (event.idempotency_key,),
-            ).fetchone()
-            if _event_from_row(row) != event:
-                raise UsageStoreError(
-                    f"journal payload mismatch for {event.idempotency_key}"
-                )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-    return fenced
-
-
-def _delete_spool(path: Path, event_ids: list[str], owner: str) -> None:
+def _delete_legacy_spool(path: Path, event_ids: list[str], owner: str) -> None:
     connection = _connect_spool(path)
     try:
         connection.execute("BEGIN IMMEDIATE")
         connection.executemany(
             "DELETE FROM usage_events WHERE idempotency_key = ? AND owner IN ('', ?)",
             [(event_id, owner) for event_id in event_ids],
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-
-
-def _disown_spool(path: Path, event_ids: list[str], owner: str) -> None:
-    """Hand this process's undelivered rows back for immediate reclaim."""
-
-    connection = _connect_spool(path)
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.executemany(
-            """
-            UPDATE usage_events SET owner = '', claimed_at = 0
-            WHERE idempotency_key = ? AND owner = ?
-            """,
-            [(event_id, owner) for event_id in event_ids],
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-
-
-def _dead_letter_spool(
-    path: Path,
-    event: _UsageEvent,
-    detail: str,
-    owner: str,
-) -> None:
-    connection = _connect_spool(path)
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            """
-            INSERT INTO usage_dead_letters
-                (idempotency_key, payload_json, detail, rejected_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(idempotency_key) DO UPDATE SET
-                detail = excluded.detail,
-                rejected_at = excluded.rejected_at
-            """,
-            (
-                event.idempotency_key,
-                json.dumps(
-                    {
-                        "item": event.as_payload(),
-                        "attachments": event.attachments,
-                    },
-                    allow_nan=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ),
-                detail[:2000],
-                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            ),
-        )
-        connection.execute(
-            "DELETE FROM usage_events WHERE idempotency_key = ? AND owner IN ('', ?)",
-            (event.idempotency_key, owner),
         )
         connection.commit()
     except Exception:
@@ -1701,23 +1714,6 @@ def _event_from_store_payload(
             item.get("period_start"),
             attachments_json,
         )
-    )
-
-
-def _event_row(event: _UsageEvent) -> tuple[Any, ...]:
-    return (
-        event.idempotency_key,
-        event.api_key_id,
-        event.usage_policy_id,
-        event.status_code,
-        event.count,
-        event.period_start,
-        json.dumps(
-            event.attachments,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ),
     )
 
 

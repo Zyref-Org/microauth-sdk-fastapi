@@ -508,8 +508,8 @@ class RedisUsageStore:
         """Move a terminally rejected owned event to the dead-letter hash.
 
         The full payload is preserved alongside the rejection detail so
-        dead-lettered usage remains reconcilable, matching the SQLite
-        dead-letter table.
+        dead-lettered usage remains reconcilable, matching the local
+        journal's dead-letter file.
         """
 
         record_body: dict[str, Any] = {"detail": detail[:2000]}

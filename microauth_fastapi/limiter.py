@@ -26,6 +26,7 @@ logger = logging.getLogger("microauth")
 DENIED_BALANCE = "balance"
 DENIED_QUOTA = "quota"
 DENIED_PLATFORM = "platform"
+DENIED_RPS = "rps"
 
 _RPS_SCRIPT = """
 local marker = "microauth-rps-v3"
@@ -37,7 +38,21 @@ return count
 """
 
 _RESERVE_SCRIPT = """
-local marker = "microauth-request-reserve-v3"
+local marker = "microauth-request-reserve-v4"
+-- The per-second rate window shares this script so the whole admission
+-- decision costs one Redis round trip. It runs first: a rate-limited
+-- request must not consume quota, balance or platform capacity.
+local rps_limit = tonumber(ARGV[16])
+if rps_limit > 0 then
+    local rps_count = redis.call("INCR", KEYS[6])
+    if rps_count == 1 then
+        redis.call("PEXPIRE", KEYS[6], 3000)
+    end
+    if rps_count > rps_limit then
+        return {6, 0, -1, 0}
+    end
+end
+
 local customer_floor = tonumber(redis.call("HGET", KEYS[1], "floor") or ARGV[1])
 local customer_count = tonumber(redis.call("HGET", KEYS[1], "count") or customer_floor)
 local incoming_customer_floor = tonumber(ARGV[1])
@@ -258,6 +273,8 @@ class Limiter(Protocol):
         enforce_balance: bool,
         enforce_quota: bool,
         enforce_platform: bool,
+        rps: int = 0,
+        credential_id: str = "",
     ) -> LimitReservation: ...
 
     async def finalize_request(
@@ -368,12 +385,25 @@ class MemoryLimiter:
         enforce_balance: bool,
         enforce_quota: bool,
         enforce_platform: bool,
+        rps: int = 0,
+        credential_id: str = "",
     ) -> LimitReservation:
         allowance = _required_allowance(snapshot)
         snapshot_version = _snapshot_version(snapshot)
         if potential_spend_micro < 0 or potential_spend_micro > MAX_SAFE_INTEGER:
             raise LimitBackendUnavailable("potential request spend is outside the safe range")
         with self._lock:
+            if rps > 0:
+                # Checked first, inside the same lock as the admission
+                # decision: a rate-limited request consumes nothing else.
+                epoch = int(time.time())
+                window_key = (customer.id, credential_id)
+                window = self._windows.get(window_key)
+                if window is None or window.epoch != epoch:
+                    window = self._windows[window_key] = _Window(epoch=epoch, count=0)
+                window.count += 1
+                if window.count > rps:
+                    raise ReservationDenied(DENIED_RPS)
             quota = self._quota_state(tenant_scope, customer, allowance)
             quota.floor = max(quota.floor, customer.month_requests)
             quota.count = max(quota.count, quota.floor)
@@ -728,6 +758,8 @@ class RedisLimiter:
         enforce_balance: bool,
         enforce_quota: bool,
         enforce_platform: bool,
+        rps: int = 0,
+        credential_id: str = "",
     ) -> LimitReservation:
         allowance = _required_allowance(snapshot)
         if potential_spend_micro < 0 or potential_spend_micro > MAX_SAFE_INTEGER:
@@ -737,17 +769,19 @@ class RedisLimiter:
             allowance.period_key,
             customer.id,
         )
+        rps_key = self._rps_key(tenant_scope, customer.id, credential_id)
         ttl_ms = _state_ttl_ms(allowance.period_end)
         quota = customer.effective.monthly_quota
         try:
             result = await self._redis.eval(
                 _RESERVE_SCRIPT,
-                5,
+                6,
                 keys.customer,
                 keys.balance,
                 keys.platform,
                 keys.reservations,
                 keys.acknowledgements,
+                rps_key,
                 customer.month_requests,
                 customer.credit_balance_micro,
                 _snapshot_version_ms(snapshot),
@@ -763,6 +797,7 @@ class RedisLimiter:
                 _milliseconds(snapshot.refresh_started_at),
                 ttl_ms,
                 MAX_SAFE_INTEGER,
+                max(0, rps),
             )
             values = [int(value) for value in result]
         except Exception as exc:
@@ -778,6 +813,8 @@ class RedisLimiter:
             raise ReservationDenied(DENIED_QUOTA)
         if reason == 3:
             raise ReservationDenied(DENIED_PLATFORM)
+        if reason == 6:
+            raise ReservationDenied(DENIED_RPS)
         if reason != 0:
             raise LimitBackendUnavailable("Redis could not create a safe reservation")
         return LimitReservation(
@@ -986,6 +1023,15 @@ class RedisLimiter:
             reservations=f"{root}:reservations:{customer_hash}",
             acknowledgements=f"{root}:acks:{customer_hash}",
         )
+
+    def _rps_key(self, tenant_scope: str, customer_id: str, credential_id: str) -> str:
+        # Shares the tenant hash tag with the reservation keys so the
+        # combined reserve script stays single-slot on Redis Cluster.
+        tag = hashlib.sha256(tenant_scope.encode()).hexdigest()[:32]
+        identity = hashlib.sha256(
+            f"{customer_id}\0{credential_id}".encode()
+        ).hexdigest()[:32]
+        return f"{self._prefix}:{{{tag}}}:rps:{identity}:{int(time.time())}"
 
     def _attachment_keys(self, attachment: _Attachment) -> _RedisKeys:
         generated = self._keys(

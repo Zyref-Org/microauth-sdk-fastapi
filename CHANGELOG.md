@@ -1,8 +1,53 @@
 # Changelog
 
-## 2.3.0
+## 2.5.0
 
-Durable delivery and distributed-coordination hardening release.
+Redis-less journal rewrite and one-round-trip admission release.
+
+- Replaced the SQLite usage spool with a per-process append-only journal
+  (WAL). Every completed request costs one appended, group-committed and
+  fsynced JSON line — merges included — so journal work per request is O(1)
+  regardless of how many requests have merged into an event. The previous
+  SQLite journal rewrote the full merged row (with its growing attachment
+  list) on every request, which made Redis-less p99 latency climb with
+  sustained bursts. SQLite is no longer used anywhere in the SDK.
+- Journal recovery uses whole-file adoption: each process owns one journal
+  file; a file whose owner stopped writing for `spool_claim_grace` (default
+  120s) is claimed atomically by rename, replayed, re-journaled under the
+  adopter's ownership, and only then removed, so an adopter crash cannot lose
+  events. Graceful shutdown backdates the file for immediate adoption by the
+  next process. If another process adopts a live worker's file (clock skew,
+  aggressive grace), the owner's next write detects the theft and rebuilds a
+  complete journal; duplicates are settled by the server's idempotency
+  receipts.
+- Rows left behind by a pre-2.5 SQLite spool are migrated automatically on
+  startup under the same owner-fenced grace rules and then removed from the
+  legacy file. A still-running 2.4 worker keeps its own rows.
+- Dead-lettered events are appended to a per-process `*.dead.jsonl` file with
+  their full payload.
+- Cold-burst event coalescing: concurrent requests for the same API key,
+  policy, status and hour now wait for the first in-flight event creation
+  and merge into it instead of opening one event per in-flight request. A
+  5,000-request burst at 150 concurrency now produces 5 counted items (the
+  500-per-item cap) instead of several hundred.
+- The per-second rate check now rides inside the atomic reservation script
+  (memory and Redis, script marker v4): the entire admission decision -
+  RPS, quota, balance, platform cap and monetary hold - costs one Redis
+  round trip per request instead of two. A rate-limited request consumes no
+  quota, balance or platform capacity. Behavior change: RPS enforcement now
+  fails closed with the rest of the admission decision when Redis is down
+  (previously it briefly failed open on its own).
+- A key-verification response can no longer overwrite the snapshot's
+  billable status codes: a snapshot refresh completing while the
+  verification was in flight would have been silently rolled back to the
+  older set, changing billing decisions. The snapshot is now the sole
+  authority for billable statuses.
+- Fixed `microauth_fastapi.__version__`, which still reported "2.3.0" in the
+  published 2.4.0 package.
+
+## 2.4.0
+
+Batching, aggregation and exact-accounting audit release.
 
 - Usage reporting now batches deliveries: a flush happens when 500 requests
   accumulate or `report_interval` (default now 5 seconds) elapses since the
@@ -19,6 +64,32 @@ Durable delivery and distributed-coordination hardening release.
 - Unified every Redis Lua script marker and the shared snapshot envelope on
   one protocol version (v3). Older SDK versions reject v3 cache entries and
   refresh directly, and vice versa; no compatibility shims are carried.
+- `UsageReporter.record()` is now a coroutine; the SQLite journal writes
+  moved off the event loop into a single group-committing writer.
+- Redis acknowledgements are batched per customer/credential pair, the no-op
+  billable finalize round trip is skipped, and reservation-time
+  acknowledgement cleanup is bounded, keeping the hot path O(1).
+- Hardened every audited failure path for exact accounting: request
+  cancellation during finalization releases the queue reservation and the
+  monetary hold instead of leaking them; the SQLite journal writer runs as a
+  detached task so a cancelled request can never strand other requests'
+  writes; Redis merges are idempotent (per-request dedup tokens with one
+  retry), so an ambiguous timeout cannot double-count after crash recovery;
+  a transient journal failure now heals after a 5-second cooldown instead of
+  poisoning the process into permanent 503s; and the shared SQLite journal is
+  owner-fenced with lease-style claims, so multi-worker hosts can no longer
+  steal a live worker's rows or dead-letter billed usage.
+- Performance under high cardinality: limiter acknowledgements and restores
+  are pipelined into single Redis round trips, the batch trigger is an O(1)
+  counter, a full batch completed during an in-flight flush now delivers
+  immediately, event age checks parse timestamps once, dead-lettered Redis
+  events retain their full payload for reconciliation, and the invalid-key
+  negative cache is hard-capped.
+
+## 2.3.0
+
+Durable delivery and distributed-coordination hardening release.
+
 - Added a Redis-backed durable usage queue with lease-based cross-worker
   delivery. Every completed request's usage event is durably enqueued before
   the final response body is released; a dead worker's leases expire and any
@@ -42,29 +113,8 @@ Durable delivery and distributed-coordination hardening release.
   so only one leader reaches the control plane at policy expiry.
 - Frozen serverless workers recover on-request: a stale snapshot triggers a
   throttled inline refresh from the shared cache before rejecting traffic.
-- `UsageReporter.record()` is now a coroutine; the SQLite journal writes
-  moved off the event loop into a single group-committing writer.
-- Redis acknowledgements are batched per customer/credential pair, the no-op
-  billable finalize round trip is skipped, and reservation-time
-  acknowledgement cleanup is bounded, keeping the hot path O(1).
 - Snapshot cache waiters poll with jittered exponential backoff instead of a
   fixed 50 ms interval.
-- Hardened every audited failure path for exact accounting: request
-  cancellation during finalization releases the queue reservation and the
-  monetary hold instead of leaking them; the SQLite journal writer runs as a
-  detached task so a cancelled request can never strand other requests'
-  writes; Redis merges are idempotent (per-request dedup tokens with one
-  retry), so an ambiguous timeout cannot double-count after crash recovery;
-  a transient journal failure now heals after a 5-second cooldown instead of
-  poisoning the process into permanent 503s; and the shared SQLite journal is
-  owner-fenced with lease-style claims, so multi-worker hosts can no longer
-  steal a live worker's rows or dead-letter billed usage.
-- Performance under high cardinality: limiter acknowledgements and restores
-  are pipelined into single Redis round trips, the batch trigger is an O(1)
-  counter, a full batch completed during an in-flight flush now delivers
-  immediately, event age checks parse timestamps once, dead-lettered Redis
-  events retain their full payload for reconciliation, and the invalid-key
-  negative cache is hard-capped.
 
 ## 2.2.1
 

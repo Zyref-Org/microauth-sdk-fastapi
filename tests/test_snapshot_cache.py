@@ -68,7 +68,7 @@ class FakeSnapshotRedis:
         # tests that focus on snapshot coordination.
         if "microauth-rps-v3" in script:
             return 1
-        if "microauth-request-reserve-v3" in script:
+        if "microauth-request-reserve-v4" in script:
             return [0, 1_000_000, -1, 1_000_000]
         if "microauth-request-finalize-v3" in script:
             return 0

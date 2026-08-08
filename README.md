@@ -48,14 +48,16 @@ request to `/forecast` is now authenticated, rate-limited and billed.
   a **single-flight** on-demand lookup; invalid keys are negatively cached
   so a flood of bad keys can't reach MicroAuth.
 - Usage is durably journaled as each request completes — to a Redis-backed
-  shared queue when Redis is configured, otherwise to SQLite — and requests
-  sharing an API key, policy, status and hour merge into one counted item
-  (up to 500). Deliveries are batched: a flush happens when 500 requests
-  accumulate or `report_interval` (default 5s) elapses since the last flush,
-  whichever comes first, so a high-concurrency burst becomes one usage call
-  with one counted item. Every item is immutable once delivery starts and
-  keeps one idempotency key across transport retries, requeues, concurrent
-  workers, and process restarts.
+  shared queue when Redis is configured, otherwise to a per-process
+  append-only journal file (one fsynced line per request, group-committed
+  across concurrent requests) — and requests sharing an API key, policy,
+  status and hour merge into one counted item (up to 500). Deliveries are
+  batched: a flush happens when 500 requests accumulate or `report_interval`
+  (default 5s) elapses since the last flush, whichever comes first, so a
+  high-concurrency burst becomes one usage call with one counted item. Every
+  item is immutable once delivery starts and keeps one idempotency key
+  across transport retries, requeues, concurrent workers, and process
+  restarts.
 - Authentication itself is a SHA-256 and a couple of dict lookups.
 
 Long-lived processes report usage in background batches and do not call
@@ -89,9 +91,12 @@ pip install 'microauth-fastapi[redis]'
 
 RPS uses a fixed one-second window in both backends. Its key includes both the
 customer and credential, so traffic on one key does not throttle another key
-owned by the same customer. RPS fails open briefly if Redis is down. Quota,
-potential spend, and platform reservations fail closed because serving
-without an atomic decision could oversubscribe a hard limit.
+owned by the same customer. The RPS check rides inside the same atomic
+reservation script as quota, spend, and platform decisions, so the entire
+admission decision costs one Redis round trip per request and a rate-limited
+request consumes no quota or balance. Like those decisions, it fails closed
+(503) if Redis is down, because serving without an atomic decision could
+oversubscribe a hard limit.
 
 With Redis configured (and `persist_usage=True`), completed usage also enters
 a **durable shared queue**: each event is enqueued before the final response
@@ -114,7 +119,7 @@ durably queued for a later batch, so control-plane accounting neither adds to
 the caller's response latency nor produces one usage call per request.
 
 This relies on a runtime that keeps the invocation alive for ASGI background
-work (for example, Vercel Fluid Compute). Without Redis, SQLite journals are
+work (for example, Vercel Fluid Compute). Without Redis, journal files are
 local to each instance; they protect retries within that instance but cannot
 survive host replacement. **Configure `redis_url` in serverless deployments**:
 the durable shared usage queue survives instance replacement, snapshots and
@@ -154,7 +159,7 @@ Everything has a sensible default; override only what you need.
 | `enforce_platform_allowance` | `True` | Enforce the platform monthly hard cap |
 | `verify_negative_ttl` | `30` | Seconds an invalid key is cached |
 | `timeout` | `5` | HTTP timeout for MicroAuth calls |
-| `usage_spool_path` | Tenant-specific temp file | SQLite journal for completed usage |
+| `usage_spool_path` | Tenant-specific temp path | Base path for the append-only usage journal |
 | `persistence_namespace` | Snapshot tenant ID or secret fingerprint | Stable Redis and journal namespace |
 | `persist_usage` | `True` | Keep stable IDs across process restarts |
 | `max_usage_queue` | `10000` | Bounded journaled usage item count |
@@ -188,8 +193,12 @@ typed exceptions.
   its monetary reservation.
 - Completed usage is durably written before it enters the delivery queue: to
   the Redis shared queue when Redis is configured (surviving host
-  replacement), otherwise to SQLite. Without Redis, put `usage_spool_path` on
-  a durable volume when host replacement must also be survived.
+  replacement), otherwise to a per-process append-only journal file. Each
+  process writes its own file; files abandoned by a dead process are adopted
+  atomically by any surviving process on the host after a short grace, and a
+  journal left behind by a pre-2.5 SQLite spool is migrated automatically.
+  Without Redis, put `usage_spool_path` on a durable volume when host
+  replacement must also be survived.
 - Usage older than the API's 45-day acceptance window is dead-lettered with
   its reservation released instead of being retried into a guaranteed
   rejection.

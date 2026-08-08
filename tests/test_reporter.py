@@ -252,12 +252,16 @@ def test_per_item_rejection_is_dead_lettered_without_blocking(
     run(reporter.flush())
     assert reporter.pending_items == 0
     assert rejected_attachments == [{"token": "terminal"}]
-    connection = sqlite3.connect(spool)
-    rows = connection.execute(
-        "SELECT idempotency_key, detail FROM usage_dead_letters"
-    ).fetchall()
-    connection.close()
-    assert rows == [(rejected_id, "unknown key")]
+    dead_files = list(tmp_path.glob("*.dead.jsonl"))
+    assert len(dead_files) == 1
+    records = [
+        json.loads(line)
+        for line in dead_files[0].read_text().splitlines()
+        if line
+    ]
+    assert [(r["idempotency_key"], r["detail"]) for r in records] == [
+        (rejected_id, "unknown key")
+    ]
 
 
 def test_batch_level_terminal_error_is_bisected_to_isolate_poison() -> None:
@@ -518,15 +522,15 @@ def test_cancelling_one_recording_request_does_not_strand_another(
 ) -> None:
     import time as time_module
 
-    import microauth_fastapi.reporter as reporter_module
+    from microauth_fastapi.journal import WalJournal
 
-    real_persist = reporter_module._persist_spool
+    real_apply = WalJournal.apply
 
-    def slow_persist(*args: Any, **kwargs: Any) -> Any:
+    def slow_apply(self: WalJournal, *args: Any, **kwargs: Any) -> Any:
         time_module.sleep(0.05)
-        return real_persist(*args, **kwargs)
+        return real_apply(self, *args, **kwargs)
 
-    monkeypatch.setattr(reporter_module, "_persist_spool", slow_persist)
+    monkeypatch.setattr(WalJournal, "apply", slow_apply)
     spool = tmp_path / "usage.sqlite3"
     reporter = UsageReporter(ScriptedClient([]), 60, spool_path=spool)
 

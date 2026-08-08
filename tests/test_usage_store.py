@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -582,7 +581,7 @@ def test_ambiguous_merge_timeout_is_deduplicated_on_retry() -> None:
     run(exercise())
 
 
-def test_live_journal_rows_are_not_stolen_and_fenced_merges_fall_back(
+def test_live_journals_are_not_stolen_and_theft_triggers_a_resnapshot(
     tmp_path: Any,
 ) -> None:
     spool = tmp_path / "shared.sqlite3"
@@ -593,14 +592,13 @@ def test_live_journal_rows_are_not_stolen_and_fenced_merges_fall_back(
         await worker_a.record(API_KEY_ID, 200)
         assert worker_a.pending_requests == 2
 
-        # A restarting worker must not steal a live worker's fresh rows.
+        # A restarting worker must not adopt a live worker's fresh journal.
         bystander = UsageReporter(ScriptedClient([]), 60, spool_path=spool)
         await bystander.start()
         assert bystander.pending_items == 0
 
-        # A worker recovering after the grace period claims the row; the
-        # original owner's next merge is fenced and opens a fresh event
-        # instead of mutating a payload someone else may deliver.
+        # A worker recovering after the grace period adopts the file whole
+        # (atomic rename), taking a copy of the event with both requests.
         thief = UsageReporter(
             ScriptedClient([]),
             60,
@@ -609,9 +607,19 @@ def test_live_journal_rows_are_not_stolen_and_fenced_merges_fall_back(
         )
         await thief.start()
         assert thief.pending_items == 1
+        assert thief.pending_requests == 2
+
+        # The original owner keeps merging into its in-memory event; its next
+        # write notices the journal was taken and rebuilds a complete file,
+        # so a crash after the theft still loses nothing. The duplicate copy
+        # the thief holds is settled by the server's idempotency receipts.
         follow_up = await worker_a.record(API_KEY_ID, 200)
-        assert follow_up != event_id
-        assert worker_a.pending_items == 2
+        assert follow_up == event_id
+        assert worker_a.pending_requests == 3
+        journal = worker_a._journal
+        assert journal is not None
+        replayed = journal.replay_own()
+        assert replayed[event_id]["item"]["count"] == 3
 
     run(exercise())
 
@@ -620,19 +628,19 @@ def test_one_transient_journal_failure_does_not_poison_the_reporter(
     tmp_path: Any,
     monkeypatch: Any,
 ) -> None:
-    import microauth_fastapi.reporter as reporter_module
+    from microauth_fastapi.journal import WalJournal
 
     spool = tmp_path / "usage.sqlite3"
-    real_persist = reporter_module._persist_spool
+    real_apply = WalJournal.apply
     failures = {"remaining": 1}
 
-    def flaky_persist(*args: Any, **kwargs: Any) -> Any:
+    def flaky_apply(self: WalJournal, *args: Any, **kwargs: Any) -> Any:
         if failures["remaining"] > 0:
             failures["remaining"] -= 1
-            raise sqlite3.OperationalError("database is locked")
-        return real_persist(*args, **kwargs)
+            raise OSError("disk briefly unavailable")
+        return real_apply(self, *args, **kwargs)
 
-    monkeypatch.setattr(reporter_module, "_persist_spool", flaky_persist)
+    monkeypatch.setattr(WalJournal, "apply", flaky_apply)
     reporter = UsageReporter(ScriptedClient([acknowledge]), 60, spool_path=spool)
 
     async def exercise() -> None:

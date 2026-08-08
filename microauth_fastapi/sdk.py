@@ -64,6 +64,7 @@ from .limiter import (
     DENIED_BALANCE,
     DENIED_PLATFORM,
     DENIED_QUOTA,
+    DENIED_RPS,
     Limiter,
     MemoryLimiter,
     RedisLimiter,
@@ -130,7 +131,7 @@ class MicroAuth:
             fan-out, and completed usage is journaled to a durable shared
             queue that survives instance replacement (delivery leases are
             recovered by any worker). Without it, each worker enforces
-            independently and journals to local SQLite.
+            independently and journals to a local append-only file.
         shared_snapshot_cache: Share snapshots and coordinate refreshes through
             Redis when Redis is configured. Default True.
         sync_interval: Seconds between snapshot refreshes. Default 30.
@@ -157,8 +158,11 @@ class MicroAuth:
         verify_negative_ttl: Seconds an unknown key is cached as invalid
             (protects MicroAuth from invalid-key floods). Default 30.
         timeout: HTTP timeout for MicroAuth API calls. Default 5s.
-        usage_spool_path: SQLite spool used to preserve in-flight item IDs
-            across process restarts. Defaults to a tenant-specific temp file.
+        usage_spool_path: Base path for the append-only usage journal that
+            preserves in-flight items across process restarts (each process
+            derives its own ``<stem>-<owner>.wal`` file from it, and a
+            pre-2.5 SQLite spool at this path is migrated automatically).
+            Defaults to a tenant-specific temp path.
         persistence_namespace: Stable tenant identifier for Redis and the
             default journal path. Use this when the snapshot does not expose
             ``tenant_id`` and tenant secrets may rotate.
@@ -504,12 +508,6 @@ class MicroAuth:
             raise CustomerSuspended()
 
         eff = cust.effective
-        if self._enforce_rps and not await self._limiter.allow(
-            cust.id,
-            record.key_id,
-            eff.rps,
-        ):
-            raise RateLimited()
 
         try:
             usage_reservation = self._reporter.reserve()
@@ -528,6 +526,8 @@ class MicroAuth:
             else 0
         )
         try:
+            # The per-second rate check rides inside the reservation call, so
+            # the whole admission decision costs one limiter round trip.
             limit_reservation = await self._limiter.reserve_request(
                 self._tenant_scope,
                 cust,
@@ -537,9 +537,13 @@ class MicroAuth:
                 enforce_balance=self._enforce_balance,
                 enforce_quota=self._enforce_quota,
                 enforce_platform=self._enforce_platform_allowance,
+                rps=eff.rps if self._enforce_rps else 0,
+                credential_id=record.key_id,
             )
         except ReservationDenied as exc:
             self._reporter.release(usage_reservation)
+            if exc.reason == DENIED_RPS:
+                raise RateLimited() from exc
             if exc.reason == DENIED_BALANCE:
                 raise PaymentRequired() from exc
             if exc.reason == DENIED_QUOTA:
@@ -704,9 +708,12 @@ class MicroAuth:
                     "key verification response has invalid customer"
                 )
             customer = _parse_customer(raw_customer, "verify.customer")
-            billable_statuses = _parse_billable_statuses(
-                data.get("billable_status_codes")
-            )
+            # Contract validation only. The snapshot refresh is the sole
+            # authority for billable statuses: this response was generated
+            # before it arrived here, and a refresh completing during that
+            # window may already have installed a newer set, which a
+            # wholesale overwrite would silently roll back.
+            _parse_billable_statuses(data.get("billable_status_codes"))
         except MicroAuthAuthorizationError as exc:
             self._invalidate_authorization()
             raise AuthUnavailable() from exc
@@ -718,7 +725,6 @@ class MicroAuth:
         self._snapshot.keys[key_hash] = record
         if record.customer_id not in self._snapshot.customers:
             self._snapshot.customers[record.customer_id] = customer
-        self._snapshot.billable_statuses = billable_statuses
         return record
 
     def _prune_negative(self) -> None:

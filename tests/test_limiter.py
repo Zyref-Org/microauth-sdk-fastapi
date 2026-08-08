@@ -105,7 +105,7 @@ class FakeRedis:
             key = keys[0]
             self.rps[key] = self.rps.get(key, 0) + 1
             return self.rps[key]
-        if "microauth-request-reserve-v3" in script:
+        if "microauth-request-reserve-v4" in script:
             return self._reserve(keys, args)
         if "microauth-request-finalize-v3" in script:
             return self._finalize(keys, args)
@@ -137,7 +137,13 @@ class FakeRedis:
             acknowledgement_cutoff,
             _ttl,
             maximum,
+            rps_limit,
         ) = (int(value) if index != 11 else str(value) for index, value in enumerate(args))
+        if rps_limit > 0:
+            rps_key = keys[5]
+            self.rps[rps_key] = self.rps.get(rps_key, 0) + 1
+            if self.rps[rps_key] > rps_limit:
+                return [6, 0, -1, 0]
         quota = self.quotas.setdefault(
             keys[0],
             {"floor": incoming_customer_floor, "count": incoming_customer_floor},
@@ -279,6 +285,89 @@ def test_memory_rps_uses_same_fixed_window_semantics_as_redis(
         return first, second, other_key
 
     assert run(exercise()) == (True, False, True)
+
+
+def test_memory_reserve_enforces_rps_inside_the_same_admission_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import microauth_fastapi.limiter as limiter_module
+
+    monkeypatch.setattr(limiter_module.time, "time", lambda: 1000.25)
+    limiter = MemoryLimiter()
+    snapshot, customer = make_snapshot(quota=100, balance=1_000, price=1)
+
+    async def exercise() -> str:
+        await limiter.reserve_request(
+            "tenant",
+            customer,
+            snapshot,
+            "one",
+            potential_spend_micro=1,
+            enforce_balance=True,
+            enforce_quota=True,
+            enforce_platform=True,
+            rps=1,
+            credential_id="key-a",
+        )
+        try:
+            await limiter.reserve_request(
+                "tenant",
+                customer,
+                snapshot,
+                "two",
+                potential_spend_micro=1,
+                enforce_balance=True,
+                enforce_quota=True,
+                enforce_platform=True,
+                rps=1,
+                credential_id="key-a",
+            )
+        except ReservationDenied as exc:
+            return exc.reason
+        return "accepted"
+
+    assert run(exercise()) == limiter_module.DENIED_RPS
+    # The rate-limited request consumed no quota, spend, or platform slot.
+    assert sum(counter.count for counter in limiter._quotas.values()) == 1
+
+
+def test_redis_reserve_enforces_rps_in_one_round_trip() -> None:
+    redis = FakeRedis()
+    limiter = RedisLimiter(redis_client=redis)
+    snapshot, customer = make_snapshot(quota=100, balance=1_000, price=1)
+
+    async def exercise() -> list[str]:
+        outcomes: list[str] = []
+        for index in range(3):
+            try:
+                await limiter.reserve_request(
+                    "tenant",
+                    customer,
+                    snapshot,
+                    f"token-{index}",
+                    potential_spend_micro=1,
+                    enforce_balance=True,
+                    enforce_quota=True,
+                    enforce_platform=True,
+                    rps=2,
+                    credential_id="key-a",
+                )
+                outcomes.append("accepted")
+            except ReservationDenied as exc:
+                outcomes.append(exc.reason)
+        return outcomes
+
+    from microauth_fastapi.limiter import DENIED_RPS
+
+    assert run(exercise()) == ["accepted", "accepted", DENIED_RPS]
+    # One eval per request: the RPS window rides inside the reserve script.
+    assert len(redis.calls) == 3
+    assert all("microauth-request-reserve-v4" in call[0] for call in redis.calls)
+    # The denied request reserved nothing.
+    assert sum(state["count"] for state in redis.quotas.values()) == 2
+    # The RPS key shares the tenant hash tag (single-slot on Redis Cluster).
+    rps_keys = [key for key in redis.rps if ":rps:" in key]
+    assert rps_keys and all("{" in key and "}" in key for key in rps_keys)
 
 
 def test_memory_reservation_is_atomic_under_concurrency() -> None:
@@ -515,7 +604,7 @@ def test_redis_reservation_is_shared_across_instances() -> None:
 
     run(exercise())
     reserve_calls = [
-        call for call in redis.calls if "microauth-request-reserve-v3" in call[0]
+        call for call in redis.calls if "microauth-request-reserve-v4" in call[0]
     ]
     assert len({call[1][0] for call in reserve_calls}) == 1
     assert all("{" in key and "}" in key for key in reserve_calls[0][1])

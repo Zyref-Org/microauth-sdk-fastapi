@@ -28,7 +28,7 @@ from .exceptions import (
 from .models import Customer, PlatformMonthlyAllowance
 from .sdk import MicroAuth
 
-__version__ = "2.3.0"
+__version__ = "2.5.0"
 
 __all__ = [
     "AuthDenied",
