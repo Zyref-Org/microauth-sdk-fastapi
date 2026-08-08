@@ -32,6 +32,7 @@ import os
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,7 +80,8 @@ from .models import (
     Snapshot,
 )
 from .reporter import UsageReporter, UsageReservation
-from .snapshot_cache import CachedSnapshot, RedisSnapshotCache
+from .snapshot_cache import CachedSnapshot, RedisSnapshotCache, SnapshotLease
+from .usage_store import RedisUsageStore
 
 logger = logging.getLogger("microauth")
 
@@ -124,15 +126,21 @@ class MicroAuth:
             Default ``X-API-Key``.
         redis_url: Optional Redis URL (``redis://...``). When set, RPS,
             customer quota, potential spend, and platform limits are enforced
-            across all workers, and snapshots are shared to prevent cold-start
-            fan-out. Without it, each worker enforces independently.
+            across all workers, snapshots are shared to prevent cold-start
+            fan-out, and completed usage is journaled to a durable shared
+            queue that survives instance replacement (delivery leases are
+            recovered by any worker). Without it, each worker enforces
+            independently and journals to local SQLite.
         shared_snapshot_cache: Share snapshots and coordinate refreshes through
             Redis when Redis is configured. Default True.
         sync_interval: Seconds between snapshot refreshes. Default 30.
-        report_interval: Seconds between usage report flushes. Default 15.
-        flush_on_response: Await usage delivery before finishing each response.
-            Defaults to True on Vercel/AWS Lambda and False elsewhere because
-            frozen serverless runtimes cannot run interval timers reliably.
+        report_interval: Usage reports are batched: a flush happens when 500
+            events accumulate or this many seconds pass since the last flush,
+            whichever comes first. Default 5.
+        flush_on_response: On serverless runtimes, evaluate the batching rule
+            after the final response frame while the invocation remains
+            active, so a frozen timer cannot strand a due batch. Defaults to
+            True on Vercel/AWS Lambda and False elsewhere.
         max_snapshot_age: If the snapshot can't be refreshed for this many
             seconds, ``fail_open=False`` returns 503. Default 300.
         max_stale_snapshot_age: Absolute stale-data ceiling, including when
@@ -172,7 +180,7 @@ class MicroAuth:
         redis_url: str | None = None,
         shared_snapshot_cache: bool = True,
         sync_interval: float = 30.0,
-        report_interval: float = 15.0,
+        report_interval: float = 5.0,
         flush_on_response: bool | None = None,
         max_snapshot_age: float = 300.0,
         max_stale_snapshot_age: float | None = None,
@@ -263,12 +271,23 @@ class MicroAuth:
             raise MicroAuthConfigurationError(
                 "shared_snapshot_cache must be a boolean"
             )
+        usage_store = (
+            RedisUsageStore(
+                self._limiter.redis_client,
+                tenant_scope,
+                max_items=max_usage_queue,
+                lease_ms=max(60_000, math.ceil(report_interval * 4_000)),
+            )
+            if persist_usage and isinstance(self._limiter, RedisLimiter)
+            else None
+        )
         self._reporter = UsageReporter(
             self._client,
             report_interval,
             max_items=max_usage_queue,
             shutdown_timeout=shutdown_timeout,
             spool_path=resolved_spool,
+            store=usage_store,
             on_acknowledged=self._limiter.acknowledge,
             on_rejected=self._limiter.reject,
             on_restored=self._restore_limit_attachments,
@@ -283,10 +302,13 @@ class MicroAuth:
             and os.environ.get("MICROAUTH_USAGE_SPOOL_PATH") is None
         )
         snapshot_refresh_timeout = max(45.0, timeout * 4.0)
+        # The snapshot cache scope is credential-bound (unlike the limiter
+        # scope): a revoked secret must never inherit snapshots that a
+        # different, still-valid credential refreshed and validated.
         self._snapshot_cache = (
             RedisSnapshotCache(
                 self._limiter.redis_client,
-                tenant_scope,
+                f"{tenant_scope}\0{secret_scope}",
                 ttl=max_stale_snapshot_age + sync_interval,
                 lock_timeout=snapshot_refresh_timeout,
             )
@@ -316,6 +338,9 @@ class MicroAuth:
         self._start_lock: asyncio.Lock | None = None
         self._refresh_lock: asyncio.Lock | None = None
         self._policy_refresh_blocked_until = 0.0
+        self._stale_recovery_blocked_until = 0.0
+        self._request_refresh_task: asyncio.Task[None] | None = None
+        self._request_refresh_blocked_until = 0.0
         self._negative: dict[str, float] = {}  # key hash -> monotonic expiry
         self._verifying: dict[str, asyncio.Future[KeyRecord | None]] = {}
         self._authorization_invalid = False
@@ -377,15 +402,18 @@ class MicroAuth:
     async def aclose(self) -> None:
         """Stop background tasks and flush pending usage. Idempotent."""
         close_errors: list[Exception] = []
-        if self._sync_task is not None:
-            self._sync_task.cancel()
+        for task_attr in ("_sync_task", "_request_refresh_task"):
+            task: asyncio.Task[None] | None = getattr(self, task_attr)
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._sync_task
+                await task
             except asyncio.CancelledError:
                 pass
             except Exception:
                 logger.exception("microauth: snapshot sync task stopped with an error")
-            self._sync_task = None
+            setattr(self, task_attr, None)
         try:
             await self._reporter.aclose()
         except Exception as exc:
@@ -430,13 +458,13 @@ class MicroAuth:
         if self._authorization_invalid:
             raise AuthUnavailable()
         snap = self._snapshot
-        snapshot_age = snap.age()
-        if (
-            not snap.ready
-            or snapshot_age > self._max_stale_snapshot_age
-            or (not self._fail_open and snapshot_age > self._max_snapshot_age)
-        ):
-            raise AuthUnavailable()
+        if self._snapshot_unusable(snap):
+            # Frozen serverless workers may never run the background sync
+            # loop between invocations; recover from the shared cache or the
+            # control plane on-request instead of failing until it thaws.
+            snap = await self._recover_unusable_snapshot()
+        elif snap.age() > self._sync_interval * 1.5:
+            self._kick_request_refresh()
 
         key_hash = hashlib.sha256(api_key.encode()).hexdigest()
         record = snap.keys.get(key_hash)
@@ -558,6 +586,70 @@ class MicroAuth:
         setattr(request.state, _STATE_ATTR, usage_context)
         return principal
 
+    def _snapshot_unusable(self, snap: Snapshot) -> bool:
+        age = snap.age()
+        return (
+            not snap.ready
+            or age > self._max_stale_snapshot_age
+            or (not self._fail_open and age > self._max_snapshot_age)
+        )
+
+    async def _recover_unusable_snapshot(self) -> Snapshot:
+        """Refresh inline (throttled) before rejecting a request as stale."""
+
+        if time.monotonic() >= self._stale_recovery_blocked_until:
+            try:
+                await self._refresh()
+            except MicroAuthAuthorizationError as exc:
+                self._invalidate_authorization()
+                raise AuthUnavailable() from exc
+            except Exception as exc:
+                # One failed recovery is shared across the burst instead of
+                # letting every waiting request retry the control plane.
+                self._stale_recovery_blocked_until = time.monotonic() + min(
+                    self._sync_interval,
+                    5.0,
+                )
+                logger.error(
+                    "microauth: stale snapshot could not be recovered "
+                    "on-request (%s)",
+                    exc,
+                )
+        snap = self._snapshot
+        if self._snapshot_unusable(snap):
+            raise AuthUnavailable()
+        return snap
+
+    def _kick_request_refresh(self) -> None:
+        """Start one background refresh when the sync loop appears frozen."""
+
+        task = self._request_refresh_task
+        if task is not None and not task.done():
+            return
+        now = time.monotonic()
+        if now < self._request_refresh_blocked_until:
+            return
+        self._request_refresh_blocked_until = now + 1.0
+        self._request_refresh_task = asyncio.create_task(
+            self._request_refresh(),
+            name="microauth-request-refresh",
+        )
+
+    async def _request_refresh(self) -> None:
+        try:
+            await self._refresh()
+        except MicroAuthAuthorizationError as exc:
+            self._invalidate_authorization()
+            logger.error(
+                "microauth: tenant authorization was rejected (%s)",
+                exc,
+            )
+        except Exception as exc:
+            logger.warning(
+                "microauth: request-driven snapshot refresh failed (%s)",
+                exc,
+            )
+
     # ----------------------------------------------------------- key lookups
 
     async def _verify_unknown(self, key_hash: str) -> KeyRecord | None:
@@ -678,8 +770,25 @@ class MicroAuth:
                 return
             if time.monotonic() < self._policy_refresh_blocked_until:
                 raise AuthUnavailable()
+
+            def policy_valid(snapshot: Snapshot) -> bool:
+                # Another instance's published snapshot is acceptable when it
+                # carries a live policy for this customer; only one leader
+                # needs to reach the control plane at policy expiry.
+                if snapshot.age() > self._max_stale_snapshot_age:
+                    return False
+                snapshot_record = snapshot.keys.get(key_hash)
+                if snapshot_record is None:
+                    return False
+                snapshot_customer = snapshot.customers.get(
+                    snapshot_record.customer_id
+                )
+                return snapshot_customer is not None and not _customer_policy_expired(
+                    snapshot_customer
+                )
+
             try:
-                await self._refresh_unlocked(force_control_plane=True)
+                await self._refresh_unlocked(accept=policy_valid)
             except Exception:
                 # Share a failed refresh across a burst of waiting requests
                 # instead of serially retrying the control plane for each one.
@@ -692,11 +801,17 @@ class MicroAuth:
     async def _refresh_unlocked(
         self,
         *,
-        force_control_plane: bool = False,
+        accept: Callable[[Snapshot], bool] | None = None,
     ) -> None:
+        if self._authorization_invalid:
+            # Only a direct authenticated control-plane success may clear an
+            # authoritative credential rejection; cached data must not.
+            await self._refresh_from_control_plane()
+            return
         if self._snapshot_cache is not None:
             await self._refresh_shared_snapshot(
-                force_control_plane=force_control_plane,
+                accept=accept
+                or (lambda snapshot: snapshot.age() < self._sync_interval),
             )
             return
         await self._refresh_from_control_plane()
@@ -704,7 +819,7 @@ class MicroAuth:
     async def _refresh_shared_snapshot(
         self,
         *,
-        force_control_plane: bool,
+        accept: Callable[[Snapshot], bool],
     ) -> None:
         cache = self._snapshot_cache
         if cache is None:  # pragma: no cover - guarded by caller
@@ -730,11 +845,8 @@ class MicroAuth:
 
         if cached is not None:
             try:
-                snapshot = _parse_snapshot(cached.payload)
-                if (
-                    not force_control_plane
-                    and snapshot.age() < self._sync_interval
-                ):
+                snapshot = _parse_cached_snapshot(cached)
+                if accept(snapshot):
                     await self._apply_snapshot(snapshot)
                     return
             except MicroAuthResponseError as exc:
@@ -746,7 +858,7 @@ class MicroAuth:
                 )
 
         try:
-            token = await cache.acquire_refresh_lock()
+            lease = await cache.acquire_refresh_lock()
         except SnapshotCacheError as exc:
             logger.warning(
                 "microauth: shared snapshot refresh coordination unavailable "
@@ -755,34 +867,33 @@ class MicroAuth:
             )
             await self._refresh_from_control_plane()
             return
-        if token is not None:
+        if lease is not None:
             # The previous owner can publish between our first read and lock
             # acquisition. Recheck before reaching the control plane.
-            if not force_control_plane:
-                try:
-                    latest = await cache.load()
-                    if latest is not None:
-                        snapshot = _parse_snapshot(latest.payload)
-                        if snapshot.age() < self._sync_interval:
-                            await self._apply_snapshot(snapshot)
-                            try:
-                                await cache.release_refresh_lock(token)
-                            except SnapshotCacheError:
-                                logger.exception(
-                                    "microauth: shared snapshot refresh lock "
-                                    "release failed"
-                                )
-                            return
-                except MicroAuthResponseError as exc:
-                    logger.error(
-                        "microauth: replacing an invalid shared snapshot (%s)",
-                        exc,
-                    )
-                except SnapshotCacheError:
-                    logger.exception(
-                        "microauth: shared snapshot recheck failed; refreshing"
-                    )
-            await self._refresh_with_snapshot_lease(cache, token)
+            try:
+                latest = await cache.load()
+                if latest is not None:
+                    snapshot = _parse_cached_snapshot(latest)
+                    if accept(snapshot):
+                        await self._apply_snapshot(snapshot)
+                        try:
+                            await cache.release_refresh_lock(lease)
+                        except SnapshotCacheError:
+                            logger.exception(
+                                "microauth: shared snapshot refresh lock "
+                                "release failed"
+                            )
+                        return
+            except MicroAuthResponseError as exc:
+                logger.error(
+                    "microauth: replacing an invalid shared snapshot (%s)",
+                    exc,
+                )
+            except SnapshotCacheError:
+                logger.exception(
+                    "microauth: shared snapshot recheck failed; refreshing"
+                )
+            await self._refresh_with_snapshot_lease(cache, lease)
             return
 
         try:
@@ -799,7 +910,9 @@ class MicroAuth:
             return
         if updated is not None:
             try:
-                await self._apply_snapshot(_parse_snapshot(updated.payload))
+                # A fresh publication is applied even when it does not satisfy
+                # the caller's requirement; the caller re-evaluates afterwards.
+                await self._apply_snapshot(_parse_cached_snapshot(updated))
                 return
             except MicroAuthResponseError as exc:
                 logger.error(
@@ -810,14 +923,14 @@ class MicroAuth:
         # The previous owner may have crashed or lost its lease. Only the next
         # lock winner retries; other followers continue with bounded fallback.
         try:
-            retry_token = await cache.acquire_refresh_lock()
+            retry_lease = await cache.acquire_refresh_lock()
         except SnapshotCacheError:
             logger.exception(
                 "microauth: shared snapshot retry coordination failed"
             )
-            retry_token = None
-        if retry_token is not None:
-            await self._refresh_with_snapshot_lease(cache, retry_token)
+            retry_lease = None
+        if retry_lease is not None:
+            await self._refresh_with_snapshot_lease(cache, retry_lease)
             return
         try:
             recovered = await cache.wait_for_update(
@@ -831,7 +944,7 @@ class MicroAuth:
             recovered = None
         if recovered is not None:
             try:
-                await self._apply_snapshot(_parse_snapshot(recovered.payload))
+                await self._apply_snapshot(_parse_cached_snapshot(recovered))
                 return
             except MicroAuthResponseError as exc:
                 logger.error(
@@ -843,7 +956,7 @@ class MicroAuth:
         # an already usable local/shared snapshot instead of creating a
         # cold-start thundering herd when the control plane is slow.
         fallback = (
-            _parse_snapshot(cached.payload)
+            _parse_cached_snapshot(cached)
             if cached is not None
             else self._snapshot
         )
@@ -857,14 +970,25 @@ class MicroAuth:
     async def _refresh_with_snapshot_lease(
         self,
         cache: RedisSnapshotCache,
-        token: str,
+        lease: SnapshotLease,
     ) -> None:
         heartbeat = asyncio.create_task(
-            cache.maintain_refresh_lock(token),
+            cache.maintain_refresh_lock(lease),
             name="microauth-snapshot-lock-heartbeat",
         )
         try:
-            await self._refresh_from_control_plane(cache_token=token)
+            await self._refresh_from_control_plane(cache_lease=lease)
+        except BaseException:
+            # The refresh failed while this worker owned the repair duty;
+            # quarantine a malformed cache value so followers are not pinned
+            # to a poison entry until the next successful publication.
+            try:
+                await cache.discard_corrupt()
+            except SnapshotCacheError:
+                logger.exception(
+                    "microauth: corrupt shared snapshot could not be discarded"
+                )
+            raise
         finally:
             heartbeat.cancel()
             try:
@@ -876,7 +1000,7 @@ class MicroAuth:
                     "microauth: shared snapshot refresh lock renewal failed"
                 )
             try:
-                await cache.release_refresh_lock(token)
+                await cache.release_refresh_lock(lease)
             except SnapshotCacheError:
                 logger.exception(
                     "microauth: shared snapshot refresh lock release failed"
@@ -885,7 +1009,7 @@ class MicroAuth:
     async def _refresh_from_control_plane(
         self,
         *,
-        cache_token: str | None = None,
+        cache_lease: SnapshotLease | None = None,
     ) -> None:
         refresh_started_at = time.time()
         try:
@@ -897,26 +1021,54 @@ class MicroAuth:
             data,
             refresh_started_at=refresh_started_at,
         )
-        if cache_token is not None and self._snapshot_cache is not None:
+        if cache_lease is not None and self._snapshot_cache is not None:
             try:
+                assert snap.generated_at is not None  # enforced by the parser
+                fetched_generated_ms = int(snap.generated_at.timestamp() * 1000)
                 stored = await self._snapshot_cache.store_if_owner(
                     data,
-                    cache_token,
+                    cache_lease,
+                    refresh_started_at=refresh_started_at,
+                    generated_at_ms=fetched_generated_ms,
                 )
                 if stored is None:
-                    logger.warning(
-                        "microauth: snapshot refresh lease expired before "
-                        "publication; a newer owner may have refreshed it"
-                    )
-                    current = await self._snapshot_cache.load()
-                    if current is not None:
-                        current_snapshot = _parse_snapshot(current.payload)
-                        if (
-                            current_snapshot.generated_at is not None
-                            and snap.generated_at is not None
-                            and current_snapshot.generated_at >= snap.generated_at
-                        ):
-                            snap = current_snapshot
+                    replace_unusable = False
+                    try:
+                        current = await self._snapshot_cache.load()
+                        if current is not None:
+                            current_snapshot = _parse_cached_snapshot(current)
+                            if (
+                                current_snapshot.generated_at is not None
+                                and snap.generated_at is not None
+                                and current_snapshot.generated_at
+                                >= snap.generated_at
+                            ):
+                                snap = current_snapshot
+                            else:
+                                logger.warning(
+                                    "microauth: snapshot publication was "
+                                    "fenced off; a newer owner has refreshed "
+                                    "the shared cache"
+                                )
+                        else:
+                            replace_unusable = True
+                    except MicroAuthResponseError:
+                        # The entry blocking publication cannot be used by
+                        # anyone; its recorded generation must not pin the
+                        # cache to a poisoned value.
+                        replace_unusable = True
+                    if replace_unusable:
+                        logger.warning(
+                            "microauth: force-replacing an unusable shared "
+                            "snapshot entry"
+                        )
+                        await self._snapshot_cache.store_if_owner(
+                            data,
+                            cache_lease,
+                            refresh_started_at=refresh_started_at,
+                            generated_at_ms=fetched_generated_ms,
+                            force=True,
+                        )
             except SnapshotCacheError:
                 logger.exception(
                     "microauth: fetched snapshot could not be shared"
@@ -925,13 +1077,31 @@ class MicroAuth:
                 logger.exception(
                     "microauth: newer shared snapshot could not be validated"
                 )
-        await self._apply_snapshot(snap)
+        await self._apply_snapshot(snap, from_control_plane=True)
 
-    async def _apply_snapshot(self, snap: Snapshot) -> None:
+    async def _apply_snapshot(
+        self,
+        snap: Snapshot,
+        *,
+        from_control_plane: bool = False,
+    ) -> None:
+        if from_control_plane:
+            # Only a successful authenticated control-plane exchange may clear
+            # an authoritative 401/403; hydrating shared cache data proves
+            # nothing about this process's credential.
+            self._authorization_invalid = False
+        current = self._snapshot
+        if (
+            current.ready
+            and current.generated_at is not None
+            and snap.generated_at is not None
+            and snap.generated_at < current.generated_at
+        ):
+            # Never let older cached data replace a newer local snapshot.
+            return
         self._apply_stable_namespace(snap)
         await self._limiter.sync_snapshot(self._tenant_scope, snap)
         self._snapshot = snap
-        self._authorization_invalid = False
         self._policy_refresh_blocked_until = 0.0
 
     # -------------------------------------------------------------- billing
@@ -940,9 +1110,9 @@ class MicroAuth:
         self,
         context: _RequestUsage,
         status_code: int,
-    ) -> None:
+    ) -> str | None:
         if context.finished:
-            return
+            return context.recorded_event_id
         context.finished = True
         billable = status_code in context.billable_statuses
         recorded_event_id: str | None = None
@@ -951,7 +1121,7 @@ class MicroAuth:
                 billable=billable,
             )
             try:
-                recorded_event_id = self._reporter.record(
+                recorded_event_id = await self._reporter.record(
                     context.principal.key_id,
                     status_code,
                     usage_policy_id=context.usage_policy_id,
@@ -959,13 +1129,18 @@ class MicroAuth:
                     occurred_at=context.occurred_at,
                     attachment=attachment,
                 )
+                context.recorded_event_id = recorded_event_id
             except Exception:
                 self._reporter.release(context.usage_reservation)
                 context.usage_reservation = None
                 try:
+                    # The event was never journaled, so no acknowledgement can
+                    # ever release a billable hold. Finalize as non-billable to
+                    # return the reserved spend instead of leaking it until the
+                    # reservation TTL expires.
                     await self._limiter.finalize_request(
                         context.limit_reservation,
-                        billable=billable,
+                        billable=False,
                     )
                 except LimitBackendUnavailable:
                     logger.exception(
@@ -973,23 +1148,35 @@ class MicroAuth:
                     )
                 raise
             context.usage_reservation = None
-            try:
-                await self._limiter.finalize_request(
-                    context.limit_reservation,
-                    billable=billable,
-                )
-            except LimitBackendUnavailable:
-                logger.exception(
-                    "microauth: could not finalize a request reservation"
-                )
-            if self._flush_on_response:
+            if not billable:
+                # A billable finalize is a no-op by design: the reserve call
+                # already established the monetary hold and its TTL, and the
+                # acknowledgement after delivery releases it. Skipping it
+                # saves one Redis round trip on every billable response.
                 try:
-                    await self._reporter.flush_on_response(recorded_event_id)
-                except Exception:
-                    logger.exception(
-                        "microauth: synchronous serverless usage flush failed; "
-                        "stable items remain queued"
+                    await self._limiter.finalize_request(
+                        context.limit_reservation,
+                        billable=False,
                     )
+                except LimitBackendUnavailable:
+                    logger.exception(
+                        "microauth: could not finalize a request reservation"
+                    )
+        return recorded_event_id
+
+    async def _flush_after_response(self, event_id: str | None) -> None:
+        if not self._flush_on_response or event_id is None:
+            return
+        try:
+            # Only deliver when the batching rule calls for it (a full batch,
+            # or the report interval elapsed since the last flush). Otherwise
+            # the event stays durably queued and ships with a later batch.
+            await self._reporter.flush_on_response(event_id, only_if_due=True)
+        except Exception:
+            logger.exception(
+                "microauth: post-response serverless usage flush failed; "
+                "stable items remain queued"
+            )
 
     async def _restore_limit_attachments(
         self,
@@ -1040,12 +1227,28 @@ class _RequestUsage:
     limit_reservation: LimitReservation
     occurred_at: datetime
     finished: bool = False
+    recorded_event_id: str | None = None
 
 
 def _customer_policy_expired(customer: CustomerState) -> bool:
     return (
         customer.policy_valid_until is not None
         and customer.policy_valid_until <= datetime.now(timezone.utc)
+    )
+
+
+def _parse_cached_snapshot(cached: CachedSnapshot) -> Snapshot:
+    """Validate a shared-cache payload, preserving the origin refresh cutoff.
+
+    The envelope's ``refresh_started_at`` is the moment the publishing leader
+    started reading balances from the control plane. Reconciling acknowledged
+    monetary reservations against a later cache-read time could release holds
+    for charges the cached balance has never seen.
+    """
+
+    return _parse_snapshot(
+        cached.payload,
+        refresh_started_at=cached.refresh_started_at,
     )
 
 
@@ -1390,8 +1593,11 @@ class _UsageMiddleware:
             return
 
         status_holder = {"status": 500}
+        response_event_id: str | None = None
+        response_flushed = False
 
         async def finish_request() -> None:
+            nonlocal response_event_id
             state = scope.get("state")
             context = None
             if state is not None:
@@ -1401,10 +1607,31 @@ class _UsageMiddleware:
                     else getattr(state, _STATE_ATTR, None)
                 )
             if context is not None:
-                await self.auth._finish_request(
+                event_id = await self.auth._finish_request(
                     context,
                     status_holder["status"],
                 )
+                if event_id is not None:
+                    response_event_id = event_id
+
+        async def flush_response_usage() -> None:
+            nonlocal response_flushed
+            if response_flushed:
+                return
+            response_flushed = True
+            task = asyncio.create_task(
+                self.auth._flush_after_response(response_event_id),
+                name="microauth-post-response-flush",
+            )
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Preserve the request cancellation, but do not let it cancel
+                # a journaled financial event halfway through delivery.
+                try:
+                    await task
+                finally:
+                    raise
 
         async def send_wrapper(message: dict[str, Any]) -> None:
             if message["type"] == "http.response.start":
@@ -1417,12 +1644,16 @@ class _UsageMiddleware:
                 # body frame. A process crash cannot leave a response that
                 # the caller observed as complete but usage never recorded.
                 await finish_request()
+                await send(message)
+                await flush_response_usage()
+                return
             await send(message)
 
         try:
             await self.app(scope, receive, send_wrapper)
         finally:
             await finish_request()
+            await flush_response_usage()
 
     async def _lifespan(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         async def send_wrapper(message: dict[str, Any]) -> None:

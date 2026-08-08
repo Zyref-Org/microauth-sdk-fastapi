@@ -258,7 +258,7 @@ def test_every_completed_authenticated_status_is_reported() -> None:
     assert all(item["usage_policy_id"] == POLICY_ID for item in items)
 
 
-def test_vercel_auto_flushes_usage_before_the_response_finishes(
+def test_vercel_flushes_after_the_response_only_when_the_batch_is_due(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("VERCEL", "1")
@@ -290,7 +290,24 @@ def test_vercel_auto_flushes_usage_before_the_response_finishes(
                 headers={"X-API-Key": API_KEY},
             )
             assert response.status_code == 200
+            # One event is far below the 500 batch and the report interval
+            # has not elapsed: it stays queued instead of shipping alone.
+            assert plane.usage_calls == []
+            assert auth._reporter.pending_items == 1
+
+            # Simulate the report interval elapsing since the last flush;
+            # the next response-bound check delivers the whole batch.
+            auth._reporter._last_flush -= auth._reporter._interval + 1
+            response = await caller.get(
+                "/protected",
+                headers={"X-API-Key": API_KEY},
+            )
+            assert response.status_code == 200
             assert len(plane.usage_calls) == 1
+            # Both requests merged into one counted item covering the batch.
+            assert len(plane.usage_calls[0]["items"]) == 1
+            assert plane.usage_calls[0]["items"][0]["count"] == 2
+            assert auth._reporter.pending_items == 0
 
         await auth.aclose()
         await control.aclose()
@@ -349,11 +366,11 @@ def test_nonbillable_outcomes_release_money_but_consume_quota() -> None:
 
     run(exercise())
     assert handled == 2
-    assert len(plane.usage_calls[0]["items"]) == 2
-    assert all(
-        item["status_code"] == 200 and item["count"] == 1
-        for item in plane.usage_calls[0]["items"]
-    )
+    # Both served requests share one identity and merge into one counted item.
+    assert len(plane.usage_calls[0]["items"]) == 1
+    item = plane.usage_calls[0]["items"][0]
+    assert item["status_code"] == 200
+    assert item["count"] == 2
 
 
 def test_nonbillable_outcome_does_not_release_platform_allowance() -> None:
@@ -404,6 +421,65 @@ def test_nonbillable_outcome_does_not_release_platform_allowance() -> None:
         await control.aclose()
 
     run(exercise())
+
+
+def test_150_concurrent_requests_report_as_one_counted_item() -> None:
+    plane = ControlPlane(
+        snapshot_payload(
+            statuses=[200],
+            balance=1_000_000,
+            price=10,
+            billing_model="payg",
+            quota=None,
+        )
+    )
+
+    async def exercise() -> None:
+        control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
+        app = FastAPI()
+        auth = MicroAuth(
+            app,
+            secret_key="mas_test",
+            http_client=control,
+            persist_usage=False,
+            enforce_rps=False,
+        )
+        auth._snapshot = _parse_snapshot(plane.snapshot)
+        auth._started = True
+
+        @app.get("/protected")
+        async def protected(customer: Customer = Security(auth)) -> dict[str, bool]:
+            await asyncio.sleep(0)
+            return {"ok": True}
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as caller:
+            responses = await asyncio.gather(
+                *(
+                    caller.get(
+                        "/protected",
+                        headers={"X-API-Key": API_KEY},
+                    )
+                    for _ in range(150)
+                )
+            )
+        assert all(response.status_code == 200 for response in responses)
+        assert auth._reporter.pending_requests == 150
+        await auth._reporter.flush()
+        assert auth._reporter.pending_items == 0
+        await auth.aclose()
+        await control.aclose()
+
+    run(exercise())
+    # A 150-request billable burst is one usage call with one counted item:
+    # one receipt and one processing pass on the API, not 150.
+    assert len(plane.usage_calls) == 1
+    items = plane.usage_calls[0]["items"]
+    assert len(items) == 1
+    assert items[0]["count"] == 150
+    assert items[0]["status_code"] == 200
 
 
 def test_concurrent_requests_cannot_oversubscribe_customer_quota() -> None:
@@ -930,16 +1006,89 @@ def test_dependency_only_use_is_rejected_without_status_middleware() -> None:
     run(exercise())
 
 
+def test_journal_failure_releases_the_billable_monetary_reservation() -> None:
+    from microauth_fastapi.models import LimitReservation
+    from microauth_fastapi.sdk import _RequestUsage
+
+    finalize_calls: list[bool] = []
+
+    class RecordingLimiter:
+        async def finalize_request(
+            self,
+            reservation: LimitReservation,
+            *,
+            billable: bool,
+        ) -> None:
+            del reservation
+            finalize_calls.append(billable)
+
+    class FailingReporter:
+        async def record(self, *args: Any, **kwargs: Any) -> str:
+            raise RuntimeError("journal write failed")
+
+        def release(self, reservation: Any) -> None:
+            del reservation
+
+    async def exercise() -> None:
+        auth = MicroAuth(
+            secret_key="mas_test",
+            persist_usage=False,
+            enforce_rps=False,
+        )
+        auth._reporter = FailingReporter()  # type: ignore[assignment]
+        auth._limiter = RecordingLimiter()  # type: ignore[assignment]
+        context = _RequestUsage(
+            principal=Customer(
+                id="customer-1",
+                key_id=KEY_ID,
+                status="active",
+                billing_model="payg",
+                rps=0,
+                price_per_request_micro=25,
+                monthly_quota=None,
+                credit_balance_micro=1_000_000,
+            ),
+            billable_statuses=frozenset({200}),
+            usage_policy_id=POLICY_ID,
+            usage_reservation=object(),  # type: ignore[arg-type]
+            limit_reservation=LimitReservation(
+                token="token-1",
+                tenant_scope="tenant-1",
+                customer_id="customer-1",
+                period_key="2026-08",
+                period_end=datetime.now(timezone.utc) + timedelta(days=1),
+                spend_micro=25,
+            ),
+            occurred_at=datetime.now(timezone.utc),
+        )
+        with pytest.raises(RuntimeError, match="journal write failed"):
+            await auth._finish_request(context, 200)
+        assert context.usage_reservation is None
+
+    run(exercise())
+    # The event was never journaled, so the monetary hold must be returned
+    # rather than left waiting for an acknowledgement that cannot happen.
+    assert finalize_calls == [False]
+
+
 def test_usage_is_finalized_before_final_response_body() -> None:
     order: list[str] = []
     context = {"finished": False}
 
     class FakeAuth:
-        async def _finish_request(self, value: dict[str, bool], status: int) -> None:
+        async def _finish_request(
+            self,
+            value: dict[str, bool],
+            status: int,
+        ) -> str | None:
             if value["finished"]:
-                return
+                return None
             value["finished"] = True
             order.append(f"finish-{status}")
+            return "event-1"
+
+        async def _flush_after_response(self, event_id: str | None) -> None:
+            order.append(f"flush-{event_id}")
 
     async def inner(scope: Any, receive: Any, send: Any) -> None:
         await send({"type": "http.response.start", "status": 207, "headers": []})
@@ -968,4 +1117,165 @@ def test_usage_is_finalized_before_final_response_body() -> None:
         "http.response.start",
         "finish-207",
         "http.response.body",
+        "flush-event-1",
     ]
+
+
+def test_usage_flush_falls_back_when_the_app_raises() -> None:
+    order: list[str] = []
+    context = {"finished": False}
+
+    class FakeAuth:
+        async def _finish_request(
+            self,
+            value: dict[str, bool],
+            status: int,
+        ) -> str | None:
+            if value["finished"]:
+                return None
+            value["finished"] = True
+            order.append(f"finish-{status}")
+            return "event-error"
+
+        async def _flush_after_response(self, event_id: str | None) -> None:
+            order.append(f"flush-{event_id}")
+
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        raise RuntimeError("application failed")
+
+    async def exercise() -> None:
+        middleware = _UsageMiddleware(inner, FakeAuth())
+
+        async def receive() -> dict[str, Any]:
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, Any]) -> None:
+            raise AssertionError("the failing app must not send a response")
+
+        with pytest.raises(RuntimeError, match="application failed"):
+            await middleware(
+                {
+                    "type": "http",
+                    "state": {_STATE_ATTR: context},
+                },
+                receive,
+                send,
+            )
+
+    run(exercise())
+    assert order == ["finish-500", "flush-event-error"]
+
+
+def test_request_cancellation_does_not_cancel_post_response_delivery() -> None:
+    context = {"finished": False}
+    flush_started = asyncio.Event()
+    allow_flush = asyncio.Event()
+    flush_completed = False
+
+    class FakeAuth:
+        async def _finish_request(
+            self,
+            value: dict[str, bool],
+            status: int,
+        ) -> str | None:
+            if value["finished"]:
+                return None
+            value["finished"] = True
+            return "event-cancelled"
+
+        async def _flush_after_response(self, event_id: str | None) -> None:
+            nonlocal flush_completed
+            assert event_id == "event-cancelled"
+            flush_started.set()
+            await allow_flush.wait()
+            flush_completed = True
+
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"done"})
+
+    async def exercise() -> None:
+        middleware = _UsageMiddleware(inner, FakeAuth())
+
+        async def receive() -> dict[str, Any]:
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, Any]) -> None:
+            return None
+
+        request = asyncio.create_task(
+            middleware(
+                {
+                    "type": "http",
+                    "state": {_STATE_ATTR: context},
+                },
+                receive,
+                send,
+            )
+        )
+        await flush_started.wait()
+        request.cancel()
+        await asyncio.sleep(0)
+        assert not request.done()
+        allow_flush.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+    run(exercise())
+    assert flush_completed
+
+
+def test_cancellation_after_journaling_recovers_the_event_for_fallback() -> None:
+    context: dict[str, Any] = {"finished": False, "event_id": None}
+    finalize_started = asyncio.Event()
+    flush_completed = False
+
+    class FakeAuth:
+        async def _finish_request(
+            self,
+            value: dict[str, Any],
+            status: int,
+        ) -> str | None:
+            if value["finished"]:
+                return value["event_id"]
+            value["finished"] = True
+            value["event_id"] = "event-journaled"
+            finalize_started.set()
+            await asyncio.Event().wait()
+            return value["event_id"]
+
+        async def _flush_after_response(self, event_id: str | None) -> None:
+            nonlocal flush_completed
+            assert event_id == "event-journaled"
+            flush_completed = True
+
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"done"})
+
+    async def exercise() -> None:
+        middleware = _UsageMiddleware(inner, FakeAuth())
+
+        async def receive() -> dict[str, Any]:
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, Any]) -> None:
+            return None
+
+        request = asyncio.create_task(
+            middleware(
+                {
+                    "type": "http",
+                    "state": {_STATE_ATTR: context},
+                },
+                receive,
+                send,
+            )
+        )
+        await finalize_started.wait()
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+    run(exercise())
+    assert flush_completed

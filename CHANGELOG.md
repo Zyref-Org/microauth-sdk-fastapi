@@ -1,5 +1,67 @@
 # Changelog
 
+## 2.3.0
+
+Durable delivery and distributed-coordination hardening release.
+
+- Usage reporting now batches deliveries: a flush happens when 500 requests
+  accumulate or `report_interval` (default now 5 seconds) elapses since the
+  last flush, whichever comes first. The serverless response-bound flush
+  applies the same rule instead of shipping every response individually, so
+  one usage call covers up to 500 requests.
+- Requests sharing an API key, usage policy, status code and hour bucket now
+  merge into one counted usage item (up to 500 per item) with or without
+  Redis. A 150-concurrent burst becomes a single wire item, receipt and
+  accounting pass on the API instead of 150. Redis merges are O(1) (a counter
+  increment plus one appended limiter attachment); once an item has been
+  selected for delivery its payload is frozen, because the server's receipt
+  pins the idempotency key to an exact count.
+- Unified every Redis Lua script marker and the shared snapshot envelope on
+  one protocol version (v3). Older SDK versions reject v3 cache entries and
+  refresh directly, and vice versa; no compatibility shims are carried.
+- Added a Redis-backed durable usage queue with lease-based cross-worker
+  delivery. Every completed request's usage event is durably enqueued before
+  the final response body is released; a dead worker's leases expire and any
+  other worker recovers and delivers its events, keeping accounting
+  at-least-once across serverless instance replacement. Requires Redis with
+  persistence (managed offerings such as Upstash persist by default;
+  self-hosted Redis needs AOF).
+- Shutdown with the durable queue hands undelivered claims back to the shared
+  queue for other workers instead of raising a drain error.
+- Events older than the API's 45-day usage age limit are dead-lettered with
+  their reservation released instead of being retried into a guaranteed
+  rejection.
+- Hardened the shared snapshot cache: cache keys and envelopes are
+  credential-scoped, publications carry fencing tokens so an expired refresh
+  leader cannot overwrite a newer snapshot, payloads are digest-checked and
+  size-bounded, and the origin leader's reservation-reconciliation cutoff is
+  preserved through hydration (closing a temporary overspend window).
+- Cached snapshots can no longer clear an authoritative 401/403 credential
+  rejection, and older cached data can never replace a newer local snapshot.
+- Expired usage policies now accept another instance's published snapshot,
+  so only one leader reaches the control plane at policy expiry.
+- Frozen serverless workers recover on-request: a stale snapshot triggers a
+  throttled inline refresh from the shared cache before rejecting traffic.
+- `UsageReporter.record()` is now a coroutine; the SQLite journal writes
+  moved off the event loop into a single group-committing writer.
+- Redis acknowledgements are batched per customer/credential pair, the no-op
+  billable finalize round trip is skipped, and reservation-time
+  acknowledgement cleanup is bounded, keeping the hot path O(1).
+- Snapshot cache waiters poll with jittered exponential backoff instead of a
+  fixed 50 ms interval.
+
+## 2.2.1
+
+- Journal serverless usage before the final response frame, then deliver it
+  after that frame is sent so control-plane accounting does not delay callers.
+- Coalesce concurrently completed responses through a short post-response
+  microbatch window, avoiding one usage request per application request during
+  serverless concurrency bursts.
+- Release the billable monetary reservation when journaling a usage event
+  fails, instead of leaking reserved credit until the reservation TTL.
+- Document the serverless background-execution and durable-filesystem
+  requirements explicitly.
+
 ## 2.2.0
 
 Serverless caching and reporting reliability release.

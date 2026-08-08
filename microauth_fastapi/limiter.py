@@ -27,7 +27,7 @@ DENIED_QUOTA = "quota"
 DENIED_PLATFORM = "platform"
 
 _RPS_SCRIPT = """
-local marker = "microauth-rps-v2"
+local marker = "microauth-rps-v3"
 local count = redis.call("INCR", KEYS[1])
 if count == 1 then
     redis.call("PEXPIRE", KEYS[1], ARGV[1])
@@ -36,7 +36,7 @@ return count
 """
 
 _RESERVE_SCRIPT = """
-local marker = "microauth-request-reserve-v2"
+local marker = "microauth-request-reserve-v3"
 local customer_floor = tonumber(redis.call("HGET", KEYS[1], "floor") or ARGV[1])
 local customer_count = tonumber(redis.call("HGET", KEYS[1], "count") or customer_floor)
 local incoming_customer_floor = tonumber(ARGV[1])
@@ -52,7 +52,11 @@ local stored_version = tonumber(redis.call("HGET", KEYS[2], "version") or "-1")
 local balance = tonumber(redis.call("HGET", KEYS[2], "balance") or ARGV[2])
 local reserved = tonumber(redis.call("HGET", KEYS[2], "reserved") or "0")
 
-local acknowledged = redis.call("ZRANGEBYSCORE", KEYS[5], "-inf", ARGV[13])
+-- Bounded cleanup keeps this hot-path script O(1): a large acknowledgement
+-- backlog is drained a slice at a time by subsequent requests instead of
+-- pausing one unlucky request for the whole backlog.
+local acknowledged = redis.call(
+    "ZRANGEBYSCORE", KEYS[5], "-inf", ARGV[13], "LIMIT", 0, 128)
 for _, token in ipairs(acknowledged) do
     local amount = tonumber(redis.call("HGET", KEYS[4], token) or "0")
     reserved = math.max(0, reserved - amount)
@@ -138,7 +142,7 @@ return {
 """
 
 _FINALIZE_SCRIPT = """
-local marker = "microauth-request-finalize-v2"
+local marker = "microauth-request-finalize-v3"
 local amount = tonumber(redis.call("HGET", KEYS[2], ARGV[1]) or "0")
 local reserved = tonumber(redis.call("HGET", KEYS[1], "reserved") or "0")
 if tonumber(ARGV[2]) == 0 then
@@ -153,17 +157,20 @@ return reserved
 """
 
 _ACKNOWLEDGE_SCRIPT = """
-local marker = "microauth-request-acknowledge-v2"
-if redis.call("HEXISTS", KEYS[1], ARGV[1]) == 1 then
-    redis.call("ZADD", KEYS[2], ARGV[2], ARGV[1])
+local marker = "microauth-request-acknowledge-v3"
+for index = 3, #ARGV do
+    local token = ARGV[index]
+    if redis.call("HEXISTS", KEYS[1], token) == 1 then
+        redis.call("ZADD", KEYS[2], ARGV[1], token)
+    end
 end
-redis.call("PEXPIRE", KEYS[1], ARGV[3])
-redis.call("PEXPIRE", KEYS[2], ARGV[3])
+redis.call("PEXPIRE", KEYS[1], ARGV[2])
+redis.call("PEXPIRE", KEYS[2], ARGV[2])
 return 1
 """
 
 _RESTORE_SCRIPT = """
-local marker = "microauth-request-restore-v2"
+local marker = "microauth-request-restore-v3"
 if redis.call("HEXISTS", KEYS[4], ARGV[8]) == 1 then
     return 0
 end
@@ -812,18 +819,33 @@ class RedisLimiter:
 
     async def acknowledge(self, attachments: list[dict[str, Any]]) -> None:
         acknowledged_at = _milliseconds(time.time())
+        # One Redis call per customer/key pair instead of one per event: a
+        # 1000-item acknowledgement otherwise holds the flush lock through
+        # 1000 sequential round trips.
+        grouped: dict[tuple[str, str], tuple[int, list[str]]] = {}
+        for raw in attachments:
+            attachment = _parse_attachment(raw)
+            keys = self._attachment_keys(attachment)
+            group_key = (keys.reservations, keys.acknowledgements)
+            ttl = _state_ttl_ms(attachment.period_end)
+            existing = grouped.get(group_key)
+            if existing is None:
+                grouped[group_key] = (ttl, [attachment.token])
+            else:
+                grouped[group_key] = (
+                    max(existing[0], ttl),
+                    existing[1] + [attachment.token],
+                )
         try:
-            for raw in attachments:
-                attachment = _parse_attachment(raw)
-                keys = self._attachment_keys(attachment)
+            for (reservations, acknowledgements), (ttl, tokens) in grouped.items():
                 await self._redis.eval(
                     _ACKNOWLEDGE_SCRIPT,
                     2,
-                    keys.reservations,
-                    keys.acknowledgements,
-                    attachment.token,
+                    reservations,
+                    acknowledgements,
                     acknowledged_at,
-                    _state_ttl_ms(attachment.period_end),
+                    ttl,
+                    *tokens,
                 )
         except Exception as exc:
             raise LimitBackendUnavailable(

@@ -27,13 +27,24 @@ from .exceptions import (
     UsageStoreError,
 )
 from .models import MAX_USAGE_COUNT
+from .usage_store import (
+    UPSERT_MERGED,
+    RedisUsageStore,
+)
 
 logger = logging.getLogger("microauth")
 
 _DEFAULT_MAX_ITEMS = 10_000
-_DEFAULT_BATCH_SIZE = 1000
+# Deliveries batch up to this many events; reaching it triggers an immediate
+# flush instead of waiting for the interval deadline.
+_DEFAULT_BATCH_SIZE = 500
+_RESPONSE_BATCH_WINDOW = 0.01
 _SUCCESS_STATUSES = frozenset({"accepted", "duplicate"})
 _TERMINAL_ITEM_HTTP_STATUSES = frozenset({400, 402, 409, 422})
+
+# The API terminally rejects usage older than 45 days; retrying past that only
+# converts a delayed delivery into a guaranteed rejection.
+_MAX_EVENT_AGE_SECONDS = 45 * 86_400
 
 UsageCallback = Callable[[list[dict[str, Any]]], Awaitable[None] | None]
 AuthorizationCallback = Callable[
@@ -51,6 +62,15 @@ class _UsageEvent:
     count: int
     period_start: str
     attachments: list[dict[str, Any]] = field(default_factory=list)
+    # Once an event has been selected for delivery (or restored from a spool,
+    # where a previous attempt may have happened), its payload is immutable:
+    # the server's receipt is keyed by idempotency_key and a retry with a
+    # different count would be a 409 conflict.
+    frozen: bool = False
+    # Number of merges currently persisting into this event. Flush selection
+    # defers events with active merges so a delivery can never freeze a
+    # payload halfway through a durable count increment.
+    merging: int = 0
 
     def as_payload(self) -> dict[str, Any]:
         payload = {
@@ -63,6 +83,19 @@ class _UsageEvent:
         if self.usage_policy_id is not None:
             payload["usage_policy_id"] = self.usage_policy_id
         return payload
+
+    def as_static_payload(self) -> dict[str, Any]:
+        payload = self.as_payload()
+        del payload["count"]
+        return payload
+
+    def merge_key(self) -> tuple[str, str | None, int, str]:
+        return (
+            self.api_key_id,
+            self.usage_policy_id,
+            self.status_code,
+            self.period_start,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +131,7 @@ class UsageReporter:
         batch_size: int = _DEFAULT_BATCH_SIZE,
         shutdown_timeout: float = 10.0,
         spool_path: str | os.PathLike[str] | None = None,
+        store: RedisUsageStore | None = None,
         on_acknowledged: UsageCallback | None = None,
         on_rejected: UsageCallback | None = None,
         on_restored: UsageCallback | None = None,
@@ -122,7 +156,13 @@ class UsageReporter:
         self._on_restored = on_restored
         self._on_authorization_failure = on_authorization_failure
 
+        self._store = store
         self._events: dict[str, _UsageEvent] = {}
+        # Open (unfrozen, pending) events by identity, so requests sharing an
+        # API key, policy, status and hour merge into one counted event
+        # instead of one row per request.
+        self._open_events: dict[tuple[str, str | None, int, str], str] = {}
+        self._merge_limit = min(batch_size, MAX_USAGE_COUNT)
         self._pending: deque[str] = deque()
         self._reservations: set[str] = set()
         self._task: asyncio.Task[None] | None = None
@@ -133,6 +173,12 @@ class UsageReporter:
         self._flush_deadline: float | None = None
         self._restored = False
         self._store_error: UsageStoreError | None = None
+        self._last_sweep = 0.0
+        # Anchor the "seconds since the last flush" batching rule so the
+        # first request batches instead of flushing instantly.
+        self._last_flush = time.monotonic()
+        self._spool_writes: list[tuple[list[_UsageEvent], asyncio.Future[None]]] = []
+        self._spool_writer_active = False
 
     @property
     def pending_items(self) -> int:
@@ -169,7 +215,7 @@ class UsageReporter:
     def release(self, reservation: UsageReservation) -> None:
         self._reservations.discard(reservation.token)
 
-    def record(
+    async def record(
         self,
         api_key_id: str,
         status_code: int,
@@ -215,6 +261,14 @@ class UsageReporter:
         ):
             raise UsageQueueFull(self._max_items)
 
+        merge_key = (api_key_id, usage_policy_id, status_code, period_start)
+        merged_id = await self._try_merge(merge_key, normalized_attachment)
+        if merged_id is not None:
+            if reservation is not None:
+                self._consume_reservation(reservation)
+            self._schedule_flush()
+            return merged_id
+
         event = _UsageEvent(
             idempotency_key=str(uuid.uuid4()),
             api_key_id=api_key_id,
@@ -224,19 +278,174 @@ class UsageReporter:
             period_start=period_start,
             attachments=[normalized_attachment],
         )
-        self._persist_now([event])
+        await self._persist_event(event)
+        if reservation is not None and reservation.token not in self._reservations:
+            # Validated before the durable write; a concurrent consumer while
+            # awaiting persistence indicates a caller bug.
+            raise ValueError("usage queue reservation is invalid or already consumed")
         if reservation is not None:
             self._consume_reservation(reservation)
         self._events[event.idempotency_key] = event
+        self._open_events[merge_key] = event.idempotency_key
         self._pending.append(event.idempotency_key)
         self._schedule_flush()
         return event.idempotency_key
+
+    async def _try_merge(
+        self,
+        merge_key: tuple[str, str | None, int, str],
+        attachment: dict[str, Any],
+    ) -> str | None:
+        """Aggregate this request into an open event with the same identity.
+
+        Merging keeps one counted event (and later one receipt and one API
+        item) per key/policy/status/hour per flush window, instead of one row
+        per request. Only never-delivered events are merged: once a payload
+        has been attempted, its idempotency key pins its exact count.
+        """
+
+        event_id = self._open_events.get(merge_key)
+        if event_id is None:
+            return None
+        event = self._events.get(event_id)
+        if event is None or event.frozen or event.count >= self._merge_limit:
+            self._open_events.pop(merge_key, None)
+            return None
+        event.merging += 1
+        try:
+            if self._store is not None:
+                try:
+                    result = await self._store.merge_claimed(
+                        event_id,
+                        attachment or None,
+                        max_count=self._merge_limit,
+                    )
+                except (UsageQueueFull, UsageStoreError):
+                    # Fall back to an independent event; its own persistence
+                    # path handles a struggling store.
+                    return None
+                if result != UPSERT_MERGED:
+                    # Fenced (another worker recovered the event) or capped;
+                    # this open event can no longer accept requests.
+                    self._open_events.pop(merge_key, None)
+                    return None
+            elif self._spool_path is not None:
+                # Commit in memory first and journal a synchronous snapshot of
+                # the merged state, so concurrent merges into the same event
+                # serialize correctly through the group-commit writer.
+                event.count += 1
+                if attachment:
+                    event.attachments.append(attachment)
+                snapshot = _UsageEvent(
+                    idempotency_key=event.idempotency_key,
+                    api_key_id=event.api_key_id,
+                    usage_policy_id=event.usage_policy_id,
+                    status_code=event.status_code,
+                    count=event.count,
+                    period_start=event.period_start,
+                    attachments=list(event.attachments),
+                )
+                try:
+                    await self._persist_batched([snapshot])
+                except BaseException:
+                    event.count -= 1
+                    if attachment:
+                        try:
+                            event.attachments.remove(attachment)
+                        except ValueError:
+                            pass
+                    raise
+                return event_id
+            # The merging latch kept flush selection away; commit in memory.
+            event.count += 1
+            if attachment:
+                event.attachments.append(attachment)
+            return event_id
+        finally:
+            event.merging -= 1
+
+    async def _persist_event(self, event: _UsageEvent) -> None:
+        """Complete the durable handoff before the caller's response is final."""
+
+        if self._store is not None:
+            try:
+                await self._store.enqueue_claimed(
+                    event.idempotency_key,
+                    event.as_static_payload(),
+                    event.attachments[0] if event.attachments[0] else None,
+                )
+                return
+            except UsageQueueFull:
+                raise
+            except UsageStoreError as exc:
+                if self._spool_path is None:
+                    logger.error(
+                        "microauth: durable usage queue is unavailable (%s); "
+                        "the event is retained in memory only",
+                        exc,
+                    )
+                    return
+                logger.warning(
+                    "microauth: durable usage queue is unavailable (%s); "
+                    "falling back to the local journal",
+                    exc,
+                )
+        await self._persist_batched([event])
+
+    async def _persist_batched(self, events: list[_UsageEvent]) -> None:
+        """Group concurrent journal writes into one SQLite transaction."""
+
+        if self._spool_path is None or not events:
+            return
+        if self._store_error is not None:
+            raise self._store_error
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._spool_writes.append((events, future))
+        if not self._spool_writer_active:
+            self._spool_writer_active = True
+            try:
+                while self._spool_writes:
+                    batch = self._spool_writes
+                    self._spool_writes = []
+                    combined = [
+                        event
+                        for batch_events, _ in batch
+                        for event in batch_events
+                    ]
+                    try:
+                        await asyncio.to_thread(
+                            _persist_spool,
+                            self._spool_path,
+                            combined,
+                            self._max_items,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - storage boundary
+                        error: Exception
+                        if isinstance(exc, (UsageQueueFull, UsageStoreError)):
+                            error = exc
+                        else:
+                            error = UsageStoreError(
+                                f"could not persist usage journal: {exc}"
+                            )
+                        if isinstance(error, UsageStoreError):
+                            self._store_error = error
+                        for _, waiter in batch:
+                            if not waiter.done():
+                                waiter.set_exception(error)
+                    else:
+                        for _, waiter in batch:
+                            if not waiter.done():
+                                waiter.set_result(None)
+            finally:
+                self._spool_writer_active = False
+        await future
 
     async def start(self) -> None:
         async with self._start_lock:
             if not self._restored:
                 await self._restore()
                 self._restored = True
+                await self._maybe_sweep()
             if self._task is None or self._task.done():
                 self._task = asyncio.create_task(
                     self._loop(),
@@ -247,8 +456,21 @@ class UsageReporter:
         while True:
             deadline = self._flush_deadline
             if deadline is None:
-                await self._wake.wait()
-                self._wake.clear()
+                if self._store is None:
+                    await self._wake.wait()
+                    self._wake.clear()
+                    continue
+                # Idle workers still sweep the shared queue so a dead worker's
+                # leases are recovered without waiting for local traffic.
+                try:
+                    await asyncio.wait_for(
+                        self._wake.wait(),
+                        timeout=self._interval,
+                    )
+                except asyncio.TimeoutError:
+                    await self._maybe_sweep()
+                else:
+                    self._wake.clear()
                 continue
             delay = deadline - time.monotonic()
             if delay > 0:
@@ -259,6 +481,7 @@ class UsageReporter:
                 else:
                     self._wake.clear()
                     continue
+            await self._maybe_sweep()
             try:
                 await self.flush()
             except asyncio.CancelledError:
@@ -267,15 +490,79 @@ class UsageReporter:
                 logger.exception("microauth: usage flush failed; stable items remain queued")
                 self._defer_pending()
 
-    async def flush_on_response(self, event_id: str | None = None) -> None:
-        """Deliver a response's event, coalescing concurrent callers."""
+    async def _maybe_sweep(self) -> None:
+        """Claim due and abandoned events from the shared durable queue."""
 
+        if self._store is None:
+            return
+        now = time.monotonic()
+        if self._last_sweep and now - self._last_sweep < self._interval:
+            return
+        self._last_sweep = now
+        capacity = self._max_items - len(self._events) - len(self._reservations)
+        if capacity <= 0:
+            return
+        try:
+            claimed = await self._store.claim_due(min(capacity, self._batch_size))
+        except UsageStoreError as exc:
+            logger.warning(
+                "microauth: durable usage queue sweep failed (%s)",
+                exc,
+            )
+            return
+        recovered: list[_UsageEvent] = []
+        for event_id, payload in claimed:
+            if event_id in self._events:
+                continue
+            try:
+                event = _event_from_store_payload(event_id, payload)
+                # A recovered event may already have been attempted by its
+                # dead owner; its payload is pinned by the server's receipt.
+                event.frozen = True
+                recovered.append(event)
+            except UsageStoreError as exc:
+                logger.error(
+                    "microauth: dead-lettering an invalid durable usage "
+                    "event %s (%s)",
+                    event_id,
+                    exc,
+                )
+                try:
+                    await self._store.dead_letter(event_id, str(exc))
+                except UsageStoreError:
+                    logger.exception(
+                        "microauth: invalid durable usage event could not "
+                        "be dead-lettered"
+                    )
+        if not recovered:
+            return
+        await self._notify(self._on_restored, _event_attachments(recovered))
+        for event in recovered:
+            self._events[event.idempotency_key] = event
+            self._pending.append(event.idempotency_key)
+        self._schedule_flush()
+
+    async def flush_on_response(
+        self,
+        event_id: str | None = None,
+        *,
+        only_if_due: bool = False,
+    ) -> None:
+        """Deliver a response's event, coalescing concurrent callers.
+
+        With ``only_if_due`` the call returns without delivering unless the
+        batching rule (full batch, or the interval elapsed since the last
+        flush) calls for it; the event stays durably queued for a later batch.
+        """
+
+        if only_if_due and not self.flush_is_due(event_id):
+            return
         targets = {event_id} if event_id is not None else set(self._events)
         while any(target in self._events for target in targets):
             task = self._response_flush_task
             if task is None or task.done():
                 task = asyncio.create_task(
-                    self.flush(),
+                    self._flush_response_batch(),
                     name="microauth-usage-response-flush",
                 )
                 self._response_flush_task = task
@@ -285,15 +572,49 @@ class UsageReporter:
                 if self._response_flush_task is task and task.done():
                     self._response_flush_task = None
 
+    async def _flush_response_batch(self) -> None:
+        # A very short post-response window lets concurrently completed ASGI
+        # requests share one usage call. The client response has already been
+        # sent, so this reduces serverless request amplification without adding
+        # user-visible latency.
+        await asyncio.sleep(_RESPONSE_BATCH_WINDOW)
+        # Serverless workers may never run the background loop between
+        # invocations, so the response-bound path also recovers abandoned
+        # events (throttled to one claim per interval).
+        await self._maybe_sweep()
+        await self.flush()
+
     async def flush(self) -> None:
         """Deliver all selected events while retaining only transient failures."""
 
         async with self._flush_lock:
-            selected = list(self._pending)
+            self._last_flush = time.monotonic()
+            await self._expire_stale_events()
+            selected: list[str] = []
+            deferred: list[str] = []
+            for event_id in self._pending:
+                event = self._events.get(event_id)
+                if event is None:
+                    continue
+                if event.merging:
+                    # A durable count increment is mid-flight; deliver this
+                    # event in the next cycle rather than freezing a payload
+                    # halfway through a merge.
+                    deferred.append(event_id)
+                    continue
+                # Selection permanently freezes the payload: the server's
+                # receipt pins this idempotency key to this exact count.
+                event.frozen = True
+                if self._open_events.get(event.merge_key()) == event_id:
+                    del self._open_events[event.merge_key()]
+                selected.append(event_id)
+            self._pending = deque(deferred)
             if not selected:
-                self._flush_deadline = None
+                if deferred:
+                    self._defer_pending()
+                else:
+                    self._flush_deadline = None
                 return
-            self._pending.clear()
             self._flush_deadline = None
 
             first_error: Exception | None = None
@@ -306,6 +627,7 @@ class UsageReporter:
                     ]
                     if not chunk_ids:
                         continue
+                    await self._extend_store_leases(chunk_ids)
                     try:
                         retry_ids, error = await self._deliver(chunk_ids)
                     except MicroAuthAuthorizationError as exc:
@@ -333,6 +655,39 @@ class UsageReporter:
             finally:
                 if self._pending:
                     self._defer_pending()
+                    await self._extend_store_leases(list(self._pending))
+
+    async def _expire_stale_events(self) -> None:
+        """Dead-letter events the API would terminally reject by age."""
+
+        cutoff = datetime.now(timezone.utc).timestamp() - _MAX_EVENT_AGE_SECONDS
+        expired: list[str] = []
+        for event_id, event in self._events.items():
+            if event.merging:
+                continue
+            period = datetime.fromisoformat(
+                event.period_start.replace("Z", "+00:00")
+            )
+            if period.timestamp() < cutoff:
+                expired.append(event_id)
+        for event_id in expired:
+            await self._dead_letter(
+                event_id,
+                "the event exceeded the API's 45-day usage age limit "
+                "before it could be delivered",
+            )
+
+    async def _extend_store_leases(self, event_ids: list[str]) -> None:
+        if self._store is None or not event_ids:
+            return
+        try:
+            await self._store.extend_leases(event_ids)
+        except UsageStoreError as exc:
+            logger.warning(
+                "microauth: durable usage delivery leases could not be "
+                "renewed (%s)",
+                exc,
+            )
 
     async def _deliver(
         self,
@@ -372,16 +727,24 @@ class UsageReporter:
             if event_id in self._events
         ]
         if accepted_events:
+            accepted_ids = [event.idempotency_key for event in accepted_events]
             await self._notify(
                 self._on_acknowledged,
                 _event_attachments(accepted_events),
             )
-            await self._delete_persisted(
-                [event.idempotency_key for event in accepted_events]
-            )
-            self._remove_events(
-                [event.idempotency_key for event in accepted_events]
-            )
+            if self._store is not None:
+                try:
+                    await self._store.ack(accepted_ids)
+                except UsageStoreError as exc:
+                    # The server already recorded these idempotent items; a
+                    # re-claimed copy will be acknowledged as a duplicate.
+                    logger.warning(
+                        "microauth: delivered usage could not be removed from "
+                        "the durable queue (%s)",
+                        exc,
+                    )
+            await self._delete_persisted(accepted_ids)
+            self._remove_events(accepted_ids)
 
         for event_id, detail in plan.rejected.items():
             if event_id in self._events:
@@ -393,6 +756,14 @@ class UsageReporter:
     async def _dead_letter(self, event_id: str, detail: str) -> None:
         event = self._events[event_id]
         await self._notify(self._on_rejected, list(event.attachments))
+        if self._store is not None:
+            try:
+                await self._store.dead_letter(event_id, detail)
+            except UsageStoreError:
+                logger.exception(
+                    "microauth: terminal usage item could not be moved to "
+                    "the durable dead-letter queue"
+                )
         await self._persist_dead_letter(event, detail)
         self._remove_events([event_id])
         logger.error(
@@ -420,13 +791,47 @@ class UsageReporter:
             )
         except Exception as exc:
             await self._cancel_response_flush()
+            if not self._reservations and await self._release_store_claims():
+                return
             raise UsageDrainError(self.pending_items, str(exc)) from exc
         await self._cancel_response_flush()
         if self._events or self._reservations:
+            if not self._reservations and await self._release_store_claims():
+                return
             raise UsageDrainError(
                 len(self._events) + len(self._reservations),
                 "queue changed while shutdown was draining",
             )
+
+    async def _release_store_claims(self) -> bool:
+        """Hand undelivered events back to the shared queue at shutdown.
+
+        Returns True when every locally queued event is durably owned by the
+        shared queue again, meaning shutdown lost nothing and need not raise.
+        """
+
+        if self._store is None:
+            return False
+        event_ids = list(self._events)
+        if not event_ids:
+            return True
+        try:
+            released = await self._store.release(event_ids)
+        except UsageStoreError:
+            logger.exception(
+                "microauth: undelivered usage could not be handed back to "
+                "the durable queue during shutdown"
+            )
+            return False
+        logger.warning(
+            "microauth: %d undelivered usage item(s) were handed back to the "
+            "durable queue for another worker (released %d lease(s))",
+            len(event_ids),
+            released,
+        )
+        self._remove_events(event_ids)
+        self._pending.clear()
+        return True
 
     async def _drain(self) -> None:
         response_task = self._response_flush_task
@@ -465,7 +870,12 @@ class UsageReporter:
 
     def _remove_events(self, event_ids: Iterable[str]) -> None:
         for event_id in event_ids:
-            self._events.pop(event_id, None)
+            event = self._events.pop(event_id, None)
+            if (
+                event is not None
+                and self._open_events.get(event.merge_key()) == event_id
+            ):
+                del self._open_events[event.merge_key()]
 
     def _requeue_back(self, event_ids: Iterable[str]) -> None:
         requested = [
@@ -480,10 +890,39 @@ class UsageReporter:
             event_id for event_id in requested if event_id not in existing
         )
 
+    def _pending_request_total(self) -> int:
+        """Requests (not events) awaiting delivery; merged events count fully."""
+
+        return sum(
+            event.count
+            for event_id in self._pending
+            if (event := self._events.get(event_id)) is not None
+        )
+
     def _schedule_flush(self) -> None:
-        if self._flush_deadline is None:
-            self._flush_deadline = time.monotonic() + self._interval
+        now = time.monotonic()
+        if self._pending_request_total() >= self._batch_size:
+            # A full batch of requests flushes immediately instead of waiting
+            # out the interval deadline.
+            self._flush_deadline = now
+        elif self._flush_deadline is None:
+            self._flush_deadline = now + self._interval
         self._wake.set()
+
+    def flush_is_due(self, event_id: str | None = None) -> bool:
+        """True when the 500-or-interval batching rule calls for a delivery.
+
+        A delivery is due when a full batch of requests has accumulated or
+        the interval has elapsed since the last flush while events are queued.
+        """
+
+        if event_id is not None and event_id not in self._events:
+            return False
+        if not self._events:
+            return False
+        if self._pending_request_total() >= self._batch_size:
+            return True
+        return time.monotonic() - self._last_flush >= self._interval
 
     def _defer_pending(self) -> None:
         if not self._pending:
@@ -508,6 +947,10 @@ class UsageReporter:
             for event in events
             if event.idempotency_key not in self._events
         ]
+        for event in unseen:
+            # A restored event may already have been attempted before the
+            # previous process died; its payload is pinned by the receipt.
+            event.frozen = True
         if len(self._events) + len(unseen) > self._max_items:
             raise UsageQueueFull(self._max_items)
         if unseen:
@@ -517,21 +960,6 @@ class UsageReporter:
             self._pending.append(event.idempotency_key)
         if unseen:
             self._schedule_flush()
-
-    def _persist_now(self, events: list[_UsageEvent]) -> None:
-        if self._spool_path is None or not events:
-            return
-        try:
-            _persist_spool(self._spool_path, events, self._max_items)
-        except UsageQueueFull:
-            raise
-        except UsageStoreError as exc:
-            self._store_error = exc
-            raise
-        except Exception as exc:
-            error = UsageStoreError(f"could not persist usage journal: {exc}")
-            self._store_error = error
-            raise error from exc
 
     async def _delete_persisted(self, event_ids: list[str]) -> None:
         if self._spool_path is None or not event_ids:
@@ -919,6 +1347,44 @@ def _dead_letter_spool(path: Path, event: _UsageEvent, detail: str) -> None:
         raise
     finally:
         connection.close()
+
+
+def _event_from_store_payload(
+    event_id: str,
+    payload: dict[str, Any],
+) -> _UsageEvent:
+    item = payload.get("item")
+    attachments = payload.get("attachments")
+    if not isinstance(item, dict) or not isinstance(attachments, list):
+        raise UsageStoreError(
+            "the durable usage queue holds a malformed event envelope"
+        )
+    if item.get("idempotency_key") != event_id:
+        raise UsageStoreError(
+            "the durable usage queue holds a mismatched idempotency key"
+        )
+    try:
+        attachments_json = json.dumps(
+            attachments,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise UsageStoreError(
+            "the durable usage queue holds invalid attachment metadata"
+        ) from exc
+    return _event_from_row(
+        (
+            event_id,
+            item.get("api_key_id"),
+            item.get("usage_policy_id"),
+            item.get("status_code"),
+            item.get("count"),
+            item.get("period_start"),
+            attachments_json,
+        )
+    )
 
 
 def _event_row(event: _UsageEvent) -> tuple[Any, ...]:

@@ -68,10 +68,12 @@ def test_wire_payload_uses_canonical_names_and_stable_retry() -> None:
         ]
     )
     reporter = UsageReporter(client, 60, spool_path=None)
-    event_id = reporter.record(
-        "11111111-1111-4111-8111-111111111111",
-        207,
-        usage_policy_id="22222222-2222-4222-8222-222222222222",
+    event_id = run(
+        reporter.record(
+            "11111111-1111-4111-8111-111111111111",
+            207,
+            usage_policy_id="22222222-2222-4222-8222-222222222222",
+        )
     )
 
     with pytest.raises(MicroAuthAPIError):
@@ -117,7 +119,7 @@ def test_http_transport_retry_keeps_identical_payload(
             http_client=external,
         )
         reporter = UsageReporter(api, 60, spool_path=None)
-        reporter.record("11111111-1111-4111-8111-111111111111", 218)
+        await reporter.record("11111111-1111-4111-8111-111111111111", 218)
         await reporter.flush()
         await external.aclose()
 
@@ -128,10 +130,12 @@ def test_http_transport_retry_keeps_identical_payload(
 def test_record_is_journaled_before_flush_and_restored(tmp_path: Path) -> None:
     spool = tmp_path / "usage.sqlite3"
     first = UsageReporter(ScriptedClient([]), 60, spool_path=spool)
-    event_id = first.record(
-        "11111111-1111-4111-8111-111111111111",
-        201,
-        attachment={"token": "reservation-1", "spend_micro": 10},
+    event_id = run(
+        first.record(
+            "11111111-1111-4111-8111-111111111111",
+            201,
+            attachment={"token": "reservation-1", "spend_micro": 10},
+        )
     )
 
     second_client = ScriptedClient([acknowledge])
@@ -232,13 +236,15 @@ def test_per_item_rejection_is_dead_lettered_without_blocking(
         spool_path=spool,
         on_rejected=rejected,
     )
-    reporter.record("11111111-1111-4111-8111-111111111111", 200)
-    rejected_id = reporter.record(
-        "22222222-2222-4222-8222-222222222222",
-        200,
-        attachment={"token": "terminal"},
+    run(reporter.record("11111111-1111-4111-8111-111111111111", 200))
+    rejected_id = run(
+        reporter.record(
+            "22222222-2222-4222-8222-222222222222",
+            200,
+            attachment={"token": "terminal"},
+        )
     )
-    reporter.record("33333333-3333-4333-8333-333333333333", 200)
+    run(reporter.record("33333333-3333-4333-8333-333333333333", 200))
 
     run(reporter.flush())
     assert reporter.pending_items == 0
@@ -261,9 +267,9 @@ def test_batch_level_terminal_error_is_bisected_to_isolate_poison() -> None:
 
     client = ScriptedClient([outcome] * 5)
     reporter = UsageReporter(client, 60, spool_path=None)
-    reporter.record("11111111-1111-4111-8111-111111111111", 200)
-    reporter.record(poison_key, 200)
-    reporter.record("33333333-3333-4333-8333-333333333333", 200)
+    run(reporter.record("11111111-1111-4111-8111-111111111111", 200))
+    run(reporter.record(poison_key, 200))
+    run(reporter.record("33333333-3333-4333-8333-333333333333", 200))
 
     run(reporter.flush())
     assert reporter.pending_items == 0
@@ -283,7 +289,7 @@ def test_batch_level_terminal_error_is_bisected_to_isolate_poison() -> None:
 def test_transient_http_failures_remain_queued(status: int) -> None:
     client = ScriptedClient([MicroAuthAPIError(status, "retry"), acknowledge])
     reporter = UsageReporter(client, 60, spool_path=None)
-    reporter.record("11111111-1111-4111-8111-111111111111", 200)
+    run(reporter.record("11111111-1111-4111-8111-111111111111", 200))
     with pytest.raises(MicroAuthAPIError):
         run(reporter.flush())
     assert reporter.pending_items == 1
@@ -309,7 +315,7 @@ def test_authoritative_auth_failure_is_signalled_and_retained(status: int) -> No
         spool_path=None,
         on_authorization_failure=invalid,
     )
-    reporter.record("11111111-1111-4111-8111-111111111111", 200)
+    run(reporter.record("11111111-1111-4111-8111-111111111111", 200))
     with pytest.raises(MicroAuthAuthorizationError):
         run(reporter.flush())
     assert failures == [status]
@@ -331,7 +337,7 @@ def test_malformed_partial_ack_does_not_block_later_chunk() -> None:
     client = ScriptedClient([omitted, acknowledge, acknowledge])
     reporter = UsageReporter(client, 60, batch_size=2, spool_path=None)
     ids = [
-        reporter.record(f"{index:08d}-1111-4111-8111-111111111111", 200)
+        run(reporter.record(f"{index:08d}-1111-4111-8111-111111111111", 200))
         for index in range(3)
     ]
 
@@ -343,21 +349,39 @@ def test_malformed_partial_ack_does_not_block_later_chunk() -> None:
     assert client.calls[2][0]["idempotency_key"] == ids[1]
 
 
-def test_completed_requests_are_frozen_and_batched_consistently() -> None:
-    client = ScriptedClient([acknowledge, acknowledge, acknowledge])
-    reporter = UsageReporter(client, 60, batch_size=2, spool_path=None)
-    for _ in range(5):
-        reporter.record("11111111-1111-4111-8111-111111111111", 200)
-    run(reporter.flush())
-    assert [len(call) for call in client.calls] == [2, 2, 1]
-    assert all(item["count"] == 1 for call in client.calls for item in call)
-    assert len(
-        {
-            item["idempotency_key"]
-            for call in client.calls
-            for item in call
+def test_same_identity_requests_merge_into_one_counted_item() -> None:
+    client = ScriptedClient([acknowledge, acknowledge])
+    reporter = UsageReporter(client, 60, spool_path=None)
+
+    async def exercise() -> None:
+        first_ids = {
+            await reporter.record("11111111-1111-4111-8111-111111111111", 200)
+            for _ in range(5)
         }
-    ) == 5
+        # Five requests sharing one key/status/hour become one counted event.
+        assert len(first_ids) == 1
+        different_status = await reporter.record(
+            "11111111-1111-4111-8111-111111111111",
+            201,
+        )
+        assert different_status not in first_ids
+        assert reporter.pending_items == 2
+        assert reporter.pending_requests == 6
+        await reporter.flush()
+
+        # Delivery froze the payloads; a new request opens a fresh event
+        # instead of mutating a count the server has already receipted.
+        follow_up = await reporter.record(
+            "11111111-1111-4111-8111-111111111111",
+            200,
+        )
+        assert follow_up not in first_ids
+        await reporter.flush()
+
+    run(exercise())
+    first_call, second_call = client.calls
+    assert sorted(item["count"] for item in first_call) == [1, 5]
+    assert [item["count"] for item in second_call] == [1]
 
 
 def test_queue_is_bounded_and_reserved_capacity_is_consumed() -> None:
@@ -370,10 +394,12 @@ def test_queue_is_bounded_and_reserved_capacity_is_consumed() -> None:
     reservation = reporter.reserve()
     with pytest.raises(UsageQueueFull):
         reporter.reserve()
-    reporter.record(
-        "11111111-1111-4111-8111-111111111111",
-        299,
-        reservation=reservation,
+    run(
+        reporter.record(
+            "11111111-1111-4111-8111-111111111111",
+            299,
+            reservation=reservation,
+        )
     )
     assert reporter.pending_items == 1
 
@@ -384,7 +410,7 @@ def test_graceful_shutdown_drains_or_raises_typed_error() -> None:
         60,
         spool_path=None,
     )
-    success.record("11111111-1111-4111-8111-111111111111", 200)
+    run(success.record("11111111-1111-4111-8111-111111111111", 200))
     run(success.aclose())
 
     failure = UsageReporter(
@@ -392,7 +418,7 @@ def test_graceful_shutdown_drains_or_raises_typed_error() -> None:
         60,
         spool_path=None,
     )
-    failure.record("11111111-1111-4111-8111-111111111111", 200)
+    run(failure.record("11111111-1111-4111-8111-111111111111", 200))
     with pytest.raises(UsageDrainError) as caught:
         run(failure.aclose())
     assert caught.value.pending_items == 1
@@ -402,7 +428,7 @@ def test_graceful_shutdown_drains_or_raises_typed_error() -> None:
 def test_status_code_validation(status: Any) -> None:
     reporter = UsageReporter(ScriptedClient([]), 60, spool_path=None)
     with pytest.raises((TypeError, ValueError)):
-        reporter.record("11111111-1111-4111-8111-111111111111", status)
+        run(reporter.record("11111111-1111-4111-8111-111111111111", status))
 
 
 def test_interval_flushes_without_a_follow_up_record() -> None:
@@ -411,7 +437,7 @@ def test_interval_flushes_without_a_follow_up_record() -> None:
 
     async def exercise() -> None:
         await reporter.start()
-        reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        await reporter.record("11111111-1111-4111-8111-111111111111", 200)
         deadline = asyncio.get_running_loop().time() + 1.0
         while reporter.pending_items and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.01)
@@ -420,6 +446,67 @@ def test_interval_flushes_without_a_follow_up_record() -> None:
 
     run(exercise())
     assert len(client.calls) == 1
+
+
+def test_full_batch_of_requests_triggers_an_immediate_flush() -> None:
+    client = ScriptedClient([acknowledge])
+    # A one-hour interval proves the size trigger, not the timer, flushed.
+    # The batch rule counts requests, so five merged into one counted event
+    # still fill a batch of five.
+    reporter = UsageReporter(client, 3600, batch_size=5, spool_path=None)
+
+    async def exercise() -> None:
+        await reporter.start()
+        for _ in range(5):
+            await reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while reporter.pending_items and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert reporter.pending_items == 0
+        await reporter.aclose()
+
+    run(exercise())
+    assert [len(call) for call in client.calls] == [1]
+    assert client.calls[0][0]["count"] == 5
+
+
+def test_response_flush_defers_until_the_batch_is_due() -> None:
+    client = ScriptedClient([acknowledge])
+    reporter = UsageReporter(client, 60, spool_path=None)
+
+    async def exercise() -> None:
+        event_id = await reporter.record(
+            "11111111-1111-4111-8111-111111111111",
+            200,
+        )
+        await reporter.flush_on_response(event_id, only_if_due=True)
+        # Below the batch size and within the interval: nothing shipped.
+        assert client.calls == []
+        assert reporter.pending_items == 1
+
+        reporter._last_flush -= 61
+        await reporter.flush_on_response(event_id, only_if_due=True)
+        assert reporter.pending_items == 0
+        assert len(client.calls) == 1
+
+    run(exercise())
+
+
+def test_explicit_response_flush_bypasses_the_batching_rule() -> None:
+    client = ScriptedClient([acknowledge])
+    reporter = UsageReporter(client, 60, spool_path=None)
+
+    async def exercise() -> None:
+        event_id = await reporter.record(
+            "11111111-1111-4111-8111-111111111111",
+            200,
+        )
+        # flush_usage()-style forced drains must not wait for a batch.
+        await reporter.flush_on_response(event_id)
+        assert reporter.pending_items == 0
+        assert len(client.calls) == 1
+
+    run(exercise())
 
 
 def test_response_flush_includes_an_event_recorded_during_delivery() -> None:
@@ -443,10 +530,10 @@ def test_response_flush_includes_an_event_recorded_during_delivery() -> None:
     async def exercise() -> list[list[dict[str, Any]]]:
         client = BlockingClient()
         reporter = UsageReporter(client, 60, spool_path=None)
-        reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        await reporter.record("11111111-1111-4111-8111-111111111111", 200)
         first = asyncio.create_task(reporter.flush_on_response())
         await first_started.wait()
-        reporter.record("22222222-2222-4222-8222-222222222222", 201)
+        await reporter.record("22222222-2222-4222-8222-222222222222", 201)
         second = asyncio.create_task(reporter.flush_on_response())
         release_first.set()
         await asyncio.gather(first, second)
@@ -455,6 +542,37 @@ def test_response_flush_includes_an_event_recorded_during_delivery() -> None:
 
     calls = run(exercise())
     assert [len(call) for call in calls] == [1, 1]
+
+
+def test_response_flush_microbatches_concurrent_request_burst() -> None:
+    async def exercise() -> list[list[dict[str, Any]]]:
+        client = ScriptedClient([acknowledge, acknowledge])
+        reporter = UsageReporter(client, 60, spool_path=None)
+
+        async def simulated_response(index: int) -> None:
+            # Responses complete staggered across event-loop iterations, the
+            # way concurrent ASGI requests finish, so later events must join
+            # a batching window that is already counting down.
+            for _ in range(index % 5):
+                await asyncio.sleep(0)
+            event_id = await reporter.record(
+                f"{index + 1:08d}-0000-4000-8000-000000000000",
+                200,
+            )
+            await reporter.flush_on_response(event_id)
+
+        await asyncio.gather(
+            *(simulated_response(index) for index in range(150))
+        )
+        assert reporter.pending_items == 0
+        return client.calls
+
+    calls = run(exercise())
+    # Without the post-response batching window this staggered burst degrades
+    # toward one usage POST per request; with it, everything that completes
+    # within the window shares a delivery.
+    assert len(calls) <= 2
+    assert sum(len(call) for call in calls) == 150
 
 
 def test_explicit_drain_waits_for_an_already_inflight_event() -> None:
@@ -472,7 +590,7 @@ def test_explicit_drain_waits_for_an_already_inflight_event() -> None:
                 return acknowledge(items)
 
         reporter = UsageReporter(BlockingClient(), 60, spool_path=None)
-        reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        await reporter.record("11111111-1111-4111-8111-111111111111", 200)
         delivery = asyncio.create_task(reporter.flush())
         await started.wait()
         drain = asyncio.create_task(reporter.flush_on_response())
@@ -505,7 +623,7 @@ def test_shutdown_cancels_a_stuck_response_flush() -> None:
             shutdown_timeout=0.02,
             spool_path=None,
         )
-        reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        await reporter.record("11111111-1111-4111-8111-111111111111", 200)
         response_flush = asyncio.create_task(reporter.flush_on_response())
         await started.wait()
         with pytest.raises(UsageDrainError):

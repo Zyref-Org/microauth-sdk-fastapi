@@ -101,22 +101,22 @@ class FakeRedis:
         self.calls.append((script, keys, args))
         if self.fail:
             raise OSError("redis down")
-        if "microauth-rps-v2" in script:
+        if "microauth-rps-v3" in script:
             key = keys[0]
             self.rps[key] = self.rps.get(key, 0) + 1
             return self.rps[key]
-        if "microauth-request-reserve-v2" in script:
+        if "microauth-request-reserve-v3" in script:
             return self._reserve(keys, args)
-        if "microauth-request-finalize-v2" in script:
+        if "microauth-request-finalize-v3" in script:
             return self._finalize(keys, args)
-        if "microauth-request-acknowledge-v2" in script:
+        if "microauth-request-acknowledge-v3" in script:
             reservations = self.reservations.setdefault(keys[0], {})
-            if str(args[0]) in reservations:
-                self.acknowledgements.setdefault(keys[1], {})[str(args[0])] = int(
-                    args[1]
-                )
+            acknowledgements = self.acknowledgements.setdefault(keys[1], {})
+            for token in args[2:]:
+                if str(token) in reservations:
+                    acknowledgements[str(token)] = int(args[0])
             return 1
-        if "microauth-request-restore-v2" in script:
+        if "microauth-request-restore-v3" in script:
             return self._restore(keys, args)
         raise AssertionError("unexpected Lua script")
 
@@ -442,6 +442,37 @@ def test_acknowledged_spend_reconciles_only_after_later_snapshot() -> None:
     run(exercise())
 
 
+def test_acknowledgements_are_batched_per_customer_and_credential() -> None:
+    redis = FakeRedis()
+    limiter = RedisLimiter(redis_client=redis)
+    period_end = datetime.now(timezone.utc) + timedelta(days=1)
+
+    def attachment(token: str, customer: str) -> dict[str, Any]:
+        return {
+            "token": token,
+            "tenant_scope": "tenant",
+            "customer_id": customer,
+            "period_key": "period",
+            "period_end": period_end.isoformat().replace("+00:00", "Z"),
+            "spend_micro": 10,
+        }
+
+    attachments = [
+        attachment(f"token-{index}", "customer-a") for index in range(500)
+    ] + [attachment(f"other-{index}", "customer-b") for index in range(500)]
+
+    run(limiter.acknowledge(attachments))
+
+    ack_calls = [
+        call
+        for call in redis.calls
+        if "microauth-request-acknowledge-v3" in call[0]
+    ]
+    # One round trip per customer/credential pair, not one per event.
+    assert len(ack_calls) == 2
+    assert {len(call[2]) - 2 for call in ack_calls} == {500}
+
+
 def test_redis_reservation_is_shared_across_instances() -> None:
     redis = FakeRedis()
     first = RedisLimiter(redis_client=redis)
@@ -484,7 +515,7 @@ def test_redis_reservation_is_shared_across_instances() -> None:
 
     run(exercise())
     reserve_calls = [
-        call for call in redis.calls if "microauth-request-reserve-v2" in call[0]
+        call for call in redis.calls if "microauth-request-reserve-v3" in call[0]
     ]
     assert len({call[1][0] for call in reserve_calls}) == 1
     assert all("{" in key and "}" in key for key in reserve_calls[0][1])
@@ -550,7 +581,7 @@ def test_redis_restore_is_idempotent_and_ttl_exceeds_31_days() -> None:
 
     run(exercise())
     restore_calls = [
-        call for call in redis.calls if "microauth-request-restore-v2" in call[0]
+        call for call in redis.calls if "microauth-request-restore-v3" in call[0]
     ]
     assert restore_calls
     ttl_ms = int(restore_calls[0][2][-2])
