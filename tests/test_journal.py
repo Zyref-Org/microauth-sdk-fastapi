@@ -149,6 +149,73 @@ def test_compaction_drops_acknowledged_operations(tmp_path: Path) -> None:
     assert set(journal.replay_own()) == {"keep-1"}
 
 
+def test_apply_fast_path_defers_live_state_until_actually_needed(
+    tmp_path: Path,
+) -> None:
+    """The group-commit hot path must stay O(batch) regardless of backlog.
+
+    Building every live event's payload on each commit made a growing
+    backlog quadratically expensive; the journal now asks for live state
+    (returns False without writing) only when the file was taken away or a
+    compaction is due.
+    """
+
+    from microauth_fastapi.journal import JournalOp
+
+    journal = WalJournal(tmp_path / "usage.sqlite3", max_items=100, grace_seconds=60)
+    event = {
+        "item": {
+            "idempotency_key": "ev-1",
+            "api_key_id": API_KEY_ID,
+            "status_code": 200,
+            "count": 2,
+            "period_start": "2026-08-08T10:00:00Z",
+        },
+        "attachments": [],
+    }
+    assert journal.apply([JournalOp(op="create", event=event)], None) is True
+
+    # Steal the file: the fast path must refuse (writing nothing) so the
+    # caller can retry with live payloads for the rebuild.
+    journal.path.rename(tmp_path / "stolen.wal")
+    merge = JournalOp(op="merge", event_id="ev-1")
+    assert journal.apply([merge], None) is False
+    event["item"]["count"] = 3  # memory is incremented before submission
+    assert journal.apply([merge], {"ev-1": event}) is True
+    assert journal.replay_own()["ev-1"]["item"]["count"] == 3
+
+
+def test_size_compaction_uses_garbage_ratio_not_absolute_size(
+    tmp_path: Path,
+) -> None:
+    """A large live backlog must not trigger a full rewrite on every append."""
+
+    from microauth_fastapi.journal import JournalOp
+
+    journal = WalJournal(tmp_path / "usage.sqlite3", max_items=100, grace_seconds=60)
+    big_live = {
+        "item": {
+            "idempotency_key": "live-1",
+            "api_key_id": API_KEY_ID,
+            "status_code": 200,
+            "count": 1,
+            "period_start": "2026-08-08T10:00:00Z",
+        },
+        # ~2MB of live attachments: bigger than the compaction floor.
+        "attachments": [{"token": "x" * 100} for _ in range(18_000)],
+    }
+    journal.apply([JournalOp(op="create", event=big_live)], {"live-1": big_live})
+    baseline = journal.path.stat().st_size
+    assert baseline > 1 << 20
+
+    # Appending small batches on top of big live state must stay on the
+    # fast path: below twice the live baseline no compaction is due, so
+    # apply(None) keeps succeeding without asking for live payloads.
+    for index in range(50):
+        op = JournalOp(op="merge", event_id="live-1")
+        assert journal.apply([op], None) is True, f"batch {index} left fast path"
+
+
 def test_adoption_rename_race_is_won_by_exactly_one_process(tmp_path: Path) -> None:
     base = tmp_path / "usage.sqlite3"
     dead = WalJournal(base, max_items=100, grace_seconds=0)

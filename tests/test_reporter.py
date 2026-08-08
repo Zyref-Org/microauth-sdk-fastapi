@@ -518,6 +518,39 @@ def test_failure_backoff_holds_against_full_batches() -> None:
     run(exercise())
 
 
+def test_flush_waits_out_inflight_merges_instead_of_starving_delivery() -> None:
+    """Selection settles active merges rather than skipping busy events.
+
+    Under sustained concurrency the open event's merge latch is effectively
+    never zero at selection time. Deferring busy events therefore starved
+    delivery completely: every flush selected nothing, re-armed immediately
+    (full batch pending) and hot-looped while the backlog grew.
+    """
+
+    client = ScriptedClient([acknowledge])
+    reporter = UsageReporter(client, 60, spool_path=None)
+
+    async def exercise() -> None:
+        event_id = await reporter.record(
+            "11111111-1111-4111-8111-111111111111", 200
+        )
+        event = reporter._events[event_id]
+        event.merging = 1
+
+        async def finish_merge() -> None:
+            await asyncio.sleep(0.05)
+            event.merging = 0
+
+        release = asyncio.create_task(finish_merge())
+        await reporter.flush()
+        await release
+        assert reporter.pending_items == 0
+
+    run(exercise())
+    assert len(client.calls) == 1
+    assert client.calls[0][0]["count"] == 1
+
+
 def test_merge_cap_is_independent_of_the_batch_size() -> None:
     """Open events absorb far more requests than one delivery batch.
 

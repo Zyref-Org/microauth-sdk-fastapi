@@ -38,9 +38,12 @@ from typing import Any
 from .exceptions import UsageQueueFull, UsageStoreError
 
 # Compact after this many acknowledged (dead) operations accumulate, or when
-# the file grows past this size with mostly-dead content.
+# the file grows past this size with mostly-dead content. The size floor is
+# deliberately small: fsync latency grows with the append file's size on
+# some filesystems (notably APFS), so keeping the journal short keeps the
+# group-commit cadence fast; compaction itself only rewrites live state.
 _COMPACT_DEAD_OPS = 2_000
-_COMPACT_MIN_BYTES = 4 << 20
+_COMPACT_MIN_BYTES = 1 << 20
 
 _WAL_VERSION = 1
 
@@ -75,6 +78,13 @@ class WalJournal:
         self._inode: int | None = None
         self._dead_ops = 0
         self._adopt_counter = 0
+        # Tracked instead of stat()ing: appended bytes since open/compact.
+        self._approx_size = 0
+        # Bytes the last compaction wrote, i.e. the size of pure live state.
+        # Compaction triggers on the garbage RATIO (file at least twice the
+        # live baseline), never on absolute size alone: a large live backlog
+        # must not cause a full rewrite on every append batch.
+        self._live_baseline = 0
 
     @property
     def path(self) -> Path:
@@ -89,26 +99,39 @@ class WalJournal:
 
     # ------------------------------------------------------------- appends
 
-    def apply(self, ops: list[JournalOp], pending: dict[str, dict[str, Any]]) -> None:
+    def apply(
+        self,
+        ops: list[JournalOp],
+        pending: dict[str, dict[str, Any]] | None,
+    ) -> bool:
         """Append a batch of operations with one write and one fsync.
 
         ``pending`` is the reporter's current in-memory event state (payload
-        per event id). It is only used to re-snapshot the journal when the
-        file was adopted or removed out from under us, so no increment can be
-        stranded in a file another process took away.
+        per event id). It is only needed in two rare situations: the file was
+        adopted or removed out from under us (re-snapshot), or enough dead
+        operations accumulated for a compaction. Building those payloads
+        costs O(backlog), so the writer calls with ``pending=None`` first;
+        when live state is actually required this method writes nothing and
+        returns False, and the caller retries with the payloads. The common
+        case therefore stays O(batch) no matter how large the backlog is.
         """
+
+        needs_live_state = self._file_was_taken() or self._compaction_due()
+        if pending is None and needs_live_state:
+            return False
 
         self._dir.mkdir(parents=True, exist_ok=True)
         lines: list[str] = []
         resnapshotted = self._file_was_taken()
         if resnapshotted:
+            assert pending is not None
             # Another process adopted (renamed) our file, or it was deleted.
             # Every already-journaled op left with it; rebuild the journal
             # from live state so our future appends have their base records.
             for payload in pending.values():
                 lines.append(_encode_line({"v": _WAL_VERSION, "op": "create", "event": payload}))
         for op in ops:
-            if resnapshotted and op.op == "merge" and op.event_id in pending:
+            if resnapshotted and op.op == "merge" and pending is not None and op.event_id in pending:
                 # The snapshot above already contains this increment (memory
                 # is bumped before the merge op is submitted); appending it
                 # again would double-count on replay.
@@ -128,16 +151,32 @@ class WalJournal:
             raise
         except Exception as exc:
             raise UsageStoreError(f"could not append to the usage journal: {exc}") from exc
+        if resnapshotted:
+            self._approx_size = len(data)
+            self._live_baseline = len(data)
+        else:
+            self._approx_size += len(data)
         for op in ops:
             if op.op == "dead" and op.event is not None:
                 self._append_dead_letter(op)
-        self._maybe_compact(pending)
+        if pending is not None and self._compaction_due():
+            self.compact(pending)
+        return True
 
     def _file_was_taken(self) -> bool:
         try:
             return os.stat(self._path).st_ino != self._inode
         except FileNotFoundError:
             return self._inode is not None
+
+    def _compaction_due(self) -> bool:
+        if self._dead_ops >= _COMPACT_DEAD_OPS:
+            return True
+        # Ratio rule: rewrite only when appended garbage at least matches
+        # the live state, keeping compaction cost amortized O(1) per byte.
+        return self._approx_size >= _COMPACT_MIN_BYTES and self._approx_size >= 2 * max(
+            self._live_baseline, _COMPACT_MIN_BYTES // 2
+        )
 
     def _append_dead_letter(self, op: JournalOp) -> None:
         record = {
@@ -157,30 +196,27 @@ class WalJournal:
 
     # ---------------------------------------------------------- compaction
 
-    def _maybe_compact(self, pending: dict[str, dict[str, Any]]) -> None:
-        if self._dead_ops < _COMPACT_DEAD_OPS:
-            try:
-                if os.path.getsize(self._path) < _COMPACT_MIN_BYTES:
-                    return
-            except OSError:
-                return
-        self.compact(pending)
-
     def compact(self, pending: dict[str, dict[str, Any]]) -> None:
         """Rewrite the journal with only live events, atomically."""
 
         temporary = self._path.with_suffix(".wal.tmp")
         try:
+            written = 0
             with open(temporary, "wb") as handle:
-                handle.writelines(_encode_line(
-                            {"v": _WAL_VERSION, "op": "create", "event": payload}
-                        ).encode("utf-8") for payload in pending.values())
+                for payload in pending.values():
+                    encoded = _encode_line(
+                        {"v": _WAL_VERSION, "op": "create", "event": payload}
+                    ).encode("utf-8")
+                    handle.write(encoded)
+                    written += len(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(temporary, 0o600)
             os.replace(temporary, self._path)
             self._inode = os.stat(self._path).st_ino
             self._dead_ops = 0
+            self._approx_size = written
+            self._live_baseline = written
         except Exception as exc:
             try:
                 temporary.unlink(missing_ok=True)
@@ -195,9 +231,14 @@ class WalJournal:
 
         state = _replay_file(self._path)
         try:
-            self._inode = os.stat(self._path).st_ino
+            stat = os.stat(self._path)
+            self._inode = stat.st_ino
+            self._approx_size = stat.st_size
+            self._live_baseline = stat.st_size
         except FileNotFoundError:
             self._inode = None
+            self._approx_size = 0
+            self._live_baseline = 0
         return state
 
     def adopt_orphans(self) -> tuple[dict[str, dict[str, Any]], list[Path]]:

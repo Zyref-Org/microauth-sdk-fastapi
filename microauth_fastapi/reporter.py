@@ -558,14 +558,20 @@ class UsageReporter:
             batch = self._journal_writes
             self._journal_writes = []
             combined = [op for batch_ops, _ in batch for op in batch_ops]
-            # Live payload snapshot lets the journal rebuild itself if the
-            # file was adopted or removed out from under this process.
-            pending = {
-                event_id: _event_payload(event)
-                for event_id, event in self._events.items()
-            }
             try:
-                await asyncio.to_thread(journal.apply, combined, pending)
+                # Fast path first: no live-state payloads. Building them
+                # costs O(backlog) (every event's attachment list), which
+                # once per group commit turns a growing backlog into a
+                # quadratic slowdown. The journal asks for them (returns
+                # False, writing nothing) only when it actually needs live
+                # state: a stolen/removed file or a due compaction.
+                applied = await asyncio.to_thread(journal.apply, combined, None)
+                if not applied:
+                    pending = {
+                        event_id: _event_payload(event)
+                        for event_id, event in self._events.items()
+                    }
+                    await asyncio.to_thread(journal.apply, combined, pending)
             except BaseException as exc:
                 error: Exception
                 if isinstance(exc, (UsageQueueFull, UsageStoreError)):
@@ -787,8 +793,28 @@ class UsageReporter:
         flush) calls for it; the event stays durably queued for a later batch.
         """
 
-        if only_if_due and not self.flush_is_due(event_id):
+        if only_if_due:
+            # Batching mode: join (or start) one coalesced delivery pass and
+            # return. Waiting until this response's own event ships would
+            # serialize every in-flight request onto delivery latency under
+            # sustained load; an event that misses this pass is durably
+            # queued and ships with the next due batch.
+            if not self.flush_is_due(event_id):
+                return
+            task = self._response_flush_task
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    self._flush_response_batch(),
+                    name="microauth-usage-response-flush",
+                )
+                self._response_flush_task = task
+            try:
+                await asyncio.shield(task)
+            finally:
+                if self._response_flush_task is task and task.done():
+                    self._response_flush_task = None
             return
+
         targets = {event_id} if event_id is not None else set(self._events)
         while any(target in self._events for target in targets):
             task = self._response_flush_task
@@ -824,25 +850,40 @@ class UsageReporter:
             await self._expire_stale_events()
             selected: list[str] = []
             deferred: list[str] = []
+            settling: list[str] = []
             for event_id in self._pending:
                 event = self._events.get(event_id)
                 if event is None:
                     continue
+                # Close the event to new merges first: under sustained
+                # concurrency its merge latch may never otherwise reach
+                # zero, and skipping busy events would starve delivery
+                # entirely (no posts, unbounded backlog, a hot flush loop).
+                if self._open_events.get(event.merge_key()) == event_id:
+                    del self._open_events[event.merge_key()]
+                settling.append(event_id)
+            for event_id in settling:
+                event = self._events.get(event_id)
+                if event is None:
+                    continue
+                # In-flight durable increments finish within a group commit;
+                # wait them out so a payload is never frozen halfway through
+                # a merge (a failed merge's rollback must never mutate a
+                # frozen, receipt-pinned count).
+                settle_deadline = time.monotonic() + 2.0
+                while event.merging and time.monotonic() < settle_deadline:
+                    await asyncio.sleep(0.001)
                 if event.merging:
-                    # A durable count increment is mid-flight; deliver this
-                    # event in the next cycle rather than freezing a payload
-                    # halfway through a merge.
+                    # Pathologically stuck increment: deliver everyone else.
                     deferred.append(event_id)
                     continue
                 # Selection permanently freezes the payload: the server's
                 # receipt pins this idempotency key to this exact count.
                 event.frozen = True
-                if self._open_events.get(event.merge_key()) == event_id:
-                    del self._open_events[event.merge_key()]
                 selected.append(event_id)
             self._pending = deque(deferred)
             # Exact recompute of the additive request counter (deferred lists
-            # are tiny: only events with a merge mid-flight).
+            # are tiny: only events with a pathologically stuck merge).
             self._pending_requests = sum(
                 event.count
                 for event_id in deferred
@@ -850,7 +891,12 @@ class UsageReporter:
             )
             if not selected:
                 if deferred:
-                    self._defer_pending()
+                    # Retry shortly without spinning: the immediate full-batch
+                    # fast path would otherwise hot-loop on a stuck merge.
+                    self._flush_deadline = max(
+                        time.monotonic() + 0.05, self._backoff_until
+                    )
+                    self._wake.set()
                 else:
                     self._flush_deadline = None
                 return

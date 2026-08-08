@@ -1,8 +1,9 @@
 # Changelog
 
-## 2.5.0
+## 2.6.0
 
-Redis-less journal rewrite and one-round-trip admission release.
+Redis-less journal rewrite, one-round-trip admission, and sustained-load
+resilience release. (Supersedes the unpublished 2.5.0.)
 
 - Replaced the SQLite usage spool with a per-process append-only journal
   (WAL). Every completed request costs one appended, group-committed and
@@ -45,6 +46,24 @@ Redis-less journal rewrite and one-round-trip admission release.
   batching is unchanged.
 - The queue-full rejection log is throttled to once per second instead of
   once per rejected request.
+- Fixed delivery starvation under sustained concurrency: flush selection
+  skipped events with a merge in flight, and at high request rates the open
+  event's merge latch was never free at selection time - so flushes
+  delivered nothing, re-armed immediately, and hot-looped while the backlog
+  grew and requests slowed. Selection now closes the event to new merges,
+  settles in-flight increments (bounded wait), then freezes and delivers.
+- Long-run journal performance: the group-commit writer no longer builds
+  every live event's payload on each batch (previously O(backlog) per
+  commit); the journal requests live state only for the rare rebuild or
+  compaction. Compaction now triggers on the garbage ratio (file at least
+  twice the live state) with a 1 MB floor, so a large live backlog is never
+  rewritten per append and the file stays small - sustained throughput is
+  flat (measured: 1.5M requests at a constant ~17k records/s, journal
+  bounded under 1 MB, file removed on clean shutdown).
+- `flush_on_response(only_if_due=True)` now joins one coalesced delivery
+  pass instead of looping until the caller's own event ships, which
+  serialized every in-flight request onto delivery latency under load; an
+  event that misses the pass ships with the next due batch.
 - The per-second rate check now rides inside the atomic reservation script
   (memory and Redis, script marker v4): the entire admission decision -
   RPS, quota, balance, platform cap and monetary hold - costs one Redis
