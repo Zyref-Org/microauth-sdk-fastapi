@@ -107,6 +107,29 @@ the API's perspective (idempotency keys are preserved). Durability is bounded
 by your Redis deployment's persistence: managed offerings such as Upstash
 persist by default; self-hosted Redis should enable AOF.
 
+One caveat on connections: with only `redis_url`, the SDK builds a client
+with an unbounded pool and one-second socket timeouts. Bursty traffic (and
+especially serverless autoscaling, where every instance brings its own pool)
+can pile up enough connections to hit a managed plan's connection cap, and
+failed commands degrade usage delivery. If your provider caps connections or
+your traffic is spiky, pass a bounded client instead:
+
+```python
+from redis.asyncio import Redis, BlockingConnectionPool
+
+pool = BlockingConnectionPool.from_url(
+    redis_url, max_connections=10, timeout=5,
+    socket_timeout=2.0, socket_connect_timeout=2.0,
+)
+auth = MicroAuth(app, redis_client=Redis(connection_pool=pool))
+```
+
+Size `max_connections` so instances × pool stays under your plan's cap, then
+validate under your own peak load; the right numbers depend on your traffic.
+A passed client is externally owned: the SDK uses it but never closes it. The
+[FastAPI guide](https://docs.microauth.com/guides/fastapi-sdk) has the full
+sizing discussion and the warning signs to watch for in logs.
+
 ## Serverless runtimes
 
 On Vercel and AWS Lambda, `flush_on_response` defaults to `True`. This fixes the
