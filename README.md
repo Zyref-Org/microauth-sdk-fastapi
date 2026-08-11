@@ -118,6 +118,19 @@ evaluated while the invocation is still active — a due batch (500 events, or
 durably queued for a later batch, so control-plane accounting neither adds to
 the caller's response latency nor produces one usage call per request.
 
+A batch that is not yet due when the last response of a burst completes stays
+durably queued, and the frozen timer cannot deliver it until another
+invocation arrives — if traffic stops entirely, that trailing batch waits
+indefinitely. Set `trailing_flush=True` to close this gap: a response whose
+batch is not due holds the still-active invocation until the batching
+deadline (at most `report_interval` seconds) and then delivers. Concurrent
+responses coalesce onto one waiter, which makes at most one delivery attempt;
+a failure arms the normal backoff and leaves every event durably queued. It
+is opt-in because runtimes that buffer the whole response (for example AWS
+Lambda behind an adapter without response streaming) would surface the hold
+as caller latency; on Vercel with Fluid Compute the hold happens after the
+response is sent and is invisible to callers.
+
 This relies on a runtime that keeps the invocation alive for ASGI background
 work (for example, Vercel Fluid Compute). Without Redis, journal files are
 local to each instance; they protect retries within that instance but cannot
@@ -150,6 +163,7 @@ Everything has a sensible default; override only what you need.
 | `sync_interval` | `30` | Seconds between snapshot refreshes |
 | `report_interval` | `5` | Flush when 500 events accumulate or this many seconds pass since the last flush |
 | `flush_on_response` | Auto on Vercel/Lambda | Evaluate the batching rule after the final response frame |
+| `trailing_flush` | `False` | Hold the invocation until the batching deadline so the last burst before traffic stops is delivered |
 | `max_snapshot_age` | `300` | Fail-closed staleness threshold |
 | `max_stale_snapshot_age` | `3 × max_snapshot_age` | Absolute stale-data ceiling |
 | `fail_open` | `True` | Serve stale data only up to the absolute ceiling |

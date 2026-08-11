@@ -142,6 +142,16 @@ class MicroAuth:
             after the final response frame while the invocation remains
             active, so a frozen timer cannot strand a due batch. Defaults to
             True on Vercel/AWS Lambda and False elsewhere.
+        trailing_flush: With response-bound flushing, a response whose batch
+            is not yet due holds the still-active invocation until the
+            batching deadline (at most ``report_interval`` seconds) and then
+            delivers, so the last burst before traffic stops is reported
+            without waiting for a future invocation. Off by default because
+            buffered serverless adapters (for example AWS Lambda without
+            response streaming) would surface the hold as caller latency;
+            recommended on Vercel with Fluid Compute. Inert when
+            ``flush_on_response`` is inactive, where the background timer
+            already delivers batches on schedule. Default False.
         max_snapshot_age: If the snapshot can't be refreshed for this many
             seconds, ``fail_open=False`` returns 503. Default 300.
         max_stale_snapshot_age: Absolute stale-data ceiling, including when
@@ -186,6 +196,7 @@ class MicroAuth:
         sync_interval: float = 30.0,
         report_interval: float = 5.0,
         flush_on_response: bool | None = None,
+        trailing_flush: bool = False,
         max_snapshot_age: float = 300.0,
         max_stale_snapshot_age: float | None = None,
         fail_open: bool = True,
@@ -222,6 +233,8 @@ class MicroAuth:
             raise MicroAuthConfigurationError(
                 "flush_on_response must be a boolean or None"
             )
+        if not isinstance(trailing_flush, bool):
+            raise MicroAuthConfigurationError("trailing_flush must be a boolean")
         if isinstance(max_usage_queue, bool) or not isinstance(max_usage_queue, int):
             raise MicroAuthConfigurationError("max_usage_queue must be an integer")
         if max_usage_queue < 1 or max_usage_queue > MAX_SAFE_INTEGER:
@@ -335,6 +348,12 @@ class MicroAuth:
             if flush_on_response is None
             else flush_on_response
         )
+        self._trailing_flush = trailing_flush and self._flush_on_response
+        if trailing_flush and not self._flush_on_response:
+            logger.info(
+                "microauth: trailing_flush has no effect without response-bound "
+                "flushing; the background timer already delivers batches here"
+            )
 
         self._sync_task: asyncio.Task[None] | None = None
         self._started = False
@@ -1203,6 +1222,20 @@ class MicroAuth:
         except Exception:
             logger.exception(
                 "microauth: post-response serverless usage flush failed; "
+                "stable items remain queued"
+            )
+            return
+        if not self._trailing_flush:
+            return
+        try:
+            # The batch was not due, so nothing shipped above and the frozen
+            # background timer would strand it once this invocation ends.
+            # Hold the still-active invocation until the batching deadline
+            # and deliver the trailing batch.
+            await self._reporter.flush_trailing(event_id)
+        except Exception:
+            logger.exception(
+                "microauth: trailing serverless usage flush failed; "
                 "stable items remain queued"
             )
 

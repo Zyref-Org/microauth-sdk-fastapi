@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -743,6 +744,109 @@ def test_explicit_drain_waits_for_an_already_inflight_event() -> None:
         assert reporter.pending_items == 0
 
     run(exercise())
+
+
+def test_trailing_flush_holds_until_the_deadline_then_delivers() -> None:
+    client = ScriptedClient([acknowledge])
+    reporter = UsageReporter(client, 0.1, spool_path=None)
+
+    async def exercise() -> None:
+        event_id = await reporter.record(
+            "11111111-1111-4111-8111-111111111111",
+            200,
+        )
+        # Not due yet: a bare response-bound check would leave it queued.
+        assert not reporter.flush_is_due(event_id)
+        started = time.monotonic()
+        await reporter.flush_trailing(event_id)
+        elapsed = time.monotonic() - started
+        assert elapsed >= 0.05, "delivered before the batching deadline"
+        assert reporter.pending_items == 0
+
+    run(exercise())
+    assert len(client.calls) == 1
+
+
+def test_trailing_flush_coalesces_concurrent_waiters_into_one_delivery() -> None:
+    client = ScriptedClient([acknowledge])
+    reporter = UsageReporter(client, 0.05, spool_path=None)
+
+    async def exercise() -> None:
+        event_ids = [
+            await reporter.record(
+                "11111111-1111-4111-8111-111111111111",
+                200,
+            )
+            for _ in range(3)
+        ]
+        await asyncio.gather(
+            *(reporter.flush_trailing(event_id) for event_id in event_ids)
+        )
+        assert reporter.pending_items == 0
+
+    run(exercise())
+    assert len(client.calls) == 1
+    assert client.calls[0][0]["count"] == 3
+
+
+def test_trailing_flush_returns_immediately_once_the_event_shipped() -> None:
+    client = ScriptedClient([acknowledge])
+    reporter = UsageReporter(client, 60, spool_path=None)
+
+    async def exercise() -> None:
+        event_id = await reporter.record(
+            "11111111-1111-4111-8111-111111111111",
+            200,
+        )
+        await reporter.flush()
+        started = time.monotonic()
+        await reporter.flush_trailing(event_id)
+        assert time.monotonic() - started < 1.0
+
+    run(exercise())
+    assert len(client.calls) == 1
+
+
+def test_trailing_flush_makes_one_attempt_and_arms_the_backoff() -> None:
+    # ScriptedClient raises on any call beyond the scripted failure, so this
+    # also proves the waiter never retries inside the held invocation.
+    client = ScriptedClient([MicroAuthAPIError(503, "unavailable")])
+    reporter = UsageReporter(client, 0.05, spool_path=None)
+
+    async def exercise() -> None:
+        event_id = await reporter.record(
+            "11111111-1111-4111-8111-111111111111",
+            200,
+        )
+        await reporter.flush_trailing(event_id)
+        assert reporter.pending_items == 1
+        assert reporter._backoff_until > time.monotonic()
+
+    run(exercise())
+    assert len(client.calls) == 1
+
+
+def test_aclose_cancels_a_sleeping_trailing_waiter_and_drains() -> None:
+    client = ScriptedClient([acknowledge])
+    reporter = UsageReporter(client, 60, spool_path=None)
+
+    async def exercise() -> None:
+        event_id = await reporter.record(
+            "11111111-1111-4111-8111-111111111111",
+            200,
+        )
+        waiter = asyncio.create_task(reporter.flush_trailing(event_id))
+        await asyncio.sleep(0.01)
+        # Shutdown must not wait out the 60s deadline: the waiter is
+        # cancelled and the drain delivers what it was holding for.
+        await reporter.aclose()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert reporter._trailing_flush_task is None
+        assert reporter.pending_items == 0
+
+    run(exercise())
+    assert len(client.calls) == 1
 
 
 def test_shutdown_cancels_a_stuck_response_flush() -> None:

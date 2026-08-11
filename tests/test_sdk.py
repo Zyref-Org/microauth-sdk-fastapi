@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -313,6 +314,75 @@ def test_vercel_flushes_after_the_response_only_when_the_batch_is_due(
         await control.aclose()
 
     run(exercise())
+
+
+def test_trailing_flush_delivers_the_last_batch_without_further_traffic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VERCEL", "1")
+    plane = ControlPlane(snapshot_payload())
+
+    async def exercise() -> None:
+        control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
+        app = FastAPI()
+        auth = MicroAuth(
+            app,
+            secret_key="mas_test",
+            http_client=control,
+            persist_usage=False,
+            enforce_rps=False,
+            report_interval=0.2,
+            trailing_flush=True,
+        )
+        auth._snapshot = _parse_snapshot(plane.snapshot)
+        auth._started = True
+
+        @app.get("/protected")
+        async def protected(customer: Customer = Security(auth)) -> dict[str, bool]:
+            return {"ok": True}
+
+        # Anchor the batching rule so none of the burst is due at response
+        # time; only the trailing waiter can deliver it.
+        auth._reporter._last_flush = time.monotonic()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as caller:
+            responses = await asyncio.gather(
+                *(
+                    caller.get("/protected", headers={"X-API-Key": API_KEY})
+                    for _ in range(3)
+                )
+            )
+        assert [response.status_code for response in responses] == [200, 200, 200]
+        # The burst was below the batch size and inside the interval, yet it
+        # was delivered before the (still-active) invocations completed - no
+        # further traffic was needed, and the waiter coalesced the burst into
+        # one usage call.
+        assert len(plane.usage_calls) == 1
+        assert plane.usage_calls[0]["items"][0]["count"] == 3
+        assert auth._reporter.pending_items == 0
+
+        await auth.aclose()
+        await control.aclose()
+
+    run(exercise())
+
+
+def test_trailing_flush_is_inert_off_serverless(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
+    auth = MicroAuth(
+        secret_key="mas_test",
+        persist_usage=False,
+        trailing_flush=True,
+    )
+    # The background timer delivers batches here; the response path stays
+    # untouched so callers never inherit a post-response hold.
+    assert auth._trailing_flush is False
+    assert auth._flush_on_response is False
 
 
 def test_nonbillable_outcomes_release_money_but_consume_quota() -> None:

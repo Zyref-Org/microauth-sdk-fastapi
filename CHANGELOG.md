@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.7.0
+
+- Added opt-in trailing delivery for serverless runtimes
+  (`trailing_flush=True`): a response whose batch is not yet due keeps the
+  invocation alive until the batching deadline (at most `report_interval`
+  seconds after the last flush) and then delivers the trailing batch.
+  Previously the last burst before traffic stopped stayed durably queued
+  until a future invocation arrived, which deferred billing indefinitely on
+  idle deployments. Concurrent responses coalesce onto one waiter, which
+  makes at most one delivery attempt; a failure arms the normal failure
+  backoff and leaves every event durably queued for a later invocation.
+  Off by default because serverless adapters that buffer the whole response
+  (for example AWS Lambda without response streaming) would surface the
+  post-response hold as caller latency.
+- Shutdown cancels a sleeping trailing waiter instead of waiting out its
+  deadline; the shutdown drain delivers whatever the waiter was holding for.
+
 ## 2.6.0
 
 Redis-less journal rewrite, one-round-trip admission, and sustained-load

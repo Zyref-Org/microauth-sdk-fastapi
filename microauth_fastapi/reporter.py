@@ -193,6 +193,7 @@ class UsageReporter:
         self._reservations: set[str] = set()
         self._task: asyncio.Task[None] | None = None
         self._response_flush_task: asyncio.Task[None] | None = None
+        self._trailing_flush_task: asyncio.Task[None] | None = None
         self._flush_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._wake = asyncio.Event()
@@ -842,6 +843,67 @@ class UsageReporter:
         await self._maybe_sweep()
         await self.flush()
 
+    async def flush_trailing(self, event_id: str | None = None) -> None:
+        """Hold the caller until the batching deadline, then deliver.
+
+        A serverless surrogate for the background loop's timer: runtimes
+        that freeze the event loop between invocations never fire the
+        interval deadline, so a response whose event was not yet due keeps
+        the still-active invocation alive until the deadline and delivers
+        the trailing batch. Concurrent responses coalesce onto one waiter.
+        The waiter makes at most one delivery attempt; a failure arms the
+        normal failure backoff and leaves every event durably queued for a
+        later invocation instead of retrying inside the held invocation.
+        """
+
+        if event_id is not None and event_id not in self._events:
+            return
+        if not self._events:
+            return
+        task = self._trailing_flush_task
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._trailing_flush(),
+                name="microauth-usage-trailing-flush",
+            )
+            self._trailing_flush_task = task
+        try:
+            await asyncio.shield(task)
+        finally:
+            if self._trailing_flush_task is task and task.done():
+                self._trailing_flush_task = None
+
+    async def _trailing_flush(self) -> None:
+        while True:
+            if not self._events:
+                # A concurrent due-path flush delivered everything while this
+                # waiter slept; there is nothing left to hold the invocation
+                # open for.
+                return
+            deadline = self._flush_deadline
+            if deadline is None:
+                # Pending events normally carry a deadline; an in-flight
+                # flush clears it while delivering. Fall back to one interval
+                # so a deferred remainder is still attempted exactly once.
+                deadline = time.monotonic() + self._interval
+            delay = deadline - time.monotonic()
+            if delay <= 0:
+                break
+            # Chunked sleep so a deadline moved by the failure backoff (or
+            # cleared by a concurrent delivery) is observed without wiring
+            # this waiter into the background loop's wake event.
+            await asyncio.sleep(min(delay, self._interval))
+        await self._maybe_sweep()
+        try:
+            await self.flush()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "microauth: trailing usage flush failed; stable items remain queued"
+            )
+            self._defer_pending(backoff=True)
+
     async def flush(self) -> None:
         """Deliver all selected events while retaining only transient failures."""
 
@@ -1091,6 +1153,9 @@ class UsageReporter:
             except Exception:
                 logger.exception("microauth: usage reporter task stopped with an error")
             self._task = None
+        # A trailing waiter sleeping toward its deadline must not delay
+        # shutdown; the drain below delivers everything it was waiting for.
+        await self._cancel_trailing_flush()
         writer = self._spool_writer_task
         if writer is not None and not writer.done():
             # The journal writer self-terminates once its queue drains; wait
@@ -1211,6 +1276,23 @@ class UsageReporter:
                 )
         if self._response_flush_task is task:
             self._response_flush_task = None
+
+    async def _cancel_trailing_flush(self) -> None:
+        task = self._trailing_flush_task
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception(
+                    "microauth: trailing usage flush stopped with an error"
+                )
+        if self._trailing_flush_task is task:
+            self._trailing_flush_task = None
 
     def _consume_reservation(self, reservation: UsageReservation) -> None:
         if reservation.token not in self._reservations:
