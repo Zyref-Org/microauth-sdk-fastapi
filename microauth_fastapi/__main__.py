@@ -68,11 +68,11 @@ async def _check(args: argparse.Namespace, out: TextIO) -> int:
     report.heading("Configuration")
     if not secret.startswith("mas_"):
         report.fail(
-            "MICROAUTH_SECRET_KEY is missing or is not a tenant secret (mas_...). "
+            "MICROAUTH_SECRET_KEY is missing or is not an SDK secret key (mas_...). "
             "Copy it from your API's Overview page in the MicroAuth dashboard."
         )
         return 1
-    report.ok(f"tenant secret mas_...{secret[-4:]}")
+    report.ok(f"SDK secret key mas_...{secret[-4:]}")
     report.ok(f"control plane {base_url}")
 
     client = APIClient(base_url, secret, args.timeout)
@@ -260,7 +260,7 @@ def main(argv: list[str] | None = None, out: TextIO | None = None) -> int:
         ),
     )
     check.add_argument("--key", help="a customer API key to evaluate")
-    check.add_argument("--secret-key", help="tenant secret (defaults to MICROAUTH_SECRET_KEY)")
+    check.add_argument("--secret-key", help="your API's SDK secret key, mas_... (defaults to MICROAUTH_SECRET_KEY)")
     check.add_argument("--base-url", help="control plane URL (defaults to MICROAUTH_BASE_URL)")
     check.add_argument("--redis-url", help="Redis URL (defaults to MICROAUTH_REDIS_URL)")
     check.add_argument("--timeout", type=float, default=10.0, help="HTTP timeout in seconds")
