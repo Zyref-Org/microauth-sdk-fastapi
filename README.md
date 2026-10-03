@@ -58,7 +58,10 @@ API key
 ```
 
 The check also registers your SDK with MicroAuth, so the dashboard's setup
-checklist turns green as soon as it succeeds.
+checklist turns green as soon as it succeeds. Every flag is in the
+[SDK reference](https://docs.microauth.com/sdk/reference#check-command), and
+[troubleshooting](https://docs.microauth.com/troubleshooting#sdk-not-connecting)
+covers what to do when a check fails.
 
 ## What it does
 

@@ -29,6 +29,7 @@ from .exceptions import (
 from .models import CustomerState, Snapshot
 
 DEFAULT_BASE_URL = "https://api.microauth.com"
+TROUBLESHOOTING_URL = "https://docs.microauth.com/troubleshooting#sdk-not-connecting"
 
 
 class _Report:
@@ -273,7 +274,10 @@ def main(argv: list[str] | None = None, out: TextIO | None = None) -> int:
     args = parser.parse_args(argv)
     stream = out or sys.stdout
     if args.command == "check":
-        return asyncio.run(_check(args, stream))
+        code = asyncio.run(_check(args, stream))
+        if code:
+            stream.write(f"Help: {TROUBLESHOOTING_URL}\n")
+        return code
     return 2  # pragma: no cover
 
 

@@ -79,6 +79,7 @@ def test_check_requires_a_tenant_secret(
     out = io.StringIO()
     assert cli.main(["check"], out=out) == 1
     assert "MICROAUTH_SECRET_KEY is missing" in out.getvalue()
+    assert f"Help: {cli.TROUBLESHOOTING_URL}" in out.getvalue()
 
 
 def test_check_reads_the_secret_from_a_dotenv_file(
