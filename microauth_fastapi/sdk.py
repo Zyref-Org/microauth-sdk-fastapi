@@ -24,6 +24,7 @@ What you get:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import inspect
 import logging
@@ -61,6 +62,7 @@ from .exceptions import (
     UsageQueueFull,
 )
 from .limiter import (
+    DEFAULT_REDIS_MAX_CONNECTIONS,
     DENIED_BALANCE,
     DENIED_PLATFORM,
     DENIED_QUOTA,
@@ -182,6 +184,9 @@ class MicroAuth:
         shutdown_timeout: Seconds allowed for the final usage drain.
         http_client: Optional externally owned ``httpx.AsyncClient``.
         redis_client: Optional externally owned ``redis.asyncio`` client.
+        redis_max_connections: Connection cap for the Redis pool the SDK
+            creates from ``redis_url``. Requests wait up to one second for a
+            free connection instead of opening more. Default 64.
     """
 
     def __init__(
@@ -213,6 +218,7 @@ class MicroAuth:
         shutdown_timeout: float = 10.0,
         http_client: httpx.AsyncClient | None = None,
         redis_client: Any | None = None,
+        redis_max_connections: int = DEFAULT_REDIS_MAX_CONNECTIONS,
     ) -> None:
         secret_key = secret_key or os.environ.get("MICROAUTH_SECRET_KEY", "")
         if not secret_key.startswith("mas_"):
@@ -240,6 +246,14 @@ class MicroAuth:
         if max_usage_queue < 1 or max_usage_queue > MAX_SAFE_INTEGER:
             raise MicroAuthConfigurationError(
                 f"max_usage_queue must be between 1 and {MAX_SAFE_INTEGER}"
+            )
+        if (
+            isinstance(redis_max_connections, bool)
+            or not isinstance(redis_max_connections, int)
+            or redis_max_connections < 1
+        ):
+            raise MicroAuthConfigurationError(
+                "redis_max_connections must be a positive integer"
             )
         if max_stale_snapshot_age is None:
             max_stale_snapshot_age = max_snapshot_age * 3.0
@@ -280,7 +294,11 @@ class MicroAuth:
             http_client=http_client,
         )
         self._limiter: Limiter = (
-            RedisLimiter(redis_url, redis_client=redis_client)
+            RedisLimiter(
+                redis_url,
+                redis_client=redis_client,
+                max_connections=redis_max_connections,
+            )
             if redis_url or redis_client is not None
             else MemoryLimiter()
         )
@@ -747,9 +765,20 @@ class MicroAuth:
             raise AuthUnavailable() from exc
 
         record = KeyRecord(key_id=key_id, customer_id=customer.id)
-        self._snapshot.keys[key_hash] = record
-        if record.customer_id not in self._snapshot.customers:
-            self._snapshot.customers[record.customer_id] = customer
+        # Copy on write: the published snapshot may be shared with the
+        # limiter or an in-flight refresh, and must never change under them.
+        current = self._snapshot
+        keys = dict(current.keys)
+        keys[key_hash] = record
+        customers = current.customers
+        if record.customer_id not in customers:
+            customers = dict(customers)
+            customers[record.customer_id] = customer
+        self._snapshot = dataclasses.replace(
+            current,
+            keys=keys,
+            customers=customers,
+        )
         return record
 
     def _prune_negative(self) -> None:
@@ -1052,10 +1081,14 @@ class MicroAuth:
         except MicroAuthAuthorizationError:
             self._invalidate_authorization()
             raise
-        snap = _parse_snapshot(
-            data,
-            refresh_started_at=refresh_started_at,
-        )
+        try:
+            snap = _parse_snapshot(
+                data,
+                refresh_started_at=refresh_started_at,
+            )
+        except SnapshotValidationError:
+            self._client.forget_snapshot()
+            raise
         if cache_lease is not None and self._snapshot_cache is not None:
             try:
                 assert snap.generated_at is not None  # enforced by the parser
@@ -1422,11 +1455,16 @@ def _parse_billable_statuses(raw_statuses: Any) -> frozenset[int]:
 
 
 def _parse_customer(c: dict[str, Any], field: str) -> CustomerState:
+    # Any status other than "active" denies the customer's keys. Unknown
+    # values must not invalidate the whole snapshot, so new server-side
+    # states (such as billing_suspended) degrade to a denial.
     status = _required_string(c.get("status"), f"{field}.status")
-    if status not in {"active", "suspended"}:
-        raise SnapshotValidationError(
-            f"{field}.status must be 'active' or 'suspended'"
-        )
+    raw_balance_seq = c.get("balance_seq")
+    balance_seq = (
+        None
+        if raw_balance_seq is None
+        else _safe_int(raw_balance_seq, f"{field}.balance_seq", minimum=0)
+    )
     raw_effective = c.get("effective")
     if not isinstance(raw_effective, dict):
         raise SnapshotValidationError(f"{field}.effective must be an object")
@@ -1496,6 +1534,7 @@ def _parse_customer(c: dict[str, Any], field: str) -> CustomerState:
         ),
         usage_policy_id=usage_policy_id,
         policy_valid_until=policy_valid_until,
+        balance_seq=balance_seq,
     )
 
 

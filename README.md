@@ -1,8 +1,12 @@
 # MicroAuth SDK for FastAPI
 
 API key authentication, per-customer rate limiting and metered billing for
-your FastAPI API — powered by your [MicroAuth](https://microauth.com) tenant,
+your FastAPI API, powered by your [MicroAuth](https://microauth.com) tenant,
 in one dependency.
+
+```bash
+pip install microauth-fastapi
+```
 
 ```python
 from fastapi import FastAPI, Security
@@ -17,16 +21,42 @@ async def forecast(customer: Customer = Security(auth)):
 ```
 
 That's the whole integration. Your customers sign up on your MicroAuth
-developer portal, create API keys, pick a plan or top up credits — and every
-request to `/forecast` is now authenticated, rate-limited and billed.
+developer portal, create API keys, and pick a plan or top up credits. Every
+request to `/forecast` is then authenticated, rate-limited and billed.
+
+## Check your setup
+
+Before you deploy, run the built-in check with the same environment your app
+uses:
+
+```bash
+MICROAUTH_SECRET_KEY=mas_... python -m microauth_fastapi check
+```
+
+It confirms the secret works, loads a snapshot, pings Redis when
+`MICROAUTH_REDIS_URL` is set, and makes sure the usage journal directory is
+writable. Add `--key` with one of your customers' API keys to see exactly how
+a request with that key would be treated, and why:
+
+```text
+$ python -m microauth_fastapi check --key map_live_...
+API key
+  ok    key belongs to customer 2b7c1f8e-...
+        balance: $0
+        price per billable request: $0.001
+  fail  the balance cannot cover one billable request, so requests get 402.
+```
+
+The check also registers your SDK with MicroAuth, so the dashboard's setup
+checklist turns green as soon as it succeeds.
 
 ## What it does
 
 - **API key auth** via the `X-API-Key` header (configurable), including the
-  security scheme in your OpenAPI docs — the Swagger "Authorize" button just
-  works.
-- **Suspension, balance and quota enforcement** — suspended customers get
-  `403`, customers who ran out of prepaid credit get `402`, customers over
+  security scheme in your OpenAPI docs, so the Swagger "Authorize" button
+  just works.
+- **Suspension, balance and quota enforcement.** Suspended customers get
+  `403`, customers who ran out of prepaid credit get `402`, and customers over
   their monthly quota get `429`.
 - **Per-customer rate limiting** at each customer's effective RPS (custom
   override → plan → pay-as-you-go default), scoped to each API credential,
@@ -47,11 +77,11 @@ request to `/forecast` is now authenticated, rate-limited and billed.
 - Keys not in the snapshot yet (created seconds ago) are resolved once via
   a **single-flight** on-demand lookup; invalid keys are negatively cached
   so a flood of bad keys can't reach MicroAuth.
-- Usage is durably journaled as each request completes — to a Redis-backed
+- Usage is durably journaled as each request completes: to a Redis-backed
   shared queue when Redis is configured, otherwise to a per-process
   append-only journal file (one fsynced line per request, group-committed
-  across concurrent requests) — and requests sharing an API key, policy,
-  status and hour merge into one counted item (up to 10,000). Deliveries are
+  across concurrent requests). Requests sharing an API key, policy, status
+  and hour merge into one counted item (up to 10,000). Deliveries are
   batched: a flush happens when 500 requests accumulate or `report_interval`
   (default 5s) elapses since the last flush, whichever comes first, so a
   high-concurrency burst becomes one usage call with one counted item. Every
@@ -100,33 +130,26 @@ oversubscribe a hard limit.
 
 With Redis configured (and `persist_usage=True`), completed usage also enters
 a **durable shared queue**: each event is enqueued before the final response
-body is released and delivered under a per-worker lease. If a worker dies —
-including serverless instance replacement — its leases expire and any other
+body is released and delivered under a per-worker lease. If a worker dies,
+including serverless instance replacement, its leases expire and any other
 worker sharing the queue recovers and delivers its events exactly once from
 the API's perspective (idempotency keys are preserved). Durability is bounded
 by your Redis deployment's persistence: managed offerings such as Upstash
 persist by default; self-hosted Redis should enable AOF.
 
-One caveat on connections: with only `redis_url`, the SDK builds a client
-with an unbounded pool and one-second socket timeouts. Bursty traffic (and
-especially serverless autoscaling, where every instance brings its own pool)
-can pile up enough connections to hit a managed plan's connection cap, and
-failed commands degrade usage delivery. If your provider caps connections or
-your traffic is spiky, pass a bounded client instead:
+Connections are bounded. With `redis_url`, the SDK builds a blocking pool of
+at most `redis_max_connections` (default 64) per worker, with one-second
+socket timeouts. Under a burst, requests wait up to a second for a free
+connection instead of opening new ones, so autoscaling cannot exhaust a
+managed plan's connection cap. Size it so instances × pool stays under your
+plan's limit:
 
 ```python
-from redis.asyncio import Redis, BlockingConnectionPool
-
-pool = BlockingConnectionPool.from_url(
-    redis_url, max_connections=10, timeout=5,
-    socket_timeout=2.0, socket_connect_timeout=2.0,
-)
-auth = MicroAuth(app, redis_client=Redis(connection_pool=pool))
+auth = MicroAuth(app, redis_url=redis_url, redis_max_connections=10)
 ```
 
-Size `max_connections` so instances × pool stays under your plan's cap, then
-validate under your own peak load; the right numbers depend on your traffic.
-A passed client is externally owned: the SDK uses it but never closes it. The
+For full control, pass your own client with `redis_client=`. A passed client
+is externally owned: the SDK uses it but never closes it. The
 [FastAPI guide](https://docs.microauth.com/guides/fastapi-sdk) has the full
 sizing discussion and the warning signs to watch for in logs.
 
@@ -136,14 +159,14 @@ On Vercel and AWS Lambda, `flush_on_response` defaults to `True`. This fixes the
 case where the report timer is frozen after a low-traffic request and only runs
 when the next invocation arrives. The completed event is journaled before the
 final body is released; after that frame is sent, the batching rule is
-evaluated while the invocation is still active — a due batch (500 events, or
+evaluated while the invocation is still active. A due batch (500 events, or
 `report_interval` since the last flush) is delivered, and anything else stays
 durably queued for a later batch, so control-plane accounting neither adds to
 the caller's response latency nor produces one usage call per request.
 
 A batch that is not yet due when the last response of a burst completes stays
 durably queued, and the frozen timer cannot deliver it until another
-invocation arrives — if traffic stops entirely, that trailing batch waits
+invocation arrives. If traffic stops entirely, that trailing batch waits
 indefinitely. Set `trailing_flush=True` to close this gap: a response whose
 batch is not due holds the still-active invocation until the batching
 deadline (at most `report_interval` seconds) and then delivers. Concurrent
@@ -203,22 +226,45 @@ Everything has a sensible default; override only what you need.
 | `shutdown_timeout` | `10` | Maximum seconds for final usage drain |
 | `http_client` | `None` | Optional externally owned async HTTP client |
 | `redis_client` | `None` | Optional externally owned async Redis client |
+| `redis_max_connections` | `64` | Connection cap for the pool built from `redis_url` |
 
 ## Error responses
 
-| Status | When |
-| --- | --- |
-| `401` | Missing or invalid API key |
-| `402` | Prepaid balance exhausted |
-| `403` | Customer suspended |
-| `429` | RPS, customer quota, or platform monthly hard cap exceeded |
-| `503` | Snapshot too stale, shared hard-cap backend down, or usage queue full |
+Every denial is a JSON body of the form `{"detail": "..."}` with one of these
+statuses. The fix column is what you, or your customer, can do about it.
+
+| Status | Detail | Why | Fix |
+| --- | --- | --- | --- |
+| `401` | `Invalid or missing API key` | No key in the header, or the key is unknown or revoked | Send the key in `X-API-Key` (or your `header_name`); create a new key in the portal |
+| `402` | `Insufficient credit balance` | The customer's prepaid balance cannot cover one billable request | The customer tops up in the portal. Give new customers a welcome credit so the first request works |
+| `403` | `This account is suspended` | The customer is suspended, or billing suspended them after a failed payment | Reactivate the customer in the dashboard, or the customer fixes their payment method |
+| `429` | `Rate limit exceeded` | More requests per second than the customer's RPS. Has `Retry-After` | Slow down, or raise the plan's RPS |
+| `429` | `Monthly request quota exceeded` | The customer used their monthly request quota | Wait for the next period or upgrade the plan |
+| `429` | `Platform monthly request allowance exhausted` | Your MicroAuth plan's monthly allowance is used up | Upgrade your MicroAuth plan |
+| `503` | `Authorization is temporarily unavailable` | Snapshot too stale, Redis down while enforcing shared limits, or usage queue full | Check connectivity to MicroAuth and Redis. Run `python -m microauth_fastapi check` |
+
+Customers never see your MicroAuth secret or internal state in these
+messages. Server logs under the `microauth` logger explain every `503`.
 
 All request denials subclass `microauth_fastapi.AuthDenied` (itself a
 FastAPI `HTTPException`), so you can add your own exception handler to
-reshape response bodies. Configuration, snapshot validation, API transport,
-usage acknowledgement, spool and shutdown-drain failures also have exported
-typed exceptions.
+reshape response bodies:
+
+```python
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from microauth_fastapi import AuthDenied, PaymentRequired
+
+@app.exception_handler(AuthDenied)
+async def denied(request: Request, exc: AuthDenied):
+    body = {"error": exc.detail}
+    if isinstance(exc, PaymentRequired):
+        body["top_up_url"] = "https://developers.example.com/billing"
+    return JSONResponse(body, status_code=exc.status_code, headers=exc.headers)
+```
+
+Configuration, snapshot validation, API transport, usage acknowledgement,
+spool and shutdown-drain failures also have exported typed exceptions.
 
 ## Consistency notes
 
@@ -268,6 +314,7 @@ The SDK expects `GET /sdk/v1/snapshot` to return this shape:
       "id": "cus_123",
       "status": "active",
       "credit_balance_micro": 25000000,
+      "balance_seq": 41,
       "month_requests": 1250,
       "effective": {
         "rps": 25,
@@ -295,6 +342,17 @@ micro-unit amounts must be JSON integers in the inclusive range
 `0..9007199254740991`, except a credit balance may be negative down to
 `-9007199254740991`. Status codes must be integers from `100` through `599`.
 
+`status` is `active` for customers who may call your API. Any other value
+(`suspended`, `billing_suspended`, or a status a future API adds) denies that
+customer's keys with `403` without affecting anyone else. `balance_seq` is a
+per-customer counter the API bumps on every committed balance change; the SDK
+uses it to order balances exactly and accepts snapshots without it.
+
+The snapshot is revalidated with `If-None-Match`. When nothing changed the
+API may answer `304 Not Modified` with an `X-MicroAuth-Generated-At` header,
+and the SDK reuses its previous snapshot stamped with that time. Every call
+sends `User-Agent: microauth-fastapi/<version> python/<version>`.
+
 The SDK sends `POST /sdk/v1/usage` with up to 1000 items:
 
 ```json
@@ -311,7 +369,8 @@ The SDK sends `POST /sdk/v1/usage` with up to 1000 items:
 }
 ```
 
-The API must return exactly one result per submitted idempotency key:
+The API must return exactly one result per submitted idempotency key, plus
+the committed balance of every customer whose usage it charged:
 
 ```json
 {
@@ -320,17 +379,34 @@ The API must return exactly one result per submitted idempotency key:
       "idempotency_key": "bb02a6a7-10f4-4ab7-bf9c-8936770b67b7",
       "status": "accepted"
     }
+  ],
+  "customers": [
+    { "id": "cus_123", "credit_balance_micro": 24958000, "balance_seq": 42 }
   ]
 }
 ```
 
-Successful statuses are `accepted` and `duplicate`. The reporter also handles
-a per-item `rejected` status with an optional string `detail`. The current Go
-API returns terminal item failures as an HTTP error, so the SDK bisects a
-failed batch to isolate and dead-letter only the terminal item. Network
-failures, `429`, and `5xx` responses retain the original payload for retry.
-Missing, repeated, unknown, or unsupported results are treated as transient
+Per-item statuses:
+
+- `accepted` and `duplicate` are successes. The SDK releases those requests'
+  spend holds immediately and adopts the committed balance when its
+  `balance_seq` is newer than what it has. A snapshot read before the charge
+  committed can no longer roll the balance back.
+- `rejected` (with an optional `detail`) is terminal. The item is
+  dead-lettered and its hold released.
+- `retry` is a transient failure for that item only. It stays queued with an
+  unchanged payload and ships with the next flush.
+
+Without `customers` (older APIs), holds are released once a later snapshot
+proves the charge landed. If a whole batch fails with a terminal HTTP error,
+the SDK bisects it to isolate and dead-letter only the bad item. Network
+failures, `429`, and `5xx` responses keep the original payload for retry.
+Missing, repeated or unknown results are treated as transient
 acknowledgement failures.
+
+The API repository generates golden fixtures for both shapes. The SDK tests
+parse its copies in `tests/contract`, and compare them byte for byte with the
+API's originals when both repositories are checked out side by side.
 
 ## Example app
 

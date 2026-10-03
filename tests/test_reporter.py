@@ -5,6 +5,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -179,6 +180,11 @@ def test_legacy_journal_is_migrated_to_canonical_payload(tmp_path: Path) -> None
         )
         """
     )
+    recent_hour = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
     connection.execute(
         "INSERT INTO usage_events VALUES (?, ?, ?, ?, ?)",
         (
@@ -186,7 +192,7 @@ def test_legacy_journal_is_migrated_to_canonical_payload(tmp_path: Path) -> None
             "11111111-1111-4111-8111-111111111111",
             200,
             3,
-            "2026-08-04T00:00:00Z",
+            recent_hour.isoformat().replace("+00:00", "Z"),
         ),
     )
     connection.commit()
@@ -203,6 +209,87 @@ def test_legacy_journal_is_migrated_to_canonical_payload(tmp_path: Path) -> None
     run(exercise())
     assert client.calls[0][0]["api_key_id"].startswith("11111111")
     assert client.calls[0][0]["count"] == 3
+
+
+def test_retry_results_stay_queued_and_committed_balances_reach_the_limiter() -> None:
+    def partial(items: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "accepted": 1,
+            "results": [
+                {
+                    "idempotency_key": items[0]["idempotency_key"],
+                    "status": "accepted",
+                },
+                {
+                    "idempotency_key": items[1]["idempotency_key"],
+                    "status": "retry",
+                    "http_status": 503,
+                    "detail": "usage processing is temporarily unavailable",
+                },
+            ],
+            "customers": [
+                {"id": "customer-1", "credit_balance_micro": 990, "balance_seq": 4}
+            ],
+        }
+
+    client = ScriptedClient([partial, acknowledge])
+    acknowledged: list[tuple[list[dict[str, Any]], list[Any]]] = []
+
+    async def on_acknowledged(
+        attachments: list[dict[str, Any]],
+        balances: list[Any],
+    ) -> None:
+        acknowledged.append((attachments, balances))
+
+    reporter = UsageReporter(
+        client,
+        60,
+        spool_path=None,
+        on_acknowledged=on_acknowledged,
+    )
+    run(
+        reporter.record(
+            "11111111-1111-4111-8111-111111111111",
+            200,
+            attachment={"token": "first", "customer_id": "customer-1"},
+        )
+    )
+    retried_id = run(
+        reporter.record(
+            "22222222-2222-4222-8222-222222222222",
+            200,
+            attachment={"token": "second", "customer_id": "customer-1"},
+        )
+    )
+
+    run(reporter.flush())
+    assert reporter.pending_items == 1
+    first_attachments, first_balances = acknowledged[0]
+    assert first_attachments == [{"customer_id": "customer-1", "token": "first"}]
+    assert [(b.customer_id, b.credit_balance_micro, b.balance_seq) for b in first_balances] == [
+        ("customer-1", 990, 4)
+    ]
+
+    run(reporter.flush())
+    assert reporter.pending_items == 0
+    assert client.calls[1][0]["idempotency_key"] == retried_id
+    # An older API sends no balances; the limiter gets an empty list.
+    assert acknowledged[1][1] == []
+
+
+def test_flat_attachments_share_repeated_strings() -> None:
+    from microauth_fastapi.reporter import _normalize_attachment
+
+    suffix = "scope"
+    scope_a = f"tenant-{suffix}"
+    scope_b = f"tenant-{suffix}"
+    assert scope_a is not scope_b
+    first = _normalize_attachment({"token": "a", "tenant_scope": scope_a, "spend_micro": 5})
+    second = _normalize_attachment({"token": "b", "tenant_scope": scope_b, "spend_micro": 5})
+    assert first == {"spend_micro": 5, "tenant_scope": "tenant-scope", "token": "a"}
+    assert first["tenant_scope"] is second["tenant_scope"]
+    with pytest.raises(ValueError):
+        _normalize_attachment({"token": "a", "ratio": float("nan")})
 
 
 def test_per_item_rejection_is_dead_lettered_without_blocking(

@@ -105,18 +105,13 @@ class FakeRedis:
             key = keys[0]
             self.rps[key] = self.rps.get(key, 0) + 1
             return self.rps[key]
-        if "microauth-request-reserve-v4" in script:
+        if "microauth-request-reserve-v5" in script:
             return self._reserve(keys, args)
         if "microauth-request-finalize-v3" in script:
             return self._finalize(keys, args)
-        if "microauth-request-acknowledge-v3" in script:
-            reservations = self.reservations.setdefault(keys[0], {})
-            acknowledgements = self.acknowledgements.setdefault(keys[1], {})
-            for token in args[2:]:
-                if str(token) in reservations:
-                    acknowledgements[str(token)] = int(args[0])
-            return 1
-        if "microauth-request-restore-v3" in script:
+        if "microauth-request-acknowledge-v4" in script:
+            return self._acknowledge(keys, args)
+        if "microauth-request-restore-v4" in script:
             return self._restore(keys, args)
         raise AssertionError("unexpected Lua script")
 
@@ -138,6 +133,7 @@ class FakeRedis:
             _ttl,
             maximum,
             rps_limit,
+            incoming_seq,
         ) = (int(value) if index != 11 else str(value) for index, value in enumerate(args))
         if rps_limit > 0:
             rps_key = keys[5]
@@ -155,7 +151,8 @@ class FakeRedis:
             {
                 "balance": incoming_balance,
                 "reserved": 0,
-                "version": snapshot_version,
+                "version": -1,
+                "seq": -1,
             },
         )
         reservations = self.reservations.setdefault(keys[3], {})
@@ -167,9 +164,7 @@ class FakeRedis:
                     balance["reserved"] - reservations.pop(acknowledged_token, 0),
                 )
                 del acknowledgements[acknowledged_token]
-        if snapshot_version > balance["version"]:
-            balance["balance"] = incoming_balance
-            balance["version"] = snapshot_version
+        self._merge_balance(balance, incoming_balance, snapshot_version, incoming_seq)
         platform = self.platform.setdefault(
             keys[2],
             {"floor": incoming_platform_floor, "count": incoming_platform_floor},
@@ -214,6 +209,46 @@ class FakeRedis:
             max(0, platform_limit - platform["count"]),
         ]
 
+    @staticmethod
+    def _merge_balance(
+        balance: dict[str, int],
+        incoming_balance: int,
+        snapshot_version: int,
+        incoming_seq: int,
+    ) -> None:
+        if incoming_seq >= 0:
+            if incoming_seq > balance.get("seq", -1):
+                balance["balance"] = incoming_balance
+                balance["seq"] = incoming_seq
+            balance["version"] = max(balance["version"], snapshot_version)
+        elif snapshot_version > balance["version"]:
+            balance["balance"] = incoming_balance
+            balance["version"] = snapshot_version
+
+    def _acknowledge(self, keys: tuple[str, ...], args: tuple[Any, ...]) -> int:
+        acknowledged_at, _ttl, seq, committed = (int(value) for value in args[:4])
+        tokens = [str(token) for token in args[4:]]
+        reservations = self.reservations.setdefault(keys[0], {})
+        acknowledgements = self.acknowledgements.setdefault(keys[1], {})
+        if seq < 0:
+            for token in tokens:
+                if token in reservations:
+                    acknowledgements[token] = acknowledged_at
+            return 1
+        balance = self.balances.setdefault(
+            keys[2],
+            {"balance": committed, "reserved": 0, "version": -1, "seq": -1},
+        )
+        for token in tokens:
+            amount = reservations.pop(token, None)
+            if amount is not None:
+                balance["reserved"] = max(0, balance["reserved"] - amount)
+                acknowledgements.pop(token, None)
+        if seq > balance.get("seq", -1):
+            balance["balance"] = committed
+            balance["seq"] = seq
+        return 1
+
     def _finalize(self, keys: tuple[str, ...], args: tuple[Any, ...]) -> int:
         token, billable, _ttl = str(args[0]), int(args[1]), int(args[2])
         balance = self.balances[keys[0]]
@@ -238,6 +273,7 @@ class FakeRedis:
             token,
             _ttl,
             maximum,
+            incoming_seq,
         ) = (int(value) if index != 7 else str(value) for index, value in enumerate(args))
         reservations = self.reservations.setdefault(keys[3], {})
         if token in reservations:
@@ -255,9 +291,11 @@ class FakeRedis:
             {
                 "balance": incoming_balance,
                 "reserved": 0,
-                "version": snapshot_version,
+                "version": -1,
+                "seq": -1,
             },
         )
+        self._merge_balance(balance, incoming_balance, snapshot_version, incoming_seq)
         if quota["count"] >= maximum or platform["count"] >= maximum:
             return -1
         quota["count"] += 1
@@ -362,7 +400,7 @@ def test_redis_reserve_enforces_rps_in_one_round_trip() -> None:
     assert run(exercise()) == ["accepted", "accepted", DENIED_RPS]
     # One eval per request: the RPS window rides inside the reserve script.
     assert len(redis.calls) == 3
-    assert all("microauth-request-reserve-v4" in call[0] for call in redis.calls)
+    assert all("microauth-request-reserve-v5" in call[0] for call in redis.calls)
     # The denied request reserved nothing.
     assert sum(state["count"] for state in redis.quotas.values()) == 2
     # The RPS key shares the tenant hash tag (single-slot on Redis Cluster).
@@ -555,11 +593,11 @@ def test_acknowledgements_are_batched_per_customer_and_credential() -> None:
     ack_calls = [
         call
         for call in redis.calls
-        if "microauth-request-acknowledge-v3" in call[0]
+        if "microauth-request-acknowledge-v4" in call[0]
     ]
     # One round trip per customer/credential pair, not one per event.
     assert len(ack_calls) == 2
-    assert {len(call[2]) - 2 for call in ack_calls} == {500}
+    assert {len(call[2]) - 4 for call in ack_calls} == {500}
 
 
 def test_redis_reservation_is_shared_across_instances() -> None:
@@ -604,7 +642,7 @@ def test_redis_reservation_is_shared_across_instances() -> None:
 
     run(exercise())
     reserve_calls = [
-        call for call in redis.calls if "microauth-request-reserve-v4" in call[0]
+        call for call in redis.calls if "microauth-request-reserve-v5" in call[0]
     ]
     assert len({call[1][0] for call in reserve_calls}) == 1
     assert all("{" in key and "}" in key for key in reserve_calls[0][1])
@@ -670,7 +708,7 @@ def test_redis_restore_is_idempotent_and_ttl_exceeds_31_days() -> None:
 
     run(exercise())
     restore_calls = [
-        call for call in redis.calls if "microauth-request-restore-v3" in call[0]
+        call for call in redis.calls if "microauth-request-restore-v4" in call[0]
     ]
     assert restore_calls
     ttl_ms = int(restore_calls[0][2][-2])

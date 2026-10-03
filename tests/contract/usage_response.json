@@ -1,0 +1,32 @@
+{
+  "accepted": 1,
+  "results": [
+    {
+      "idempotency_key": "req_01J4FY9N8NCE4Q4M7FZT2QY6K3",
+      "status": "accepted"
+    },
+    {
+      "idempotency_key": "req_01J4FY9N8NCE4Q4M7FZT2QY6K4",
+      "status": "duplicate"
+    },
+    {
+      "idempotency_key": "req_01J4FY9N8NCE4Q4M7FZT2QY6K5",
+      "status": "rejected",
+      "http_status": 402,
+      "detail": "insufficient credit balance"
+    },
+    {
+      "idempotency_key": "req_01J4FY9N8NCE4Q4M7FZT2QY6K6",
+      "status": "retry",
+      "http_status": 503,
+      "detail": "usage processing is temporarily unavailable"
+    }
+  ],
+  "customers": [
+    {
+      "id": "2b7c1f8e-5d34-4a9b-8c21-6e0f3d9a7b55",
+      "credit_balance_micro": 4997000,
+      "balance_seq": 8
+    }
+  ]
+}

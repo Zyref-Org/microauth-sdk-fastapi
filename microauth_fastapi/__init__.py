@@ -1,6 +1,7 @@
 """MicroAuth SDK for FastAPI — API key auth, rate limiting and metered
 billing for your API, powered by your MicroAuth tenant."""
 
+from ._version import __version__
 from .exceptions import (
     AuthDenied,
     AuthUnavailable,
@@ -27,8 +28,6 @@ from .exceptions import (
 )
 from .models import Customer, PlatformMonthlyAllowance
 from .sdk import MicroAuth
-
-__version__ = "2.8.1"
 
 __all__ = [
     "AuthDenied",

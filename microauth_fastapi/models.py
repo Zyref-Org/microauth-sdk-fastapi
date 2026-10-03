@@ -38,6 +38,18 @@ class CustomerState:
     effective: Effective
     usage_policy_id: str | None = None
     policy_valid_until: datetime | None = None
+    # Monotonic per-customer counter bumped on every committed balance
+    # change. None when the API predates it.
+    balance_seq: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CustomerBalance:
+    """A committed balance returned with a usage acknowledgement."""
+
+    customer_id: str
+    credit_balance_micro: int
+    balance_seq: int
 
 
 @dataclass(frozen=True, slots=True)

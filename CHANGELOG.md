@@ -1,5 +1,52 @@
 # Changelog
 
+## 2.9.0
+
+Exact balances, safer contracts and a setup check.
+
+- **Balance drift fix.** Usage acknowledgements now carry each charged
+  customer's committed balance and a monotonic `balance_seq`. The SDK
+  releases spend holds as soon as their charge is acknowledged and adopts the
+  committed balance when its sequence is newer. Previously holds waited for a
+  snapshot that started after the acknowledgement, and a snapshot read just
+  before a charge committed could restore the old balance, so local balances
+  could overstate or understate credit for a refresh cycle. Snapshots carry
+  `balance_seq` too, so a stale snapshot can never undo a newer committed
+  balance, while top-ups still apply at once. Older APIs without these fields
+  keep the previous behavior. Redis scripts moved to reserve v5,
+  acknowledge v4 and restore v4; roll all workers to 2.9.0 together.
+- **Unknown customer statuses no longer break the snapshot.** Any status
+  other than `active` (for example the API's `billing_suspended`) denies that
+  customer with `403`. Before, one such customer made the whole snapshot fail
+  validation.
+- The usage reporter understands the per-item `retry` status: the item stays
+  queued and ships with the next flush instead of being treated as a
+  malformed acknowledgement.
+- Keys resolved on demand are added to a copy of the snapshot, so a
+  published snapshot is never changed under a concurrent refresh.
+- The Redis pool built from `redis_url` is bounded (`redis_max_connections`,
+  default 64) and waits up to one second for a free connection. Requires
+  `redis>=5.0.1`.
+- Queued usage keeps one shared copy of repeated attachment strings and
+  skips a JSON round trip per request, which cuts memory during long control
+  plane outages.
+- Snapshots are revalidated with `If-None-Match`; a `304` reuses the
+  previous body with the new generation time.
+- Every API call sends `User-Agent: microauth-fastapi/<version>`, which lets
+  the dashboard show which SDK version is connected.
+- New `python -m microauth_fastapi check [--key ...]` command that verifies
+  the secret, snapshot, Redis and journal, and explains how a given API key
+  would be treated.
+
+## 2.8.1
+
+- `microauth_fastapi.__version__` now matches the package version. It had
+  still reported 2.7.0. The version now lives in one place.
+
+## 2.8.0
+
+- Package version bump only. The code is identical to 2.7.0.
+
 ## 2.7.0
 
 - Added opt-in trailing delivery for serverless runtimes
@@ -24,7 +71,7 @@ resilience release. (Supersedes the unpublished 2.5.0.)
 
 - Replaced the SQLite usage spool with a per-process append-only journal
   (WAL). Every completed request costs one appended, group-committed and
-  fsynced JSON line — merges included — so journal work per request is O(1)
+  fsynced JSON line, merges included, so journal work per request is O(1)
   regardless of how many requests have merged into an event. The previous
   SQLite journal rewrote the full merged row (with its growing attachment
   list) on every request, which made Redis-less p99 latency climb with

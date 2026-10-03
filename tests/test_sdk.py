@@ -1425,3 +1425,141 @@ def test_cancellation_after_journaling_recovers_the_event_for_fallback() -> None
 
     run(exercise())
     assert flush_completed
+
+
+def test_unknown_customer_status_denies_only_that_customer() -> None:
+    other_key = "map_billing_suspended"
+    payload = snapshot_payload()
+    payload["customers"].append(
+        {
+            **deepcopy(payload["customers"][0]),
+            "id": "customer-2",
+            "status": "billing_suspended",
+        }
+    )
+    payload["keys"].append(
+        {
+            "id": "33333333-3333-4333-8333-333333333333",
+            "customer_id": "customer-2",
+            "key_hash": hashlib.sha256(other_key.encode()).hexdigest(),
+        }
+    )
+    plane = ControlPlane(payload)
+
+    async def exercise() -> None:
+        control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
+        app = FastAPI()
+        auth = MicroAuth(
+            app,
+            secret_key="mas_test",
+            http_client=control,
+            persist_usage=False,
+            enforce_rps=False,
+        )
+        auth._snapshot = _parse_snapshot(payload)
+        auth._started = True
+
+        @app.get("/protected")
+        async def protected(customer: Customer = Security(auth)) -> dict[str, str]:
+            return {"customer": customer.id}
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as caller:
+            active = await caller.get("/protected", headers={"X-API-Key": API_KEY})
+            denied = await caller.get("/protected", headers={"X-API-Key": other_key})
+        assert active.status_code == 200
+        assert denied.status_code == 403
+        await auth.aclose()
+        await control.aclose()
+
+    run(exercise())
+
+
+def test_api_client_sends_user_agent_and_revalidates_snapshots() -> None:
+    from microauth_fastapi import __version__
+    from microauth_fastapi.client import GENERATED_AT_HEADER
+
+    body = snapshot_payload()
+    later = iso(datetime.now(timezone.utc) + timedelta(seconds=5))
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.headers.get("If-None-Match") == '"snap-1"':
+            return httpx.Response(304, headers={GENERATED_AT_HEADER: later})
+        return httpx.Response(200, json=body, headers={"ETag": '"snap-1"'})
+
+    async def exercise() -> None:
+        external = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = APIClient("https://api.microauth.test", "mas_test", 1, http_client=external)
+        first = await client.snapshot()
+        second = await client.snapshot()
+        assert first == body
+        assert second["generated_at"] == later
+        assert second["customers"] == body["customers"]
+        # The cached body is never handed out by reference.
+        second["generated_at"] = "mutated"
+        third = await client.snapshot()
+        assert third["generated_at"] == later
+
+        client.forget_snapshot()
+        await client.snapshot()
+        await external.aclose()
+
+    run(exercise())
+    assert seen[0].headers["User-Agent"].startswith(f"microauth-fastapi/{__version__} ")
+    assert "If-None-Match" not in seen[0].headers
+    assert seen[1].headers["If-None-Match"] == '"snap-1"'
+    assert "If-None-Match" not in seen[3].headers
+
+
+def test_verified_keys_never_mutate_a_published_snapshot() -> None:
+    new_key = "map_verified_later"
+    new_hash = hashlib.sha256(new_key.encode()).hexdigest()
+    payload = snapshot_payload()
+    verify_customer = {
+        **deepcopy(payload["customers"][0]),
+        "id": "customer-new",
+        "balance_seq": 3,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sdk/v1/keys/verify":
+            return httpx.Response(
+                200,
+                json={
+                    "valid": True,
+                    "key_id": "44444444-4444-4444-8444-444444444444",
+                    "customer": verify_customer,
+                    "billable_status_codes": [200],
+                },
+            )
+        return ControlPlane(payload)(request)
+
+    async def exercise() -> None:
+        control = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        auth = MicroAuth(
+            FastAPI(),
+            secret_key="mas_test",
+            http_client=control,
+            persist_usage=False,
+        )
+        published = _parse_snapshot(payload)
+        published_keys = dict(published.keys)
+        auth._snapshot = published
+        auth._started = True
+
+        record = await auth._do_verify(new_hash)
+
+        assert record is not None
+        assert published.keys == published_keys
+        assert "customer-new" not in published.customers
+        assert auth._snapshot is not published
+        assert auth._snapshot.keys[new_hash] == record
+        assert auth._snapshot.customers["customer-new"].balance_seq == 3
+        await auth.aclose()
+        await control.aclose()
+
+    run(exercise())

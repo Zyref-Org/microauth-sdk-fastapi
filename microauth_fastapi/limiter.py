@@ -15,6 +15,7 @@ from typing import Any, Protocol
 from .exceptions import LimitBackendUnavailable
 from .models import (
     MAX_SAFE_INTEGER,
+    CustomerBalance,
     CustomerState,
     LimitReservation,
     PlatformMonthlyAllowance,
@@ -22,6 +23,8 @@ from .models import (
 )
 
 logger = logging.getLogger("microauth")
+
+DEFAULT_REDIS_MAX_CONNECTIONS = 64
 
 DENIED_BALANCE = "balance"
 DENIED_QUOTA = "quota"
@@ -38,7 +41,7 @@ return count
 """
 
 _RESERVE_SCRIPT = """
-local marker = "microauth-request-reserve-v4"
+local marker = "microauth-request-reserve-v5"
 -- The per-second rate window shares this script so the whole admission
 -- decision costs one Redis round trip. It runs first: a rate-limited
 -- request must not consume quota, balance or platform capacity.
@@ -65,6 +68,8 @@ end
 
 local snapshot_version = tonumber(ARGV[3])
 local stored_version = tonumber(redis.call("HGET", KEYS[2], "version") or "-1")
+local incoming_seq = tonumber(ARGV[17])
+local stored_seq = tonumber(redis.call("HGET", KEYS[2], "seq") or "-1")
 local balance = tonumber(redis.call("HGET", KEYS[2], "balance") or ARGV[2])
 local reserved = tonumber(redis.call("HGET", KEYS[2], "reserved") or "0")
 
@@ -80,7 +85,18 @@ for _, token in ipairs(acknowledged) do
     redis.call("ZREM", KEYS[5], token)
 end
 
-if snapshot_version > stored_version then
+-- A balance sequence orders committed balances exactly, so a snapshot read
+-- before a charge committed can never undo it. Without one, fall back to
+-- the snapshot generation time.
+if incoming_seq >= 0 then
+    if incoming_seq > stored_seq then
+        balance = tonumber(ARGV[2])
+        stored_seq = incoming_seq
+    end
+    if snapshot_version > stored_version then
+        stored_version = snapshot_version
+    end
+elseif snapshot_version > stored_version then
     balance = tonumber(ARGV[2])
     stored_version = snapshot_version
 end
@@ -132,7 +148,8 @@ redis.call(
     KEYS[2],
     "balance", balance,
     "reserved", reserved,
-    "version", stored_version
+    "version", stored_version,
+    "seq", stored_seq
 )
 redis.call(
     "HSET",
@@ -173,12 +190,42 @@ return reserved
 """
 
 _ACKNOWLEDGE_SCRIPT = """
-local marker = "microauth-request-acknowledge-v3"
-for index = 3, #ARGV do
-    local token = ARGV[index]
-    if redis.call("HEXISTS", KEYS[1], token) == 1 then
-        redis.call("ZADD", KEYS[2], ARGV[1], token)
+local marker = "microauth-request-acknowledge-v4"
+local seq = tonumber(ARGV[3])
+if seq < 0 then
+    -- No committed balance came back: park the tokens until a snapshot
+    -- that started after this moment proves the charge is included.
+    for index = 5, #ARGV do
+        local token = ARGV[index]
+        if redis.call("HEXISTS", KEYS[1], token) == 1 then
+            redis.call("ZADD", KEYS[2], ARGV[1], token)
+        end
     end
+else
+    -- The committed balance already includes these charges, so their
+    -- holds are released in the same step that rebases the balance.
+    local reserved = tonumber(redis.call("HGET", KEYS[3], "reserved") or "0")
+    for index = 5, #ARGV do
+        local token = ARGV[index]
+        local amount = redis.call("HGET", KEYS[1], token)
+        if amount then
+            reserved = math.max(0, reserved - tonumber(amount))
+            redis.call("HDEL", KEYS[1], token)
+            redis.call("ZREM", KEYS[2], token)
+        end
+    end
+    local stored_seq = tonumber(redis.call("HGET", KEYS[3], "seq") or "-1")
+    if seq > stored_seq then
+        redis.call(
+            "HSET", KEYS[3],
+            "balance", ARGV[4],
+            "seq", seq,
+            "reserved", reserved
+        )
+    else
+        redis.call("HSET", KEYS[3], "reserved", reserved)
+    end
+    redis.call("PEXPIRE", KEYS[3], ARGV[2])
 end
 redis.call("PEXPIRE", KEYS[1], ARGV[2])
 redis.call("PEXPIRE", KEYS[2], ARGV[2])
@@ -186,7 +233,7 @@ return 1
 """
 
 _RESTORE_SCRIPT = """
-local marker = "microauth-request-restore-v3"
+local marker = "microauth-request-restore-v4"
 if redis.call("HEXISTS", KEYS[4], ARGV[8]) == 1 then
     return 0
 end
@@ -201,9 +248,19 @@ if customer_count < customer_floor then
 end
 
 local stored_version = tonumber(redis.call("HGET", KEYS[2], "version") or "-1")
+local incoming_seq = tonumber(ARGV[11])
+local stored_seq = tonumber(redis.call("HGET", KEYS[2], "seq") or "-1")
 local balance = tonumber(redis.call("HGET", KEYS[2], "balance") or ARGV[2])
 local reserved = tonumber(redis.call("HGET", KEYS[2], "reserved") or "0")
-if tonumber(ARGV[3]) > stored_version then
+if incoming_seq >= 0 then
+    if incoming_seq > stored_seq then
+        balance = tonumber(ARGV[2])
+        stored_seq = incoming_seq
+    end
+    if tonumber(ARGV[3]) > stored_version then
+        stored_version = tonumber(ARGV[3])
+    end
+elseif tonumber(ARGV[3]) > stored_version then
     balance = tonumber(ARGV[2])
     stored_version = tonumber(ARGV[3])
 end
@@ -233,7 +290,8 @@ redis.call(
     KEYS[2],
     "balance", balance,
     "reserved", reserved,
-    "version", stored_version
+    "version", stored_version,
+    "seq", stored_seq
 )
 redis.call("HSET", KEYS[3], "floor", platform_floor, "count", platform_count)
 for index = 1, 5 do
@@ -284,7 +342,11 @@ class Limiter(Protocol):
         billable: bool,
     ) -> None: ...
 
-    async def acknowledge(self, attachments: list[dict[str, Any]]) -> None: ...
+    async def acknowledge(
+        self,
+        attachments: list[dict[str, Any]],
+        balances: Sequence[CustomerBalance] = (),
+    ) -> None: ...
 
     async def reject(self, attachments: list[dict[str, Any]]) -> None: ...
 
@@ -316,7 +378,10 @@ class _Balance:
     reserved: int
     snapshot_version: float
     last_seen: float
+    seq: int = -1
     reservations: dict[str, int] = field(default_factory=dict)
+    # Legacy only: tokens acknowledged without a committed balance, waiting
+    # for a snapshot that started after the acknowledgement.
     acknowledged: dict[str, float] = field(default_factory=dict)
 
 
@@ -368,7 +433,7 @@ class MemoryLimiter:
                 )
                 self._apply_balance_snapshot(
                     balance,
-                    customer.credit_balance_micro,
+                    customer,
                     snapshot_version,
                     snapshot.refresh_started_at,
                 )
@@ -417,7 +482,7 @@ class MemoryLimiter:
             )
             self._apply_balance_snapshot(
                 balance,
-                customer.credit_balance_micro,
+                customer,
                 snapshot_version,
                 snapshot.refresh_started_at,
             )
@@ -492,16 +557,33 @@ class MemoryLimiter:
                 return
             balance.reserved = max(0, balance.reserved - amount)
 
-    async def acknowledge(self, attachments: list[dict[str, Any]]) -> None:
+    async def acknowledge(
+        self,
+        attachments: list[dict[str, Any]],
+        balances: Sequence[CustomerBalance] = (),
+    ) -> None:
         acknowledged_at = time.time()
+        committed = {balance.customer_id: balance for balance in balances}
         with self._lock:
             for raw in attachments:
                 attachment = _parse_attachment(raw)
                 balance = self._balances.get(
                     (attachment.tenant_scope, attachment.customer_id)
                 )
-                if balance is not None and attachment.token in balance.reservations:
-                    balance.acknowledged[attachment.token] = acknowledged_at
+                if balance is None:
+                    continue
+                confirmed = committed.get(attachment.customer_id)
+                if confirmed is None:
+                    if attachment.token in balance.reservations:
+                        balance.acknowledged[attachment.token] = acknowledged_at
+                    continue
+                amount = balance.reservations.pop(attachment.token, None)
+                if amount is not None:
+                    balance.reserved = max(0, balance.reserved - amount)
+                balance.acknowledged.pop(attachment.token, None)
+                if confirmed.balance_seq > balance.seq:
+                    balance.value = confirmed.credit_balance_micro
+                    balance.seq = confirmed.balance_seq
 
     async def reject(self, attachments: list[dict[str, Any]]) -> None:
         with self._lock:
@@ -571,6 +653,7 @@ class MemoryLimiter:
                         reserved=0,
                         snapshot_version=snapshot_version,
                         last_seen=time.time(),
+                        seq=_customer_seq(customer),
                     )
                 if attachment.token in balance.reservations:
                     continue
@@ -624,6 +707,7 @@ class MemoryLimiter:
                 reserved=0,
                 snapshot_version=snapshot_version,
                 last_seen=time.time(),
+                seq=_customer_seq(customer),
             )
         else:
             state.last_seen = time.time()
@@ -632,21 +716,29 @@ class MemoryLimiter:
     @staticmethod
     def _apply_balance_snapshot(
         balance: _Balance,
-        authoritative_balance: int,
+        customer: CustomerState,
         snapshot_version: float,
         refresh_started_at: float,
     ) -> None:
-        acknowledged = [
-            token
-            for token, acknowledged_at in balance.acknowledged.items()
-            if acknowledged_at <= refresh_started_at
-        ]
-        for token in acknowledged:
-            amount = balance.reservations.pop(token, 0)
-            balance.reserved = max(0, balance.reserved - amount)
-            del balance.acknowledged[token]
-        if snapshot_version > balance.snapshot_version:
-            balance.value = authoritative_balance
+        if balance.acknowledged:
+            acknowledged = [
+                token
+                for token, acknowledged_at in balance.acknowledged.items()
+                if acknowledged_at <= refresh_started_at
+            ]
+            for token in acknowledged:
+                amount = balance.reservations.pop(token, 0)
+                balance.reserved = max(0, balance.reserved - amount)
+                del balance.acknowledged[token]
+        seq = customer.balance_seq
+        if seq is not None:
+            # Sequence order is exact; generation time is only bookkeeping.
+            if seq > balance.seq:
+                balance.value = customer.credit_balance_micro
+                balance.seq = seq
+            balance.snapshot_version = max(balance.snapshot_version, snapshot_version)
+        elif snapshot_version > balance.snapshot_version:
+            balance.value = customer.credit_balance_micro
             balance.snapshot_version = snapshot_version
 
     def _maybe_gc_locked(self) -> None:
@@ -693,11 +785,18 @@ class RedisLimiter:
         key_prefix: str = "ma",
         *,
         redis_client: Any | None = None,
+        max_connections: int = DEFAULT_REDIS_MAX_CONNECTIONS,
     ) -> None:
         self._owns_redis = redis_client is None
         if redis_client is None:
             if not url:
                 raise ValueError("url is required when redis_client is not provided")
+            if (
+                isinstance(max_connections, bool)
+                or not isinstance(max_connections, int)
+                or max_connections < 1
+            ):
+                raise ValueError("max_connections must be a positive integer")
             try:
                 import redis.asyncio as aioredis
             except ImportError as exc:  # pragma: no cover
@@ -705,11 +804,17 @@ class RedisLimiter:
                     "Redis was configured but the redis package is not installed. "
                     "Install with: pip install 'microauth-fastapi[redis]'"
                 ) from exc
-            redis_client = aioredis.from_url(
+            # A blocking pool caps connections per worker. Under a burst,
+            # callers wait briefly for a free connection instead of opening
+            # thousands of sockets and exhausting Redis maxclients.
+            pool = aioredis.BlockingConnectionPool.from_url(
                 url,
+                max_connections=max_connections,
+                timeout=1.0,
                 socket_timeout=1.0,
                 socket_connect_timeout=1.0,
             )
+            redis_client = aioredis.Redis.from_pool(pool)
         self._redis = redis_client
         self._prefix = key_prefix.rstrip(":")
         self._down_until = 0.0
@@ -798,6 +903,7 @@ class RedisLimiter:
                 ttl_ms,
                 MAX_SAFE_INTEGER,
                 max(0, rps),
+                _customer_seq(customer),
             )
             values = [int(value) for value in result]
         except Exception as exc:
@@ -856,33 +962,48 @@ class RedisLimiter:
                 "Redis could not finalize the request reservation"
             ) from exc
 
-    async def acknowledge(self, attachments: list[dict[str, Any]]) -> None:
+    async def acknowledge(
+        self,
+        attachments: list[dict[str, Any]],
+        balances: Sequence[CustomerBalance] = (),
+    ) -> None:
         acknowledged_at = _milliseconds(time.time())
+        committed = {balance.customer_id: balance for balance in balances}
         # One Redis call per customer/key pair instead of one per event: a
         # 1000-item acknowledgement otherwise holds the flush lock through
         # 1000 sequential round trips.
-        grouped: dict[tuple[str, str], tuple[int, list[str]]] = {}
+        grouped: dict[tuple[str, str, str], _AckGroup] = {}
         for raw in attachments:
             attachment = _parse_attachment(raw)
             keys = self._attachment_keys(attachment)
-            group_key = (keys.reservations, keys.acknowledgements)
+            group_key = (keys.reservations, keys.acknowledgements, keys.balance)
             ttl = _state_ttl_ms(attachment.period_end)
-            existing = grouped.get(group_key)
-            if existing is None:
-                grouped[group_key] = (ttl, [attachment.token])
-            else:
-                grouped[group_key] = (
-                    max(existing[0], ttl),
-                    existing[1] + [attachment.token],
+            group = grouped.get(group_key)
+            if group is None:
+                grouped[group_key] = _AckGroup(
+                    ttl=ttl,
+                    tokens=[attachment.token],
+                    balance=committed.get(attachment.customer_id),
                 )
+            else:
+                group.ttl = max(group.ttl, ttl)
+                group.tokens.append(attachment.token)
         calls = [
             (
                 _ACKNOWLEDGE_SCRIPT,
-                2,
-                (reservations, acknowledgements),
-                (acknowledged_at, ttl, *tokens),
+                3,
+                group_key,
+                (
+                    acknowledged_at,
+                    group.ttl,
+                    -1 if group.balance is None else group.balance.balance_seq,
+                    0
+                    if group.balance is None
+                    else group.balance.credit_balance_micro,
+                    *group.tokens,
+                ),
             )
-            for (reservations, acknowledgements), (ttl, tokens) in grouped.items()
+            for group_key, group in grouped.items()
         ]
         try:
             # One pipelined round trip for the whole batch: sequential
@@ -961,6 +1082,7 @@ class RedisLimiter:
                         attachment.token,
                         _state_ttl_ms(attachment.period_end),
                         MAX_SAFE_INTEGER,
+                        _customer_seq(customer),
                     ),
                 )
             )
@@ -1051,6 +1173,13 @@ class RedisLimiter:
         )
 
 
+@dataclass(slots=True)
+class _AckGroup:
+    ttl: int
+    tokens: list[str]
+    balance: CustomerBalance | None
+
+
 @dataclass(frozen=True, slots=True)
 class _RedisKeys:
     customer: str
@@ -1124,6 +1253,12 @@ def _parse_attachment(raw: dict[str, Any]) -> _Attachment:
         reservation_key=optional["reservation_key"],
         acknowledgement_key=optional["acknowledgement_key"],
     )
+
+
+def _customer_seq(customer: CustomerState | None) -> int:
+    if customer is None or customer.balance_seq is None:
+        return -1
+    return customer.balance_seq
 
 
 def _required_allowance(snapshot: Snapshot) -> PlatformMonthlyAllowance:

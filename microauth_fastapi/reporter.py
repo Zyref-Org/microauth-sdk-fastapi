@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import time
 import uuid
 from collections import deque
@@ -27,7 +28,7 @@ from .exceptions import (
     UsageStoreError,
 )
 from .journal import JournalOp, WalJournal, enforce_capacity
-from .models import MAX_USAGE_COUNT
+from .models import MAX_SAFE_INTEGER, MAX_USAGE_COUNT, CustomerBalance
 from .usage_store import (
     UPSERT_MERGED,
     RedisUsageStore,
@@ -42,6 +43,7 @@ _DEFAULT_BATCH_SIZE = 500
 _RESPONSE_BATCH_WINDOW = 0.01
 _SUCCESS_STATUSES = frozenset({"accepted", "duplicate"})
 _TERMINAL_ITEM_HTTP_STATUSES = frozenset({400, 402, 409, 422})
+_UNIQUE_ATTACHMENT_FIELDS = frozenset({"token"})
 
 # The API terminally rejects usage older than 45 days; retrying past that only
 # converts a delayed delivery into a guaranteed rejection.
@@ -62,6 +64,10 @@ _MERGE_CAP = 10_000
 
 
 UsageCallback = Callable[[list[dict[str, Any]]], Awaitable[None] | None]
+AcknowledgementCallback = Callable[
+    [list[dict[str, Any]], list[CustomerBalance]],
+    Awaitable[None] | None,
+]
 AuthorizationCallback = Callable[
     [MicroAuthAuthorizationError],
     Awaitable[None] | None,
@@ -126,6 +132,7 @@ class _Acknowledgements:
     rejected: dict[str, str]
     retry: list[str]
     error: UsageAcknowledgementError | None
+    balances: list[CustomerBalance] = field(default_factory=list)
 
 
 def _hour_bucket(value: datetime | None = None) -> str:
@@ -150,7 +157,7 @@ class UsageReporter:
         spool_path: str | os.PathLike[str] | None = None,
         spool_claim_grace: float = 120.0,
         store: RedisUsageStore | None = None,
-        on_acknowledged: UsageCallback | None = None,
+        on_acknowledged: AcknowledgementCallback | None = None,
         on_rejected: UsageCallback | None = None,
         on_restored: UsageCallback | None = None,
         on_authorization_failure: AuthorizationCallback | None = None,
@@ -1090,10 +1097,11 @@ class UsageReporter:
         ]
         if accepted_events:
             accepted_ids = [event.idempotency_key for event in accepted_events]
-            await self._notify(
-                self._on_acknowledged,
-                _event_attachments(accepted_events),
-            )
+            attachments = _event_attachments(accepted_events)
+            if self._on_acknowledged is not None and attachments:
+                result = self._on_acknowledged(attachments, plan.balances)
+                if inspect.isawaitable(result):
+                    await result
             if self._store is not None:
                 try:
                     await self._store.ack(accepted_ids)
@@ -1575,6 +1583,7 @@ def _parse_acknowledgements(
     seen: set[str] = set()
     accepted: set[str] = set()
     rejected: dict[str, str] = {}
+    retryable: set[str] = set()
     invalid_ids: set[str] = set()
     malformed = False
     detail = ""
@@ -1605,6 +1614,10 @@ def _parse_acknowledgements(
         elif status == "rejected":
             raw_detail = raw.get("detail", "")
             rejected[event_id] = raw_detail if isinstance(raw_detail, str) else ""
+        elif status == "retry":
+            # A transient server-side failure for this item only; it stays
+            # queued with an unchanged payload for the next delivery.
+            retryable.add(event_id)
         else:
             malformed = True
             detail = f"usage item {event_id} has unsupported status {status!r}"
@@ -1627,6 +1640,11 @@ def _parse_acknowledgements(
         if not detail:
             detail = "usage response must contain exactly one result per submitted item"
     error = UsageAcknowledgementError(detail) if malformed else None
+    if error is None and retryable:
+        logger.info(
+            "microauth: %d usage item(s) will be retried at the next flush",
+            len(retryable),
+        )
     return _Acknowledgements(
         accepted=[
             event_id for event_id in expected_ids if event_id in accepted
@@ -1638,7 +1656,50 @@ def _parse_acknowledgements(
         },
         retry=retry,
         error=error,
+        balances=_parse_committed_balances(response.get("customers")),
     )
+
+
+def _parse_committed_balances(raw: Any) -> list[CustomerBalance]:
+    """Committed per-customer balances that came back with an ack.
+
+    Anything malformed is dropped as a whole: the limiter then falls back
+    to snapshot-based reconciliation, which is slower but always safe.
+    """
+
+    if not isinstance(raw, list):
+        return []
+    balances: list[CustomerBalance] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return []
+        customer_id = entry.get("id")
+        balance = entry.get("credit_balance_micro")
+        seq = entry.get("balance_seq")
+        if (
+            not isinstance(customer_id, str)
+            or not customer_id
+            or isinstance(balance, bool)
+            or not isinstance(balance, int)
+            or abs(balance) > MAX_SAFE_INTEGER
+            or isinstance(seq, bool)
+            or not isinstance(seq, int)
+            or seq < 0
+            or seq > MAX_SAFE_INTEGER
+        ):
+            logger.warning(
+                "microauth: usage acknowledgement carried an invalid "
+                "committed balance; falling back to snapshot reconciliation"
+            )
+            return []
+        balances.append(
+            CustomerBalance(
+                customer_id=customer_id,
+                credit_balance_micro=balance,
+                balance_seq=seq,
+            )
+        )
+    return balances
 
 
 def _normalize_attachment(
@@ -1648,6 +1709,22 @@ def _normalize_attachment(
         return {}
     if not isinstance(attachment, dict):
         raise TypeError("usage attachment must be an object")
+    if all(
+        type(key) is str and type(value) in (str, int)
+        for key, value in attachment.items()
+    ):
+        # Flat limiter attachments skip the JSON round trip. Every request
+        # for one customer repeats the same scope, keys and period, so
+        # interning them keeps a large outage backlog from holding one copy
+        # of each string per queued request.
+        return {
+            key: (
+                sys.intern(value)
+                if type(value) is str and key not in _UNIQUE_ATTACHMENT_FIELDS
+                else value
+            )
+            for key, value in sorted(attachment.items())
+        }
     try:
         encoded = json.dumps(
             attachment,
