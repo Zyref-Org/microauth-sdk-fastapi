@@ -37,11 +37,13 @@ def test_check_reports_a_healthy_integration_and_explains_a_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = snapshot_payload(price=1_000, billing_model="payg", balance=5_000, quota=100)
+    payload["tenant_name"] = "Weather API"
     install_plane(monkeypatch, lambda request: httpx.Response(200, json=payload))
 
     code, output = run_check("--key", API_KEY)
 
     assert code == 0, output
+    assert "connected to Weather API" in output
     assert "snapshot loaded: 1 customer(s), 1 key(s)" in output
     assert "price per billable request: $0.001" in output
     assert "a request with this key would be allowed" in output

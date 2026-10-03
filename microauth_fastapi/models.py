@@ -83,6 +83,7 @@ class Snapshot:
     platform_allowance: PlatformMonthlyAllowance | None = None
     generated_at: datetime | None = None
     tenant_id: str | None = None
+    tenant_name: str = ""
     fetched_at: float = 0.0
     refresh_started_at: float = 0.0
     source_age_at_fetch: float = 0.0

@@ -126,6 +126,8 @@ async def _check(args: argparse.Namespace, out: TextIO) -> int:
 def _describe_snapshot(report: _Report, snapshot: Snapshot) -> None:
     assert snapshot.generated_at is not None
     skew = (datetime.now(timezone.utc) - snapshot.generated_at).total_seconds()
+    if snapshot.tenant_name:
+        report.ok(f"connected to {snapshot.tenant_name}")
     report.ok(
         f"snapshot loaded: {len(snapshot.customers)} customer(s), "
         f"{len(snapshot.keys)} key(s)"

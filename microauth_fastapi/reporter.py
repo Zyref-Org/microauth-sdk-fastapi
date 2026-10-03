@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ._time import parse_iso8601
 from .client import APIClient
 from .exceptions import (
     MicroAuthAPIError,
@@ -1030,9 +1031,7 @@ class UsageReporter:
                 continue
             if event.period_ts == 0.0:
                 # Parsed once per event lifetime, not once per flush.
-                event.period_ts = datetime.fromisoformat(
-                    event.period_start.replace("Z", "+00:00")
-                ).timestamp()
+                event.period_ts = parse_iso8601(event.period_start).timestamp()
             if event.period_ts < cutoff:
                 expired.append(event_id)
         for event_id in expired:
@@ -2003,7 +2002,7 @@ def _event_from_row(row: Any) -> _UsageEvent:
     if not isinstance(period_start, str):
         raise UsageStoreError("usage journal contains an invalid period_start")
     try:
-        parsed = datetime.fromisoformat(period_start.replace("Z", "+00:00"))
+        parsed = parse_iso8601(period_start)
     except ValueError as exc:
         raise UsageStoreError("usage journal contains an invalid period_start") from exc
     if (

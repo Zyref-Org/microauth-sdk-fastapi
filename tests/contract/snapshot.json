@@ -1,5 +1,6 @@
 {
   "tenant_id": "0f6b2d4e-8a1c-4e3f-9b5d-7c2e1a4f6b80",
+  "tenant_name": "Weather API",
   "generated_at": "2025-03-03T09:30:00Z",
   "billable_status_codes": [
     200,

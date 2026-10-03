@@ -35,8 +35,11 @@ Exact balances, safer contracts and a setup check.
 - Every API call sends `User-Agent: microauth-fastapi/<version>`, which lets
   the dashboard show which SDK version is connected.
 - New `python -m microauth_fastapi check [--key ...]` command that verifies
-  the secret, snapshot, Redis and journal, and explains how a given API key
-  would be treated.
+  the secret, snapshot, Redis and journal, names the API the secret belongs
+  to, and explains how a given API key would be treated.
+- **Python 3.10 fix.** Timestamps with any number of fractional digits
+  (the API emits up to nine) now parse on every supported Python. Before,
+  Python 3.10 rejected most snapshots as invalid.
 
 ## 2.8.1
 

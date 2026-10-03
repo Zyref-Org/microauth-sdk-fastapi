@@ -48,6 +48,17 @@ def test_snapshot_fixture_parses_with_every_customer_status() -> None:
     assert snapshot.platform_allowance is not None
     assert snapshot.platform_allowance.remaining == 996_400
     assert len(snapshot.keys) == 1
+    assert snapshot.tenant_name == "Weather API"
+
+
+def test_snapshot_with_go_nanosecond_timestamps_parses() -> None:
+    data = load("snapshot.json")
+    data["generated_at"] = "2025-03-03T09:30:00.123456789Z"
+    for customer in data["customers"]:
+        customer["policy_valid_until"] = "2025-03-03T11:30:00.12345Z"
+    snapshot = _parse_snapshot(data)
+    assert snapshot.generated_at is not None
+    assert snapshot.generated_at.microsecond == 123_456
 
 
 def test_snapshot_without_balance_seq_still_parses() -> None:

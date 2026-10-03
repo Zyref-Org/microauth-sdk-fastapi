@@ -43,6 +43,7 @@ import httpx
 from fastapi import Request, Security
 from fastapi.security import APIKeyHeader
 
+from ._time import parse_iso8601
 from .client import APIClient
 from .exceptions import (
     AuthUnavailable,
@@ -1418,6 +1419,12 @@ def _parse_snapshot(
         if tenant_id_raw is None
         else _required_string(tenant_id_raw, "tenant_id")
     )
+    tenant_name_raw = data.get("tenant_name")
+    tenant_name = (
+        tenant_name_raw.strip()
+        if isinstance(tenant_name_raw, str) and len(tenant_name_raw) <= 200
+        else ""
+    )
     fetched_at = time.monotonic()
     source_age = max(0.0, now.timestamp() - generated_at.timestamp())
     return Snapshot(
@@ -1427,6 +1434,7 @@ def _parse_snapshot(
         platform_allowance=allowance,
         generated_at=generated_at,
         tenant_id=tenant_id,
+        tenant_name=tenant_name,
         fetched_at=fetched_at,
         refresh_started_at=(
             time.time()
@@ -1588,7 +1596,7 @@ def _parse_timestamp(raw: Any, field: str) -> datetime:
     if not isinstance(raw, str) or len(raw) > 64:
         raise SnapshotValidationError(f"{field} must be an ISO 8601 timestamp")
     try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        parsed = parse_iso8601(raw)
     except ValueError as exc:
         raise SnapshotValidationError(
             f"{field} must be an ISO 8601 timestamp"

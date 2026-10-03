@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
+from ._time import parse_iso8601
 from .exceptions import LimitBackendUnavailable
 from .models import (
     MAX_SAFE_INTEGER,
@@ -1209,7 +1210,7 @@ def _parse_attachment(raw: dict[str, Any]) -> _Attachment:
         period_end_raw = raw["period_end"]
         if not isinstance(period_end_raw, str):
             raise TypeError
-        period_end = datetime.fromisoformat(period_end_raw.replace("Z", "+00:00"))
+        period_end = parse_iso8601(period_end_raw)
         if period_end.tzinfo is None or period_end.utcoffset() is None:
             raise ValueError
         spend_micro = raw["spend_micro"]
