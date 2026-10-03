@@ -330,7 +330,7 @@ The SDK expects `GET /sdk/v1/snapshot` to return this shape:
         "rps": 25,
         "price_per_request_micro": 1000,
         "monthly_quota": 100000,
-        "billing_model": "plan",
+        "billing_model": "subscription",
         "source": "plan"
       }
     }
