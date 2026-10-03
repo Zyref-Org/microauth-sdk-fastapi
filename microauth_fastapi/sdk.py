@@ -6,7 +6,7 @@ Quickstart::
     from microauth_fastapi import MicroAuth, Customer
 
     app = FastAPI()
-    auth = MicroAuth(app)  # tenant secret from MICROAUTH_SECRET_KEY
+    auth = MicroAuth(app)  # SDK secret key from MICROAUTH_SECRET_KEY or .env
 
     @app.get("/forecast")
     async def forecast(customer: Customer = Security(auth)):
@@ -43,6 +43,7 @@ import httpx
 from fastapi import Request, Security
 from fastapi.security import APIKeyHeader
 
+from ._env import getenv
 from ._time import parse_iso8601
 from .client import APIClient
 from .exceptions import (
@@ -221,11 +222,13 @@ class MicroAuth:
         redis_client: Any | None = None,
         redis_max_connections: int = DEFAULT_REDIS_MAX_CONNECTIONS,
     ) -> None:
-        secret_key = secret_key or os.environ.get("MICROAUTH_SECRET_KEY", "")
+        secret_key = secret_key or getenv("MICROAUTH_SECRET_KEY") or ""
         if not secret_key.startswith("mas_"):
             raise MicroAuthConfigurationError(
-                "MicroAuth tenant secret key is missing or malformed. Pass "
-                "secret_key='mas_...' or set the MICROAUTH_SECRET_KEY env var."
+                "MicroAuth SDK secret key is missing or malformed. Pass "
+                "secret_key='mas_...' or set MICROAUTH_SECRET_KEY in the "
+                "environment or a .env file. It is on your API's Overview page "
+                "in the MicroAuth dashboard."
             )
         _validate_positive("sync_interval", sync_interval)
         _validate_positive("report_interval", report_interval)
@@ -263,8 +266,8 @@ class MicroAuth:
             raise MicroAuthConfigurationError(
                 "max_stale_snapshot_age must be at least max_snapshot_age"
             )
-        base_url = base_url or os.environ.get("MICROAUTH_BASE_URL", "https://api.microauth.com")
-        redis_url = redis_url or os.environ.get("MICROAUTH_REDIS_URL") or None
+        base_url = base_url or getenv("MICROAUTH_BASE_URL") or "https://api.microauth.com"
+        redis_url = redis_url or getenv("MICROAUTH_REDIS_URL") or None
         secret_scope = hashlib.sha256(secret_key.encode("utf-8")).hexdigest()[:24]
         if persistence_namespace is not None:
             if not isinstance(persistence_namespace, str) or not persistence_namespace.strip():
@@ -275,9 +278,7 @@ class MicroAuth:
         else:
             tenant_scope = secret_scope
         if persist_usage:
-            configured_spool = usage_spool_path or os.environ.get(
-                "MICROAUTH_USAGE_SPOOL_PATH"
-            )
+            configured_spool = usage_spool_path or getenv("MICROAUTH_USAGE_SPOOL_PATH")
             if configured_spool is None:
                 configured_spool = (
                     Path(tempfile.gettempdir())
@@ -335,7 +336,7 @@ class MicroAuth:
         self._default_spool = (
             persist_usage
             and usage_spool_path is None
-            and os.environ.get("MICROAUTH_USAGE_SPOOL_PATH") is None
+            and getenv("MICROAUTH_USAGE_SPOOL_PATH") is None
         )
         snapshot_refresh_timeout = max(45.0, timeout * 4.0)
         # The snapshot cache scope is credential-bound (unlike the limiter

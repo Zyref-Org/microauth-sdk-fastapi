@@ -1,8 +1,8 @@
 # MicroAuth SDK for FastAPI
 
 API key authentication, per-customer rate limiting and metered billing for
-your FastAPI API, powered by your [MicroAuth](https://microauth.com) tenant,
-in one dependency.
+your FastAPI API, powered by [MicroAuth](https://microauth.com), in one
+dependency.
 
 ```bash
 pip install microauth-fastapi
@@ -13,24 +13,34 @@ from fastapi import FastAPI, Security
 from microauth_fastapi import MicroAuth, Customer
 
 app = FastAPI()
-auth = MicroAuth(app)  # tenant secret from MICROAUTH_SECRET_KEY
+auth = MicroAuth(app)  # reads MICROAUTH_SECRET_KEY
 
 @app.get("/forecast")
 async def forecast(customer: Customer = Security(auth)):
     return {"hello": customer.id}
 ```
 
-That's the whole integration. Your customers sign up on your MicroAuth
-developer portal, create API keys, and pick a plan or top up credits. Every
-request to `/forecast` is then authenticated, rate-limited and billed.
+```bash
+# .env, next to your app
+MICROAUTH_SECRET_KEY=mas_...
+```
+
+That's the whole integration. The SDK secret key is on your API's Overview
+page in the [MicroAuth dashboard](https://app.microauth.com). Settings come
+from the environment, and any `MICROAUTH_*` value that is not set there is
+read from a `.env` file in the working directory.
+
+Your customers sign up on your developer portal, create API keys, and pick a
+plan or top up credits. Every request to `/forecast` is then authenticated,
+rate-limited and billed.
 
 ## Check your setup
 
-Before you deploy, run the built-in check with the same environment your app
-uses:
+Before you deploy, run the built-in check from the same directory and
+environment your app uses:
 
 ```bash
-MICROAUTH_SECRET_KEY=mas_... python -m microauth_fastapi check
+python -m microauth_fastapi check
 ```
 
 It confirms the secret works, loads a snapshot, pings Redis when
@@ -201,7 +211,7 @@ Everything has a sensible default; override only what you need.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `secret_key` | `$MICROAUTH_SECRET_KEY` | Tenant secret key (`mas_...`) |
+| `secret_key` | `$MICROAUTH_SECRET_KEY` | SDK secret key (`mas_...`) |
 | `base_url` | `https://api.microauth.com` | MicroAuth API (`$MICROAUTH_BASE_URL`) |
 | `header_name` | `X-API-Key` | Header customers send their key in |
 | `redis_url` | `$MICROAUTH_REDIS_URL` | Share snapshots and enforce exact cross-worker limits |

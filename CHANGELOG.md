@@ -37,6 +37,10 @@ Exact balances, safer contracts and a setup check.
 - New `python -m microauth_fastapi check [--key ...]` command that verifies
   the secret, snapshot, Redis and journal, names the API the secret belongs
   to, and explains how a given API key would be treated.
+- `MicroAuth()` and the check command fall back to a `.env` file in the
+  working directory for `MICROAUTH_*` settings that are not set in the
+  environment. Real environment variables still win, and other entries in
+  the file are ignored.
 - **Python 3.10 fix.** Timestamps with any number of fractional digits
   (the API emits up to nine) now parse on every supported Python. Before,
   Python 3.10 rejected most snapshots as invalid.

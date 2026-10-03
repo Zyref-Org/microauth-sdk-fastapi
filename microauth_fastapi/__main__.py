@@ -1,7 +1,8 @@
 """``python -m microauth_fastapi check``: confirm an integration end to end.
 
-Reads the same environment variables as ``MicroAuth()`` and reports what the
-SDK would see at startup, without serving traffic or reporting usage. Pass
+Reads the same environment variables (or ``.env`` file) as ``MicroAuth()``
+and reports what the SDK would see at startup, without serving traffic or
+reporting usage. Pass
 ``--key`` with one of your customers' API keys to see exactly how a request
 with that key would be treated.
 """
@@ -11,13 +12,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
-import os
 import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
+from ._env import from_dotenv, getenv
 from ._version import __version__
 from .client import APIClient
 from .exceptions import (
@@ -63,16 +64,20 @@ async def _check(args: argparse.Namespace, out: TextIO) -> int:
     report = _Report(out)
     out.write(f"MicroAuth FastAPI SDK {__version__}\n")
 
-    secret = args.secret_key or os.environ.get("MICROAUTH_SECRET_KEY", "")
-    base_url = args.base_url or os.environ.get("MICROAUTH_BASE_URL") or DEFAULT_BASE_URL
+    secret = args.secret_key or getenv("MICROAUTH_SECRET_KEY") or ""
+    base_url = args.base_url or getenv("MICROAUTH_BASE_URL") or DEFAULT_BASE_URL
     report.heading("Configuration")
     if not secret.startswith("mas_"):
         report.fail(
             "MICROAUTH_SECRET_KEY is missing or is not an SDK secret key (mas_...). "
-            "Copy it from your API's Overview page in the MicroAuth dashboard."
+            "Copy it from your API's Overview page in the MicroAuth dashboard, then "
+            "export it or put it in a .env file in this directory."
         )
         return 1
-    report.ok(f"SDK secret key mas_...{secret[-4:]}")
+    secret_source = (
+        " (from .env)" if not args.secret_key and from_dotenv("MICROAUTH_SECRET_KEY") else ""
+    )
+    report.ok(f"SDK secret key mas_...{secret[-4:]}{secret_source}")
     report.ok(f"control plane {base_url}")
 
     client = APIClient(base_url, secret, args.timeout)
@@ -105,7 +110,7 @@ async def _check(args: argparse.Namespace, out: TextIO) -> int:
     finally:
         await client.aclose()
 
-    redis_url = args.redis_url or os.environ.get("MICROAUTH_REDIS_URL")
+    redis_url = args.redis_url or getenv("MICROAUTH_REDIS_URL")
     report.heading("Shared state")
     if redis_url:
         await _check_redis(report, redis_url)
@@ -232,7 +237,7 @@ async def _check_redis(report: _Report, redis_url: str) -> None:
 
 
 def _check_spool(report: _Report) -> None:
-    configured = os.environ.get("MICROAUTH_USAGE_SPOOL_PATH")
+    configured = getenv("MICROAUTH_USAGE_SPOOL_PATH")
     directory = Path(configured).expanduser().parent if configured else Path(tempfile.gettempdir())
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -256,7 +261,8 @@ def main(argv: list[str] | None = None, out: TextIO | None = None) -> int:
         help="verify the secret key, snapshot, Redis and journal",
         description=(
             "Verify that this environment can run MicroAuth. Reads "
-            "MICROAUTH_SECRET_KEY, MICROAUTH_BASE_URL and MICROAUTH_REDIS_URL."
+            "MICROAUTH_SECRET_KEY, MICROAUTH_BASE_URL and MICROAUTH_REDIS_URL "
+            "from the environment, or from a .env file in this directory."
         ),
     )
     check.add_argument("--key", help="a customer API key to evaluate")
