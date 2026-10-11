@@ -1,0 +1,29 @@
+{
+  "valid": true,
+  "key_id": "8d13d81b-b803-45f6-a755-3f46c696d220",
+  "billable_status_codes": [
+    200,
+    201,
+    202,
+    203,
+    204,
+    205,
+    206
+  ],
+  "customer": {
+    "id": "2b7c1f8e-5d34-4a9b-8c21-6e0f3d9a7b55",
+    "status": "active",
+    "credit_balance_micro": 5000000,
+    "balance_seq": 7,
+    "month_requests": 1200,
+    "effective": {
+      "rps": 10,
+      "price_per_request_micro": 1000,
+      "monthly_quota": 50000,
+      "source": "payg",
+      "billing_model": "payg"
+    },
+    "usage_policy_id": "6a1f0c2e-9b7d-4e3a-8f15-2c4d6e8a0b13",
+    "policy_valid_until": "2026-10-12T09:30:00.123456Z"
+  }
+}

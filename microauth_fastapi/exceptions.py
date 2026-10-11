@@ -61,20 +61,8 @@ class UsageAcknowledgementError(UsageReportingError):
     """The usage API did not acknowledge every submitted item."""
 
 
-class UsageItemRejected(UsageAcknowledgementError):
-    """The usage API explicitly rejected an item."""
-
-    def __init__(self, idempotency_key: str, detail: str = "") -> None:
-        self.idempotency_key = idempotency_key
-        self.detail = detail
-        message = f"usage item {idempotency_key} was rejected"
-        if detail:
-            message = f"{message}: {detail}"
-        super().__init__(message)
-
-
 class UsageStoreError(UsageReportingError):
-    """The durable usage spool could not be read or updated."""
+    """The usage journal or the Redis usage queue could not be read or updated."""
 
 
 class UsageDrainError(UsageReportingError):
@@ -109,6 +97,13 @@ class InvalidAPIKey(AuthDenied):
 class CustomerSuspended(AuthDenied):
     def __init__(self) -> None:
         super().__init__(status_code=403, detail="This account is suspended")
+
+
+class CustomerPending(AuthDenied):
+    """The customer signed up on a portal that approves accounts first."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=403, detail="This account is waiting for approval")
 
 
 class PaymentRequired(AuthDenied):

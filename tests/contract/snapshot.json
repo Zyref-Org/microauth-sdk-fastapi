@@ -1,22 +1,27 @@
 {
   "tenant_id": "0f6b2d4e-8a1c-4e3f-9b5d-7c2e1a4f6b80",
   "tenant_name": "Weather API",
-  "generated_at": "2025-03-03T09:30:00Z",
+  "generated_at": "2026-10-11T09:30:00.123456789Z",
   "billable_status_codes": [
     200,
-    201
+    201,
+    202,
+    203,
+    204,
+    205,
+    206
   ],
   "platform_monthly_limit": 1000000,
   "platform_monthly_used": 3600,
   "platform_monthly_remaining": 996400,
-  "platform_period_end": "2025-04-01T00:00:00Z",
+  "platform_period_end": "2026-11-01T00:00:00Z",
   "platform_hard_cap": true,
   "platform_monthly_allowance": {
     "limit": 1000000,
     "used": 3600,
     "remaining": 996400,
-    "period_start": "2025-03-01T00:00:00Z",
-    "period_end": "2025-04-01T00:00:00Z",
+    "period_start": "2026-10-01T00:00:00Z",
+    "period_end": "2026-11-01T00:00:00Z",
     "hard_cap": true
   },
   "customers": [
@@ -34,14 +39,14 @@
         "billing_model": "payg"
       },
       "usage_policy_id": "6a1f0c2e-9b7d-4e3a-8f15-2c4d6e8a0b13",
-      "policy_valid_until": "2025-03-03T11:30:00Z"
+      "policy_valid_until": "2026-10-12T09:30:00.123456Z"
     },
     {
       "id": "3c8d2a9f-6e45-4b0c-9d32-7f1a4e0b8c66",
-      "status": "suspended",
+      "status": "pending",
       "credit_balance_micro": 0,
-      "balance_seq": 3,
-      "month_requests": 1200,
+      "balance_seq": 1,
+      "month_requests": 0,
       "effective": {
         "rps": 10,
         "price_per_request_micro": 1000,
@@ -49,24 +54,23 @@
         "source": "payg",
         "billing_model": "payg"
       },
-      "usage_policy_id": "6a1f0c2e-9b7d-4e3a-8f15-2c4d6e8a0b13",
-      "policy_valid_until": "2025-03-03T11:30:00Z"
+      "usage_policy_id": "7b2a1d3f-0c8e-4f4b-9a26-3d5e7f9b1c24",
+      "policy_valid_until": "2026-10-12T09:30:00.123456Z"
     },
     {
       "id": "4d9e3b0a-7f56-4c1d-8e43-8a2b5f1c9d77",
-      "status": "billing_suspended",
+      "status": "suspended",
       "credit_balance_micro": 120000,
       "balance_seq": 12,
-      "month_requests": 1200,
+      "month_requests": 800,
       "effective": {
-        "rps": 10,
-        "price_per_request_micro": 1000,
-        "monthly_quota": 50000,
-        "source": "payg",
-        "billing_model": "payg"
+        "rps": 25,
+        "price_per_request_micro": 0,
+        "source": "plan",
+        "billing_model": "subscription"
       },
-      "usage_policy_id": "6a1f0c2e-9b7d-4e3a-8f15-2c4d6e8a0b13",
-      "policy_valid_until": "2025-03-03T11:30:00Z"
+      "usage_policy_id": "8c3b2e4a-1d9f-4a5c-8b37-4e6f8a0c2d35",
+      "policy_valid_until": "2026-10-12T09:30:00.123456Z"
     }
   ],
   "keys": [
@@ -74,6 +78,11 @@
       "id": "8d13d81b-b803-45f6-a755-3f46c696d220",
       "key_hash": "5b0e1f4c2a7d9e3b6c8f0a1d2e4b7c9f1a3d5e7b9c0f2a4d6e8b0c1f3a5d7e9b",
       "customer_id": "2b7c1f8e-5d34-4a9b-8c21-6e0f3d9a7b55"
+    },
+    {
+      "id": "9e24e92c-c914-46a7-b866-4a57d7a7e331",
+      "key_hash": "6c1f2a5d3b8e0f4c7d9a1b2e3f5c8d0a2b4e6f8c0d1a3b5e7f9c1d2a4b6e8f0c",
+      "customer_id": "4d9e3b0a-7f56-4c1d-8e43-8a2b5f1c9d77"
     }
   ]
 }

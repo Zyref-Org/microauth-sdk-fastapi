@@ -12,7 +12,7 @@ from typing import Any
 # instead of silently rounding an authorization decision.
 MAX_SAFE_INTEGER = (1 << 53) - 1
 
-# The Go ingestion endpoint applies this stricter bound to each usage item.
+# The usage endpoint accepts at most this many requests in one item.
 MAX_USAGE_COUNT = 10_000_000
 
 
@@ -36,11 +36,13 @@ class CustomerState:
     credit_balance_micro: int
     month_requests: int
     effective: Effective
-    usage_policy_id: str | None = None
-    policy_valid_until: datetime | None = None
-    # Monotonic per-customer counter bumped on every committed balance
-    # change. None when the API predates it.
-    balance_seq: int | None = None
+    # The price policy requests are admitted under. Usage carries it back so
+    # late reports are charged at the price that was enforced.
+    usage_policy_id: str
+    policy_valid_until: datetime
+    # Grows with every committed balance change, so two observations of one
+    # customer's balance can always be ordered exactly.
+    balance_seq: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +56,7 @@ class CustomerBalance:
 
 @dataclass(frozen=True, slots=True)
 class PlatformMonthlyAllowance:
-    """The flat platform allowance fields returned by the Go API."""
+    """Your MicroAuth plan's monthly request allowance."""
 
     limit: int
     used: int
@@ -75,14 +77,14 @@ class KeyRecord:
 
 @dataclass(slots=True)
 class Snapshot:
-    """One immutable-ish view of the tenant's customers and keys."""
+    """One immutable-ish view of the API's customers and keys."""
 
     billable_statuses: frozenset[int] = frozenset({200})
     keys: dict[str, KeyRecord] = field(default_factory=dict)
     customers: dict[str, CustomerState] = field(default_factory=dict)
     platform_allowance: PlatformMonthlyAllowance | None = None
     generated_at: datetime | None = None
-    tenant_id: str | None = None
+    tenant_id: str = ""
     tenant_name: str = ""
     fetched_at: float = 0.0
     refresh_started_at: float = 0.0
@@ -150,3 +152,93 @@ class Customer:
     platform_monthly_limit: int | None = None
     platform_monthly_remaining: int | None = None
     platform_monthly_period_end: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UsageReceipt:
+    """MicroAuth's record of one delivered usage item.
+
+    An item counts ``count`` requests that share an API key, usage policy,
+    status code and UTC hour. ``outcome`` is ``accepted`` when this delivery
+    recorded it and ``duplicate`` when MicroAuth had already recorded it,
+    for example after a retry whose first answer was lost. Either way the
+    customer was charged exactly once, ``charged_micro``.
+    """
+
+    idempotency_key: str
+    outcome: str
+    customer_id: str | None
+    api_key_id: str
+    usage_policy_id: str
+    status_code: int
+    count: int
+    period_start: datetime
+    # What MicroAuth charged, in micro-USD. None only if the API omitted it.
+    charged_micro: int | None
+    # What the SDK expected from the prices it enforced when it admitted the
+    # requests. None when this process did not admit all of them itself.
+    expected_charge_micro: int | None
+    recorded_at: datetime | None
+    delivered_at: datetime
+
+    @property
+    def charge_matches(self) -> bool | None:
+        """Whether MicroAuth charged what the SDK expected, when both are known."""
+
+        if self.charged_micro is None or self.expected_charge_micro is None:
+            return None
+        return self.charged_micro == self.expected_charge_micro
+
+
+@dataclass(frozen=True, slots=True)
+class UsageRejection:
+    """A usage item MicroAuth refused for good, with the reason.
+
+    Rejected items are never charged. They are kept as dead letters in the
+    journal (and in Redis, when configured) for inspection with
+    ``python -m microauth_fastapi usage``.
+    """
+
+    idempotency_key: str
+    api_key_id: str
+    usage_policy_id: str
+    status_code: int
+    count: int
+    period_start: datetime
+    http_status: int | None
+    detail: str
+    rejected_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class UsageStats:
+    """Delivery health of this process's usage reporting.
+
+    Counters cover the life of the process. Export them to your metrics
+    system and alert on ``rejected_items``, ``charge_mismatches``,
+    ``consecutive_failures`` and an ``oldest_queued_at`` that keeps aging.
+    """
+
+    # Where queued usage survives a crash: "redis", "journal" or "memory".
+    durability: str
+    journal_dir: str | None
+    queued_items: int
+    queued_requests: int
+    oldest_queued_at: datetime | None
+    # Items MicroAuth has recorded, including duplicates it had recorded
+    # before (after a retry whose first answer was lost).
+    delivered_items: int
+    delivered_requests: int
+    duplicate_items: int
+    rejected_items: int
+    rejected_requests: int
+    # The sum of charged_micro over every receipt this process received.
+    charged_micro: int
+    charge_mismatches: int
+    last_delivery_at: datetime | None
+    consecutive_failures: int
+    last_error: str | None
+    last_error_at: datetime | None
+    # Seconds to add to this host's clock to read MicroAuth's.
+    clock_offset_seconds: float
+    hook_failures: int

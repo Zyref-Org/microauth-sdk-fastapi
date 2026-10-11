@@ -41,7 +41,7 @@ UPSERT_CAPPED = "capped"
 # consistent across workers with skewed local clocks.
 
 _UPSERT_SCRIPT = """
-local marker = "microauth-usage-upsert-v3"
+local marker = "microauth-usage-upsert-v4"
 local time = redis.call("TIME")
 local now_ms = time[1] * 1000 + math.floor(time[2] / 1000)
 local id = ARGV[1]
@@ -95,7 +95,7 @@ return result
 """
 
 _CLAIM_SCRIPT = """
-local marker = "microauth-usage-claim-v3"
+local marker = "microauth-usage-claim-v4"
 local time = redis.call("TIME")
 local now_ms = time[1] * 1000 + math.floor(time[2] / 1000)
 local limit = tonumber(ARGV[2])
@@ -132,7 +132,7 @@ return claimed
 """
 
 _ACK_SCRIPT = """
-local marker = "microauth-usage-ack-v3"
+local marker = "microauth-usage-ack-v4"
 local removed = 0
 for index = 5, #ARGV do
     local id = ARGV[index]
@@ -154,7 +154,7 @@ return removed
 """
 
 _RELEASE_SCRIPT = """
-local marker = "microauth-usage-release-v3"
+local marker = "microauth-usage-release-v4"
 local time = redis.call("TIME")
 local now_ms = time[1] * 1000 + math.floor(time[2] / 1000)
 local released = 0
@@ -176,7 +176,7 @@ return released
 """
 
 _EXTEND_SCRIPT = """
-local marker = "microauth-usage-extend-v3"
+local marker = "microauth-usage-extend-v4"
 local time = redis.call("TIME")
 local now_ms = time[1] * 1000 + math.floor(time[2] / 1000)
 local extended = 0
@@ -193,7 +193,7 @@ return extended
 """
 
 _DEAD_LETTER_SCRIPT = """
-local marker = "microauth-usage-dead-letter-v3"
+local marker = "microauth-usage-dead-letter-v4"
 local id = ARGV[2]
 if redis.call("HGET", KEYS[4], id) ~= ARGV[1] then
     return 0
@@ -329,18 +329,12 @@ class RedisUsageStore:
         max_count: int,
         allow_create: bool,
     ) -> str:
-        encoded_attachment = (
-            _encode_json(attachment, "usage attachment") if attachment else ""
-        )
+        encoded_attachment = _encode_json(attachment, "usage attachment") if attachment else ""
         # A stable per-request token makes the whole operation idempotent: an
         # ambiguous failure (the server executed the script but the reply was
         # lost) is retried once and deduplicated instead of double-counting.
         raw_token = attachment.get("token") if attachment else None
-        dedup_token = (
-            raw_token
-            if isinstance(raw_token, str) and raw_token
-            else str(uuid.uuid4())
-        )
+        dedup_token = raw_token if isinstance(raw_token, str) and raw_token else str(uuid.uuid4())
         last_error: Exception | None = None
         result: int | None = None
         for attempt in range(2):
@@ -406,9 +400,7 @@ class RedisUsageStore:
                 self._att_prefix,
             )
         except Exception as exc:
-            raise UsageStoreError(
-                "the durable usage queue could not claim events"
-            ) from exc
+            raise UsageStoreError("the durable usage queue could not claim events") from exc
         if not isinstance(raw, (list, tuple)) or len(raw) % 4 != 0:
             raise UsageStoreError("the durable usage queue returned invalid claims")
         claimed: list[tuple[str, dict[str, Any]]] = []
@@ -448,9 +440,7 @@ class RedisUsageStore:
                 *event_ids,
             )
         except Exception as exc:
-            raise UsageStoreError(
-                "the durable usage queue could not acknowledge events"
-            ) from exc
+            raise UsageStoreError("the durable usage queue could not acknowledge events") from exc
         return int(removed)
 
     async def release(self, event_ids: list[str], *, delay_ms: int = 0) -> int:
@@ -472,9 +462,7 @@ class RedisUsageStore:
                 *event_ids,
             )
         except Exception as exc:
-            raise UsageStoreError(
-                "the durable usage queue could not release events"
-            ) from exc
+            raise UsageStoreError("the durable usage queue could not release events") from exc
         return int(released)
 
     async def extend_leases(self, event_ids: list[str]) -> int:
@@ -504,6 +492,9 @@ class RedisUsageStore:
         event_id: str,
         detail: str,
         payload: dict[str, Any] | None = None,
+        *,
+        http_status: int | None = None,
+        rejected_at: str | None = None,
     ) -> bool:
         """Move a terminally rejected owned event to the dead-letter hash.
 
@@ -512,7 +503,11 @@ class RedisUsageStore:
         journal's dead-letter file.
         """
 
-        record_body: dict[str, Any] = {"detail": detail[:2000]}
+        record_body: dict[str, Any] = {
+            "detail": detail[:2000],
+            "http_status": http_status,
+            "rejected_at": rejected_at,
+        }
         if payload is not None:
             record_body["event"] = payload
         record = _encode_json(record_body, "dead-letter record")
@@ -534,9 +529,7 @@ class RedisUsageStore:
                 self._tok_prefix,
             )
         except Exception as exc:
-            raise UsageStoreError(
-                "the durable usage queue could not dead-letter an event"
-            ) from exc
+            raise UsageStoreError("the durable usage queue could not dead-letter an event") from exc
         return bool(int(moved))
 
     async def pending_count(self) -> int:
@@ -545,9 +538,40 @@ class RedisUsageStore:
         try:
             return int(await self._redis.hlen(self._events_key))
         except Exception as exc:
+            raise UsageStoreError("the durable usage queue could not report its depth") from exc
+
+    async def dead_letter_count(self) -> int:
+        try:
+            return int(await self._redis.hlen(self._dead_key))
+        except Exception as exc:
             raise UsageStoreError(
-                "the durable usage queue could not report its depth"
+                "the durable usage queue could not count its dead letters"
             ) from exc
+
+    async def dead_letters(self, limit: int = 100) -> list[tuple[str, dict[str, Any]]]:
+        """Up to ``limit`` dead-lettered events with their rejection details."""
+
+        letters: list[tuple[str, dict[str, Any]]] = []
+        if limit <= 0:
+            return letters
+        try:
+            async for raw_id, raw_record in self._redis.hscan_iter(self._dead_key, count=100):
+                event_id = _decode(raw_id)
+                try:
+                    record = json.loads(_decode(raw_record))
+                except ValueError:
+                    record = {"detail": "unreadable dead-letter record"}
+                if isinstance(record, dict):
+                    letters.append((event_id, record))
+                if len(letters) >= limit:
+                    break
+        except UsageStoreError:
+            raise
+        except Exception as exc:
+            raise UsageStoreError(
+                "the durable usage queue could not list its dead letters"
+            ) from exc
+        return letters
 
 
 def _reassemble_payload(
@@ -559,13 +583,9 @@ def _reassemble_payload(
     try:
         item = json.loads(static_json)
     except ValueError as exc:
-        raise UsageStoreError(
-            f"the durable usage queue holds invalid JSON for {event_id}"
-        ) from exc
+        raise UsageStoreError(f"the durable usage queue holds invalid JSON for {event_id}") from exc
     if not isinstance(item, dict):
-        raise UsageStoreError(
-            f"the durable usage queue holds a non-object payload for {event_id}"
-        )
+        raise UsageStoreError(f"the durable usage queue holds a non-object payload for {event_id}")
     try:
         count = int(count_raw)
     except ValueError as exc:

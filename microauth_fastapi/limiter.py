@@ -7,7 +7,7 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -31,15 +31,6 @@ DENIED_BALANCE = "balance"
 DENIED_QUOTA = "quota"
 DENIED_PLATFORM = "platform"
 DENIED_RPS = "rps"
-
-_RPS_SCRIPT = """
-local marker = "microauth-rps-v3"
-local count = redis.call("INCR", KEYS[1])
-if count == 1 then
-    redis.call("PEXPIRE", KEYS[1], ARGV[1])
-end
-return count
-"""
 
 _RESERVE_SCRIPT = """
 local marker = "microauth-request-reserve-v5"
@@ -176,7 +167,7 @@ return {
 """
 
 _FINALIZE_SCRIPT = """
-local marker = "microauth-request-finalize-v3"
+local marker = "microauth-request-finalize-v4"
 local amount = tonumber(redis.call("HGET", KEYS[2], ARGV[1]) or "0")
 local reserved = tonumber(redis.call("HGET", KEYS[1], "reserved") or "0")
 if tonumber(ARGV[2]) == 0 then
@@ -313,8 +304,6 @@ class ReservationDenied(Exception):
 class Limiter(Protocol):
     distributed: bool
 
-    async def allow(self, customer_id: str, credential_id: str, rps: int) -> bool: ...
-
     async def sync_snapshot(
         self,
         tenant_scope: str,
@@ -381,36 +370,28 @@ class _Balance:
     last_seen: float
     seq: int = -1
     reservations: dict[str, int] = field(default_factory=dict)
-    # Legacy only: tokens acknowledged without a committed balance, waiting
-    # for a snapshot that started after the acknowledgement.
+    # Tokens acknowledged without a committed balance for their customer,
+    # waiting for a snapshot that started after the acknowledgement.
     acknowledged: dict[str, float] = field(default_factory=dict)
 
 
 class MemoryLimiter:
-    """A process-local implementation with one lock for atomic decisions."""
+    """A process-local implementation with one lock for atomic decisions.
+
+    ``time_fn`` is MicroAuth-aligned wall time, the same clock snapshot
+    ``refresh_started_at`` values come from.
+    """
 
     distributed = False
 
-    def __init__(self) -> None:
+    def __init__(self, *, time_fn: Callable[[], float] = time.time) -> None:
+        self._time = time_fn
         self._lock = threading.Lock()
         self._windows: dict[tuple[str, str], _Window] = {}
         self._quotas: dict[tuple[str, str, str], _Counter] = {}
         self._platform: dict[tuple[str, str], _Counter] = {}
         self._balances: dict[tuple[str, str], _Balance] = {}
         self._last_gc = time.monotonic()
-
-    async def allow(self, customer_id: str, credential_id: str, rps: int) -> bool:
-        if rps <= 0:
-            return True
-        epoch = int(time.time())
-        key = (customer_id, credential_id)
-        with self._lock:
-            window = self._windows.get(key)
-            if window is None or window.epoch != epoch:
-                window = self._windows[key] = _Window(epoch=epoch, count=0)
-            window.count += 1
-            self._maybe_gc_locked()
-            return window.count <= rps
 
     async def sync_snapshot(
         self,
@@ -462,7 +443,7 @@ class MemoryLimiter:
             if rps > 0:
                 # Checked first, inside the same lock as the admission
                 # decision: a rate-limited request consumes nothing else.
-                epoch = int(time.time())
+                epoch = int(self._time())
                 window_key = (customer.id, credential_id)
                 window = self._windows.get(window_key)
                 if window is None or window.epoch != epoch:
@@ -489,11 +470,7 @@ class MemoryLimiter:
             )
 
             monthly_quota = customer.effective.monthly_quota
-            if (
-                enforce_quota
-                and monthly_quota is not None
-                and quota.count >= monthly_quota
-            ):
+            if enforce_quota and monthly_quota is not None and quota.count >= monthly_quota:
                 raise ReservationDenied(DENIED_QUOTA)
             if (
                 enforce_balance
@@ -501,11 +478,7 @@ class MemoryLimiter:
                 and balance.value - balance.reserved < potential_spend_micro
             ):
                 raise ReservationDenied(DENIED_BALANCE)
-            if (
-                enforce_platform
-                and allowance.hard_cap
-                and platform.count >= allowance.limit
-            ):
+            if enforce_platform and allowance.hard_cap and platform.count >= allowance.limit:
                 raise ReservationDenied(DENIED_PLATFORM)
             if (
                 quota.count >= MAX_SAFE_INTEGER
@@ -520,11 +493,7 @@ class MemoryLimiter:
             platform.count += 1
             balance.reserved += potential_spend_micro
             balance.reservations[token] = potential_spend_micro
-            quota_remaining = (
-                None
-                if monthly_quota is None
-                else max(0, monthly_quota - quota.count)
-            )
+            quota_remaining = None if monthly_quota is None else max(0, monthly_quota - quota.count)
             return LimitReservation(
                 token=token,
                 tenant_scope=tenant_scope,
@@ -546,9 +515,7 @@ class MemoryLimiter:
         if billable:
             return
         with self._lock:
-            balance = self._balances.get(
-                (reservation.tenant_scope, reservation.customer_id)
-            )
+            balance = self._balances.get((reservation.tenant_scope, reservation.customer_id))
             if balance is None:
                 return
             # Tokens are single-use UUIDs; removing the entry (instead of
@@ -563,14 +530,12 @@ class MemoryLimiter:
         attachments: list[dict[str, Any]],
         balances: Sequence[CustomerBalance] = (),
     ) -> None:
-        acknowledged_at = time.time()
+        acknowledged_at = self._time()
         committed = {balance.customer_id: balance for balance in balances}
         with self._lock:
             for raw in attachments:
                 attachment = _parse_attachment(raw)
-                balance = self._balances.get(
-                    (attachment.tenant_scope, attachment.customer_id)
-                )
+                balance = self._balances.get((attachment.tenant_scope, attachment.customer_id))
                 if balance is None:
                     continue
                 confirmed = committed.get(attachment.customer_id)
@@ -590,9 +555,7 @@ class MemoryLimiter:
         with self._lock:
             for raw in attachments:
                 attachment = _parse_attachment(raw)
-                balance = self._balances.get(
-                    (attachment.tenant_scope, attachment.customer_id)
-                )
+                balance = self._balances.get((attachment.tenant_scope, attachment.customer_id))
                 if balance is None:
                     continue
                 amount = balance.reservations.pop(attachment.token, None)
@@ -612,9 +575,7 @@ class MemoryLimiter:
                 attachment = _parse_attachment(raw)
                 customer = snapshot.customers.get(attachment.customer_id)
                 customer_floor = customer.month_requests if customer is not None else 0
-                credit_balance = (
-                    customer.credit_balance_micro if customer is not None else 0
-                )
+                credit_balance = customer.credit_balance_micro if customer is not None else 0
                 quota_key = (
                     attachment.tenant_scope,
                     attachment.period_key,
@@ -634,9 +595,7 @@ class MemoryLimiter:
                 platform = self._platform.get(platform_key)
                 if platform is None:
                     platform_floor = (
-                        allowance.used
-                        if attachment.period_key == allowance.period_key
-                        else 0
+                        allowance.used if attachment.period_key == allowance.period_key else 0
                     )
                     platform = self._platform[platform_key] = _Counter(
                         floor=platform_floor,
@@ -653,7 +612,7 @@ class MemoryLimiter:
                         value=credit_balance,
                         reserved=0,
                         snapshot_version=snapshot_version,
-                        last_seen=time.time(),
+                        last_seen=self._time(),
                         seq=_customer_seq(customer),
                     )
                 if attachment.token in balance.reservations:
@@ -707,11 +666,11 @@ class MemoryLimiter:
                 value=customer.credit_balance_micro,
                 reserved=0,
                 snapshot_version=snapshot_version,
-                last_seen=time.time(),
+                last_seen=self._time(),
                 seq=_customer_seq(customer),
             )
         else:
-            state.last_seen = time.time()
+            state.last_seen = self._time()
         return state
 
     @staticmethod
@@ -731,29 +690,22 @@ class MemoryLimiter:
                 amount = balance.reservations.pop(token, 0)
                 balance.reserved = max(0, balance.reserved - amount)
                 del balance.acknowledged[token]
-        seq = customer.balance_seq
-        if seq is not None:
-            # Sequence order is exact; generation time is only bookkeeping.
-            if seq > balance.seq:
-                balance.value = customer.credit_balance_micro
-                balance.seq = seq
-            balance.snapshot_version = max(balance.snapshot_version, snapshot_version)
-        elif snapshot_version > balance.snapshot_version:
+        # Sequence order is exact; generation time is only bookkeeping.
+        if customer.balance_seq > balance.seq:
             balance.value = customer.credit_balance_micro
-            balance.snapshot_version = snapshot_version
+            balance.seq = customer.balance_seq
+        balance.snapshot_version = max(balance.snapshot_version, snapshot_version)
 
     def _maybe_gc_locked(self) -> None:
         now = time.monotonic()
         if now - self._last_gc < 600:
             return
         self._last_gc = now
-        epoch = int(time.time())
+        wall_time = self._time()
+        epoch = int(wall_time)
         self._windows = {
-            key: window
-            for key, window in self._windows.items()
-            if epoch - window.epoch <= 600
+            key: window for key, window in self._windows.items() if epoch - window.epoch <= 600
         }
-        wall_time = time.time()
         self._quotas = {
             key: counter
             for key, counter in self._quotas.items()
@@ -767,8 +719,7 @@ class MemoryLimiter:
         self._balances = {
             key: balance
             for key, balance in self._balances.items()
-            if balance.reservations
-            or balance.last_seen + 46 * 86_400 >= wall_time
+            if balance.reservations or balance.last_seen + 46 * 86_400 >= wall_time
         }
 
     async def aclose(self) -> None:
@@ -787,7 +738,9 @@ class RedisLimiter:
         *,
         redis_client: Any | None = None,
         max_connections: int = DEFAULT_REDIS_MAX_CONNECTIONS,
+        time_fn: Callable[[], float] = time.time,
     ) -> None:
+        self._time = time_fn
         self._owns_redis = redis_client is None
         if redis_client is None:
             if not url:
@@ -818,31 +771,12 @@ class RedisLimiter:
             redis_client = aioredis.Redis.from_pool(pool)
         self._redis = redis_client
         self._prefix = key_prefix.rstrip(":")
-        self._down_until = 0.0
 
     @property
     def redis_client(self) -> Any:
         """Return the client shared with other SDK coordination primitives."""
 
         return self._redis
-
-    async def allow(self, customer_id: str, credential_id: str, rps: int) -> bool:
-        if rps <= 0:
-            return True
-        now = time.monotonic()
-        if now < self._down_until:
-            return True
-        identity = hashlib.sha256(
-            f"{customer_id}\0{credential_id}".encode()
-        ).hexdigest()[:32]
-        key = f"{self._prefix}:rps:{identity}:{int(time.time())}"
-        try:
-            count = int(await self._redis.eval(_RPS_SCRIPT, 1, key, 3000))
-        except Exception:
-            self._down_until = now + 2.0
-            logger.warning("microauth: Redis RPS limiter unavailable; failing open")
-            return True
-        return count <= rps
 
     async def sync_snapshot(
         self,
@@ -968,7 +902,7 @@ class RedisLimiter:
         attachments: list[dict[str, Any]],
         balances: Sequence[CustomerBalance] = (),
     ) -> None:
-        acknowledged_at = _milliseconds(time.time())
+        acknowledged_at = _milliseconds(self._time())
         committed = {balance.customer_id: balance for balance in balances}
         # One Redis call per customer/key pair instead of one per event: a
         # 1000-item acknowledgement otherwise holds the flush lock through
@@ -998,9 +932,7 @@ class RedisLimiter:
                     acknowledged_at,
                     group.ttl,
                     -1 if group.balance is None else group.balance.balance_seq,
-                    0
-                    if group.balance is None
-                    else group.balance.credit_balance_micro,
+                    0 if group.balance is None else group.balance.credit_balance_micro,
                     *group.tokens,
                 ),
             )
@@ -1012,9 +944,7 @@ class RedisLimiter:
             # customer cardinality.
             await self._eval_many(calls)
         except Exception as exc:
-            raise LimitBackendUnavailable(
-                "Redis could not acknowledge usage reservations"
-            ) from exc
+            raise LimitBackendUnavailable("Redis could not acknowledge usage reservations") from exc
 
     async def reject(self, attachments: list[dict[str, Any]]) -> None:
         try:
@@ -1049,18 +979,11 @@ class RedisLimiter:
             customer = snapshot.customers.get(attachment.customer_id)
             customer_floor = (
                 customer.month_requests
-                if customer is not None
-                and attachment.period_key == allowance.period_key
+                if customer is not None and attachment.period_key == allowance.period_key
                 else 0
             )
-            credit_balance = (
-                customer.credit_balance_micro if customer is not None else 0
-            )
-            platform_floor = (
-                allowance.used
-                if attachment.period_key == allowance.period_key
-                else 0
-            )
+            credit_balance = customer.credit_balance_micro if customer is not None else 0
+            platform_floor = allowance.used if attachment.period_key == allowance.period_key else 0
             calls.append(
                 (
                     _RESTORE_SCRIPT,
@@ -1113,9 +1036,7 @@ class RedisLimiter:
         if pipeline_factory is None or len(calls) == 1:
             results = []
             for script, key_count, keys, args in calls:
-                results.append(
-                    await self._redis.eval(script, key_count, *keys, *args)
-                )
+                results.append(await self._redis.eval(script, key_count, *keys, *args))
             return results
         async with pipeline_factory(transaction=False) as pipe:
             for script, key_count, keys, args in calls:
@@ -1151,10 +1072,8 @@ class RedisLimiter:
         # Shares the tenant hash tag with the reservation keys so the
         # combined reserve script stays single-slot on Redis Cluster.
         tag = hashlib.sha256(tenant_scope.encode()).hexdigest()[:32]
-        identity = hashlib.sha256(
-            f"{customer_id}\0{credential_id}".encode()
-        ).hexdigest()[:32]
-        return f"{self._prefix}:{{{tag}}}:rps:{identity}:{int(time.time())}"
+        identity = hashlib.sha256(f"{customer_id}\0{credential_id}".encode()).hexdigest()[:32]
+        return f"{self._prefix}:{{{tag}}}:rps:{identity}:{int(self._time())}"
 
     def _attachment_keys(self, attachment: _Attachment) -> _RedisKeys:
         generated = self._keys(
@@ -1167,10 +1086,7 @@ class RedisLimiter:
             balance=attachment.balance_key or generated.balance,
             platform=attachment.platform_key or generated.platform,
             reservations=attachment.reservation_key or generated.reservations,
-            acknowledgements=(
-                attachment.acknowledgement_key
-                or generated.acknowledgements
-            ),
+            acknowledgements=(attachment.acknowledgement_key or generated.acknowledgements),
         )
 
 
@@ -1222,8 +1138,7 @@ def _parse_attachment(raw: dict[str, Any]) -> _Attachment:
         ):
             raise ValueError
         required = {
-            field: raw[field]
-            for field in ("token", "tenant_scope", "customer_id", "period_key")
+            field: raw[field] for field in ("token", "tenant_scope", "customer_id", "period_key")
         }
         if any(not isinstance(value, str) or not value for value in required.values()):
             raise ValueError
@@ -1257,9 +1172,7 @@ def _parse_attachment(raw: dict[str, Any]) -> _Attachment:
 
 
 def _customer_seq(customer: CustomerState | None) -> int:
-    if customer is None or customer.balance_seq is None:
-        return -1
-    return customer.balance_seq
+    return -1 if customer is None else customer.balance_seq
 
 
 def _required_allowance(snapshot: Snapshot) -> PlatformMonthlyAllowance:

@@ -267,26 +267,18 @@ def test_randomized_delivery_order_leaves_zero_drift(
                     acks_in_flight.append(
                         (
                             batch,
-                            CustomerBalance(
-                                client_customer.id, server_balance, server_seq
-                            ),
+                            CustomerBalance(client_customer.id, server_balance, server_seq),
                         )
                     )
                 elif action < 0.8 and acks_in_flight:
-                    attachments, committed = acks_in_flight.pop(
-                        rng.randrange(len(acks_in_flight))
-                    )
+                    attachments, committed = acks_in_flight.pop(rng.randrange(len(acks_in_flight)))
                     await limiter.acknowledge(attachments, [committed])
                 elif action < 0.88:
                     snapshots_in_flight.append((server_balance, server_seq))
                 elif action < 0.94 and snapshots_in_flight:
-                    balance, seq = snapshots_in_flight.pop(
-                        rng.randrange(len(snapshots_in_flight))
-                    )
+                    balance, seq = snapshots_in_flight.pop(rng.randrange(len(snapshots_in_flight)))
                     step += 1
-                    client_snapshot, client_customer = snapshot_at(
-                        base, balance, seq, step=step
-                    )
+                    client_snapshot, client_customer = snapshot_at(base, balance, seq, step=step)
                     await limiter.sync_snapshot(SCOPE, client_snapshot)
                 elif action < 0.97:
                     # An occasional top-up from the billing side.
@@ -314,17 +306,13 @@ def test_randomized_delivery_order_leaves_zero_drift(
                 await limiter.acknowledge(attachments, [committed])
             for balance, seq in snapshots_in_flight:
                 step += 1
-                client_snapshot, client_customer = snapshot_at(
-                    base, balance, seq, step=step
-                )
+                client_snapshot, client_customer = snapshot_at(base, balance, seq, step=step)
                 await limiter.sync_snapshot(SCOPE, client_snapshot)
             step += 1
             final_snapshot, final_customer = snapshot_at(
                 base, server_balance, server_seq, step=step
             )
-            residual = server_balance - await available(
-                limiter, final_snapshot, final_customer
-            )
+            residual = server_balance - await available(limiter, final_snapshot, final_customer)
             assert residual == 0
 
     run(exercise())

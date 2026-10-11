@@ -4,7 +4,6 @@ Run with:
     MICROAUTH_SECRET_KEY=mas_... uvicorn examples.weather_api:app --reload
 """
 
-import os
 import random
 
 from fastapi import FastAPI, HTTPException, Security
@@ -13,11 +12,8 @@ from microauth_fastapi import Customer, MicroAuth
 
 app = FastAPI(title="ProWeather API", version="1.0.0")
 
-auth = MicroAuth(
-    app,
-    base_url=os.environ.get("MICROAUTH_BASE_URL", "https://api.microauth.com"),
-    redis_url=os.environ.get("MICROAUTH_REDIS_URL"),  # optional
-)
+# Reads MICROAUTH_SECRET_KEY, and MICROAUTH_REDIS_URL when it is set.
+auth = MicroAuth(app)
 
 CITIES = {
     "amsterdam": {"temp_c": 14, "condition": "cloudy"},
@@ -29,7 +25,7 @@ CITIES = {
 
 @app.get("/")
 async def index():
-    """Public route — no API key required."""
+    """Public route, no API key required."""
     return {"service": "ProWeather", "docs": "/docs"}
 
 

@@ -1,10 +1,11 @@
-"""MicroAuth SDK for FastAPI — API key auth, rate limiting and metered
-billing for your API, powered by your MicroAuth tenant."""
+"""MicroAuth SDK for FastAPI: API key auth, rate limits and metered billing
+for your API, with a receipt for every request MicroAuth charges."""
 
 from ._version import __version__
 from .exceptions import (
     AuthDenied,
     AuthUnavailable,
+    CustomerPending,
     CustomerSuspended,
     InvalidAPIKey,
     LimitBackendUnavailable,
@@ -21,18 +22,24 @@ from .exceptions import (
     SnapshotValidationError,
     UsageAcknowledgementError,
     UsageDrainError,
-    UsageItemRejected,
     UsageQueueFull,
     UsageReportingError,
     UsageStoreError,
 )
-from .models import Customer, PlatformMonthlyAllowance
+from .models import (
+    Customer,
+    PlatformMonthlyAllowance,
+    UsageReceipt,
+    UsageRejection,
+    UsageStats,
+)
 from .sdk import MicroAuth
 
 __all__ = [
     "AuthDenied",
     "AuthUnavailable",
     "Customer",
+    "CustomerPending",
     "CustomerSuspended",
     "InvalidAPIKey",
     "LimitBackendUnavailable",
@@ -51,9 +58,11 @@ __all__ = [
     "SnapshotValidationError",
     "UsageAcknowledgementError",
     "UsageDrainError",
-    "UsageItemRejected",
     "UsageQueueFull",
+    "UsageReceipt",
+    "UsageRejection",
     "UsageReportingError",
+    "UsageStats",
     "UsageStoreError",
     "__version__",
 ]

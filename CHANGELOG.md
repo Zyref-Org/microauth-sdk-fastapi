@@ -1,49 +1,133 @@
 # Changelog
 
-## 2.9.0
+## 3.0.0
 
-Exact balances, safer contracts and a setup check.
+Built for the MicroAuth platform as it runs today, with a receipt for every
+charge. This release drops every compatibility path for older MicroAuth APIs.
+It also contains the changes prepared as 2.9.0, which was never published.
 
-- **Balance drift fix.** Usage acknowledgements now carry each charged
-  customer's committed balance and a monotonic `balance_seq`. The SDK
-  releases spend holds as soon as their charge is acknowledged and adopts the
-  committed balance when its sequence is newer. Previously holds waited for a
-  snapshot that started after the acknowledgement, and a snapshot read just
-  before a charge committed could restore the old balance, so local balances
-  could overstate or understate credit for a refresh cycle. Snapshots carry
-  `balance_seq` too, so a stale snapshot can never undo a newer committed
-  balance, while top-ups still apply at once. Older APIs without these fields
-  keep the previous behavior. Redis scripts moved to reserve v5,
-  acknowledge v4 and restore v4; roll all workers to 2.9.0 together.
-- **Unknown customer statuses no longer break the snapshot.** Any status
-  other than `active` (for example the API's `billing_suspended`) denies that
-  customer with `403`. Before, one such customer made the whole snapshot fail
-  validation.
-- The usage reporter understands the per-item `retry` status: the item stays
-  queued and ships with the next flush instead of being treated as a
-  malformed acknowledgement.
+### Upgrading from 2.x
+
+- **Requires the current MicroAuth API.** Snapshots must name the API
+  (`tenant_id`) and give every customer a `balance_seq` and a usage policy,
+  and usage responses must carry a receipt for every recorded item. A
+  response without them is rejected as invalid instead of falling back to
+  older behavior.
+- **Removed `usage_spool_path`, `persistence_namespace` and
+  `MICROAUTH_USAGE_SPOOL_PATH`.** Use `journal_dir` or `MICROAUTH_JOURNAL_DIR`.
+  Queued usage is now kept per API, named after the API the secret belongs
+  to, so rotating the secret keeps the same journal and the same Redis queue.
+- **Removed `UsageItemRejected`.** Usage that MicroAuth refuses now arrives
+  as `UsageRejection` records through `on_rejections` and `usage_stats()`.
+- **New journal format and location.** The journal moved from the temp
+  directory to a per user state directory, and every line now carries a
+  checksum. 3.0 does not read usage that 2.x left queued, on disk or in
+  Redis. Let your 2.x processes shut down normally before you start 3.0, which
+  delivers what they hold, and move every worker that shares a Redis
+  instance to 3.0 at the same time.
+- **Customers waiting for approval get their own `403`.** The detail is
+  `This account is waiting for approval` and the exception is
+  `CustomerPending`. Before, they got the suspended message.
+- **The SDK starts with your app.** The middleware loads the first snapshot
+  and recovers journals left by crashed processes when the app starts,
+  rather than on the first request. If that fails, the failure is logged and
+  the first request tries again.
+
+### Receipts and reconciliation
+
+- MicroAuth answers every delivery with a `UsageReceipt` per item: the
+  customer, the amount charged, when it was recorded, and whether this
+  delivery recorded it (`accepted`) or found it recorded already
+  (`duplicate`). The SDK compares each charge with the price it enforced
+  (`expected_charge_micro` and `charge_matches`) and logs any mismatch at
+  error level.
+- New `on_receipts` and `on_rejections` hooks. They run before an item
+  leaves the queue, so a crash can't skip a receipt, and a receipt may arrive
+  twice instead; store them by `idempotency_key`. Hooks can be async, plain
+  functions run in a worker thread, and each call gets five seconds.
+- Refused usage is kept as a dead letter, in the journal and in Redis, with
+  MicroAuth's status, reason and the time it was refused. It is never
+  charged.
+- New `auth.usage_stats()`, which returns a `UsageStats` with the queue depth
+  and the age of its oldest item, delivered, refused and charged totals,
+  charge mismatches, hook failures, the latest error and the clock offset.
+- New `python -m microauth_fastapi usage` command (`--json` for scripts) that
+  shows what each API on this host, or in Redis, still has to deliver and
+  everything MicroAuth refused.
+
+### Journal
+
+- Every line carries a CRC32 checksum. A last line cut short by a crash
+  belongs to a response that never finished, so it is dropped. Damage
+  anywhere else is logged and a copy of the file is kept for inspection.
+- A failed write or fsync is truncated away. New files are made durable
+  together with their directory entry, and dead letters are written to disk
+  before the journal drops the item they describe.
+- A running process refreshes its journal on every sweep, so a busy or
+  waiting process is never mistaken for a crashed one. A file is adopted
+  once it has been idle for two minutes, or four report intervals when that
+  is longer.
+- The default directory is `~/.local/state/microauth/journal` on Linux (or
+  `$XDG_STATE_HOME/microauth/journal`), `~/Library/Application
+  Support/microauth/journal` on macOS and `%LOCALAPPDATA%\microauth\journal`
+  on Windows. Serverless platforms keep using the temp directory.
+
+### MicroAuth's clock
+
+- The SDK measures the offset between this machine's clock and MicroAuth's
+  from the snapshot and every response, and uses MicroAuth's time for usage
+  hours, usage policy expiry, snapshot age, the 45 day cutoff and rate limit
+  windows. A server whose clock drifts still reports usage in the right hour.
+  The SDK warns when the offset reaches two seconds.
+
+### Exact balances
+
+- Usage acknowledgements carry each charged customer's committed balance
+  and a monotonic `balance_seq`. The SDK releases spend holds as soon as their
+  charge is acknowledged and adopts the committed balance when its sequence
+  is newer. Previously holds waited for a snapshot that started after the
+  acknowledgement, and a snapshot read just before a charge committed could
+  restore the old balance, so local balances could overstate or understate
+  credit for a refresh cycle. Snapshots carry `balance_seq` too, so a stale
+  snapshot can never undo a newer committed balance, while top ups still
+  apply at once.
+
+### Setup check
+
+- New `python -m microauth_fastapi check [--key ...]` command. It verifies
+  the secret, names the API it belongs to, loads a snapshot, measures the
+  clock offset, pings Redis, checks that the journal is writable and
+  somewhere a reboot won't clear, reports queued and refused usage, and
+  explains how a given API key would be treated.
+- `MicroAuth()` and the commands fall back to a `.env` file in the working
+  directory for `MICROAUTH_*` settings that are not set in the environment.
+  Real environment variables still win, and other entries in the file are
+  ignored.
+
+### Other changes
+
+- A customer status the SDK doesn't know denies that customer with `403`.
+  Before, one such customer made the whole snapshot fail validation.
+- The usage reporter understands the per item `retry` status: the item stays
+  queued and ships with the next delivery.
 - Keys resolved on demand are added to a copy of the snapshot, so a
   published snapshot is never changed under a concurrent refresh.
 - The Redis pool built from `redis_url` is bounded (`redis_max_connections`,
   default 64) and waits up to one second for a free connection. Requires
   `redis>=5.0.1`.
 - Queued usage keeps one shared copy of repeated attachment strings and
-  skips a JSON round trip per request, which cuts memory during long control
-  plane outages.
-- Snapshots are revalidated with `If-None-Match`; a `304` reuses the
-  previous body with the new generation time.
-- Every API call sends `User-Agent: microauth-fastapi/<version>`, which lets
-  the dashboard show which SDK version is connected.
-- New `python -m microauth_fastapi check [--key ...]` command that verifies
-  the secret, snapshot, Redis and journal, names the API the secret belongs
-  to, and explains how a given API key would be treated.
-- `MicroAuth()` and the check command fall back to a `.env` file in the
-  working directory for `MICROAUTH_*` settings that are not set in the
-  environment. Real environment variables still win, and other entries in
-  the file are ignored.
-- **Python 3.10 fix.** Timestamps with any number of fractional digits
-  (the API emits up to nine) now parse on every supported Python. Before,
-  Python 3.10 rejected most snapshots as invalid.
+  skips a JSON round trip per request, which cuts memory during long
+  outages.
+- Snapshots are revalidated with `If-None-Match`, and a `304` reuses the
+  previous body.
+- Every API call sends `User-Agent: microauth-fastapi/<version>
+  python/<version>`, which lets the dashboard show which SDK version is
+  connected.
+- Timestamps with any number of fractional digits now parse on every
+  supported Python. Before, Python 3.10 rejected most snapshots as invalid.
+- CI runs the Redis scripts against a real Redis on Python 3.10 to 3.14, and
+  the release workflow runs the same suite and the format check before it
+  publishes.
 
 ## 2.8.1
 

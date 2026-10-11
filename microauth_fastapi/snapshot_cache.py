@@ -1,8 +1,8 @@
 """Redis-backed snapshot sharing and refresh coordination.
 
-Envelope v2 hardening:
+Envelope hardening:
 
-* Cache keys and the envelope scope are credential-bound, so a revoked tenant
+* Cache keys and the envelope scope are credential-bound, so a revoked SDK
   secret can never inherit snapshots validated by a different credential.
 * Publications carry a monotonic fencing token issued with the refresh lock;
   an expired leader cannot overwrite a newer owner's snapshot, and an older
@@ -31,11 +31,11 @@ from .exceptions import MicroAuthResponseError, SnapshotCacheError
 # Lua script markers and this envelope). Bump them together; readers reject
 # other versions and the refresh leader republishes, so no compatibility
 # shims are carried.
-_CACHE_VERSION = 3
+_CACHE_VERSION = 4
 _MAX_ENVELOPE_BYTES = 8 << 20  # 8 MiB guards decode cost, not correctness.
 
 _RELEASE_LOCK_SCRIPT = """
-local marker = "microauth-snapshot-release-v3"
+local marker = "microauth-snapshot-release-v4"
 if redis.call("GET", KEYS[1]) == ARGV[1] then
     return redis.call("DEL", KEYS[1])
 end
@@ -43,7 +43,7 @@ return 0
 """
 
 _ACQUIRE_LOCK_SCRIPT = """
-local marker = "microauth-snapshot-acquire-v3"
+local marker = "microauth-snapshot-acquire-v4"
 if redis.call("SET", KEYS[1], ARGV[1], "NX", "PX", ARGV[2]) then
     return redis.call("INCR", KEYS[2])
 end
@@ -51,7 +51,7 @@ return 0
 """
 
 _STORE_IF_OWNER_SCRIPT = """
-local marker = "microauth-snapshot-store-v3"
+local marker = "microauth-snapshot-store-v4"
 if redis.call("GET", KEYS[2]) ~= ARGV[1] then
     return 0
 end
@@ -71,7 +71,7 @@ return 1
 """
 
 _EXTEND_LOCK_SCRIPT = """
-local marker = "microauth-snapshot-extend-v3"
+local marker = "microauth-snapshot-extend-v4"
 if redis.call("GET", KEYS[1]) == ARGV[1] then
     return redis.call("PEXPIRE", KEYS[1], ARGV[2])
 end
@@ -79,7 +79,7 @@ return 0
 """
 
 _DISCARD_EXACT_SCRIPT = """
-local marker = "microauth-snapshot-discard-v3"
+local marker = "microauth-snapshot-discard-v4"
 if redis.call("GET", KEYS[1]) == ARGV[1] then
     return redis.call("DEL", KEYS[1])
 end
@@ -148,23 +148,15 @@ class RedisSnapshotCache:
                     "shared snapshot cache contains invalid UTF-8"
                 ) from exc
         if not isinstance(raw, str):
-            raise MicroAuthResponseError(
-                "shared snapshot cache returned an unsupported value"
-            )
+            raise MicroAuthResponseError("shared snapshot cache returned an unsupported value")
         if len(raw) > _MAX_ENVELOPE_BYTES:
-            raise MicroAuthResponseError(
-                "shared snapshot cache entry exceeds the supported size"
-            )
+            raise MicroAuthResponseError("shared snapshot cache entry exceeds the supported size")
         try:
             envelope = json.loads(raw)
         except (TypeError, ValueError) as exc:
-            raise MicroAuthResponseError(
-                "shared snapshot cache contains invalid JSON"
-            ) from exc
+            raise MicroAuthResponseError("shared snapshot cache contains invalid JSON") from exc
         if not isinstance(envelope, dict) or envelope.get("version") != _CACHE_VERSION:
-            raise MicroAuthResponseError(
-                "shared snapshot cache has an unsupported format"
-            )
+            raise MicroAuthResponseError("shared snapshot cache has an unsupported format")
         if envelope.get("scope") != self._scope:
             raise MicroAuthResponseError(
                 "shared snapshot cache entry belongs to a different credential scope"
@@ -185,9 +177,7 @@ class RedisSnapshotCache:
         ):
             raise MicroAuthResponseError("shared snapshot cache is malformed")
         if _payload_digest(payload) != digest:
-            raise MicroAuthResponseError(
-                "shared snapshot cache digest does not match its payload"
-            )
+            raise MicroAuthResponseError("shared snapshot cache digest does not match its payload")
         return CachedSnapshot(
             payload=payload,
             marker=marker,
@@ -227,9 +217,7 @@ class RedisSnapshotCache:
                 sort_keys=True,
             )
         except (TypeError, ValueError) as exc:
-            raise MicroAuthResponseError(
-                "snapshot payload cannot be stored as JSON"
-            ) from exc
+            raise MicroAuthResponseError("snapshot payload cannot be stored as JSON") from exc
         try:
             stored = int(
                 await self._redis.eval(
@@ -270,9 +258,7 @@ class RedisSnapshotCache:
                 )
             )
         except Exception as exc:
-            raise SnapshotCacheError(
-                "could not acquire the shared snapshot refresh lock"
-            ) from exc
+            raise SnapshotCacheError("could not acquire the shared snapshot refresh lock") from exc
         if fence <= 0:
             return None
         return SnapshotLease(token=token, fence=fence)
@@ -286,9 +272,7 @@ class RedisSnapshotCache:
                 lease.token,
             )
         except Exception as exc:
-            raise SnapshotCacheError(
-                "could not release the shared snapshot refresh lock"
-            ) from exc
+            raise SnapshotCacheError("could not release the shared snapshot refresh lock") from exc
 
     async def maintain_refresh_lock(self, lease: SnapshotLease) -> None:
         """Renew a held lease until cancelled or ownership is lost."""
@@ -340,9 +324,7 @@ class RedisSnapshotCache:
                 compare,
             )
         except Exception as exc:
-            raise SnapshotCacheError(
-                "could not discard a corrupt shared snapshot"
-            ) from exc
+            raise SnapshotCacheError("could not discard a corrupt shared snapshot") from exc
         return bool(int(removed))
 
     async def wait_for_update(

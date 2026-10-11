@@ -7,6 +7,17 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    env:
+      MICROAUTH_TEST_REDIS_URL: redis://localhost:6379/15
     steps:
       - uses: actions/checkout@v4
 
@@ -28,6 +39,7 @@ jobs:
           python -m pip install --disable-pip-version-check -e ".[dev,redis]"
           python -m pytest
           python -m ruff check .
+          python -m ruff format --check .
           python -m mypy microauth_fastapi
           python -m pip_audit
 

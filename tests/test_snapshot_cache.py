@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Security
+from support import SECRET
 from test_sdk import API_KEY, ControlPlane, snapshot_payload
 
 from microauth_fastapi import Customer, MicroAuth
@@ -31,14 +32,14 @@ class FakeSnapshotRedis:
     ) -> int:
         keys = [str(value) for value in values[:number_of_keys]]
         args = list(values[number_of_keys:])
-        if "microauth-snapshot-acquire-v3" in script:
+        if "microauth-snapshot-acquire-v4" in script:
             lock_key, fence_key = keys
             if lock_key in self.values:
                 return 0
             self.values[lock_key] = str(args[0])
             self.counters[fence_key] = self.counters.get(fence_key, 0) + 1
             return self.counters[fence_key]
-        if "microauth-snapshot-store-v3" in script:
+        if "microauth-snapshot-store-v4" in script:
             data_key, lock_key, meta_key = keys
             token, encoded, _ttl, fence, generated, force = args
             if self.values.get(lock_key) != str(token):
@@ -52,25 +53,23 @@ class FakeSnapshotRedis:
             meta["fence"] = str(fence)
             meta["generated"] = str(generated)
             return 1
-        if "microauth-snapshot-release-v3" in script:
+        if "microauth-snapshot-release-v4" in script:
             if self.values.get(keys[0]) == str(args[0]):
                 del self.values[keys[0]]
                 return 1
             return 0
-        if "microauth-snapshot-extend-v3" in script:
+        if "microauth-snapshot-extend-v4" in script:
             return 1 if self.values.get(keys[0]) == str(args[0]) else 0
-        if "microauth-snapshot-discard-v3" in script:
+        if "microauth-snapshot-discard-v4" in script:
             if self.values.get(keys[0]) == str(args[0]):
                 del self.values[keys[0]]
                 return 1
             return 0
         # Minimal limiter behavior so authenticated requests can flow in
         # tests that focus on snapshot coordination.
-        if "microauth-rps-v3" in script:
-            return 1
         if "microauth-request-reserve-v5" in script:
             return [0, 1_000_000, -1, 1_000_000]
-        if "microauth-request-finalize-v3" in script:
+        if "microauth-request-finalize-v4" in script:
             return 0
         if "microauth-request-acknowledge-v4" in script:
             return 1
@@ -92,13 +91,13 @@ def test_concurrent_instances_share_one_control_plane_snapshot() -> None:
     async def exercise() -> None:
         control = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         first = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
         )
         second = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
@@ -122,7 +121,7 @@ def test_fresh_shared_snapshot_avoids_a_second_cold_start_fetch() -> None:
     async def exercise() -> None:
         control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
         first = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
@@ -131,7 +130,7 @@ def test_fresh_shared_snapshot_avoids_a_second_cold_start_fetch() -> None:
         await first.aclose()
 
         second = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
@@ -157,13 +156,13 @@ def test_concurrent_cold_starts_replace_a_malformed_cached_snapshot() -> None:
     async def exercise() -> None:
         control = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         first = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
         )
         second = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
@@ -256,13 +255,13 @@ def test_semantically_invalid_cached_snapshot_is_replaced() -> None:
     async def exercise() -> None:
         control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
         first = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
         )
         second = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
@@ -304,7 +303,7 @@ def test_hydrated_snapshots_preserve_the_origin_refresh_cutoff() -> None:
     async def exercise() -> tuple[float, float]:
         control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
         publisher = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
@@ -313,7 +312,7 @@ def test_hydrated_snapshots_preserve_the_origin_refresh_cutoff() -> None:
         origin_cutoff = publisher._snapshot.refresh_started_at
 
         hydrator = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
@@ -339,23 +338,20 @@ def test_different_credentials_do_not_share_a_snapshot_cache() -> None:
     async def exercise() -> None:
         control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
         first = MicroAuth(
-            secret_key="mas_valid",
+            secret_key="mas_" + "Valid000" * 5,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
         )
         second = MicroAuth(
-            secret_key="mas_revoked",
+            secret_key="mas_" + "Revoked0" * 5,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
         )
         assert first._snapshot_cache is not None
         assert second._snapshot_cache is not None
-        assert (
-            first._snapshot_cache._cache_key
-            != second._snapshot_cache._cache_key
-        )
+        assert first._snapshot_cache._cache_key != second._snapshot_cache._cache_key
         await first.startup()
         await second.startup()
         await first.aclose()
@@ -370,12 +366,10 @@ def test_different_credentials_do_not_share_a_snapshot_cache() -> None:
 
 def test_older_cached_data_cannot_replace_a_newer_local_snapshot() -> None:
     async def exercise() -> None:
-        auth = MicroAuth(secret_key="mas_test", persist_usage=False)
+        auth = MicroAuth(secret_key=SECRET, persist_usage=False)
         now = datetime.now(timezone.utc)
         newer = _parse_snapshot(snapshot_payload(generated_at=now))
-        older = _parse_snapshot(
-            snapshot_payload(generated_at=now - timedelta(seconds=60))
-        )
+        older = _parse_snapshot(snapshot_payload(generated_at=now - timedelta(seconds=60)))
         await auth._apply_snapshot(newer)
         await auth._apply_snapshot(older)
         assert auth._snapshot.generated_at == newer.generated_at
@@ -386,7 +380,7 @@ def test_older_cached_data_cannot_replace_a_newer_local_snapshot() -> None:
 
 def test_cached_data_cannot_clear_an_authoritative_credential_rejection() -> None:
     async def exercise() -> None:
-        auth = MicroAuth(secret_key="mas_test", persist_usage=False)
+        auth = MicroAuth(secret_key=SECRET, persist_usage=False)
         auth._invalidate_authorization()
         await auth._apply_snapshot(_parse_snapshot(snapshot_payload()))
         assert auth._authorization_invalid is True
@@ -407,7 +401,7 @@ def test_frozen_worker_recovers_from_the_shared_cache_on_request() -> None:
     async def exercise() -> None:
         control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
         publisher = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
@@ -418,7 +412,7 @@ def test_frozen_worker_recovers_from_the_shared_cache_on_request() -> None:
         app = FastAPI()
         frozen = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             redis_client=redis,
             persist_usage=False,
@@ -464,7 +458,7 @@ def test_all_cold_followers_wait_for_recovery_after_a_dead_owner() -> None:
         control = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         workers = [
             MicroAuth(
-                secret_key="mas_test",
+                secret_key=SECRET,
                 http_client=control,
                 redis_client=redis,
                 persist_usage=False,

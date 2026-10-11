@@ -5,10 +5,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from support import Reporter
 from test_reporter import ScriptedClient, acknowledge
 
 from microauth_fastapi.exceptions import UsageQueueFull
-from microauth_fastapi.reporter import UsageReporter
 from microauth_fastapi.usage_store import RedisUsageStore
 
 API_KEY_ID = "11111111-1111-4111-8111-111111111111"
@@ -36,10 +36,14 @@ class FakeUsageRedis:
     async def hlen(self, key: str) -> int:
         return len(self.hashes.get(key, {}))
 
+    async def hscan_iter(self, key: str, count: int = 100) -> Any:
+        for field, value in list(self.hashes.get(key, {}).items()):
+            yield field, value
+
     async def eval(self, script: str, number_of_keys: int, *values: Any) -> Any:
         if self.fail:
             raise OSError("redis down")
-        if "microauth-usage-upsert-v3" in script and self.ambiguous_upserts > 0:
+        if "microauth-usage-upsert-v4" in script and self.ambiguous_upserts > 0:
             # Simulate "executed but the reply was lost": the mutation lands,
             # the caller sees a transport error.
             self.ambiguous_upserts -= 1
@@ -47,7 +51,7 @@ class FakeUsageRedis:
             raise OSError("reply lost after execution")
         keys = [str(value) for value in values[:number_of_keys]]
         args = list(values[number_of_keys:])
-        if "microauth-usage-upsert-v3" in script:
+        if "microauth-usage-upsert-v4" in script:
             events, ready, leases, owners, counts, att, tok = keys
             (
                 event_id,
@@ -79,9 +83,7 @@ class FakeUsageRedis:
                 count_table[event_id] = str(count + 1)
                 if str(attachment):
                     self.lists.setdefault(att, []).append(str(attachment))
-                self.zsets.setdefault(leases, {})[event_id] = (
-                    self.now_ms + int(lease_ms)
-                )
+                self.zsets.setdefault(leases, {})[event_id] = self.now_ms + int(lease_ms)
                 return 2
             if not int(allow_create):
                 return -1
@@ -93,12 +95,10 @@ class FakeUsageRedis:
             if str(attachment):
                 self.lists.setdefault(att, []).append(str(attachment))
             self.zsets.setdefault(ready, {}).pop(event_id, None)
-            self.zsets.setdefault(leases, {})[event_id] = (
-                self.now_ms + int(lease_ms)
-            )
+            self.zsets.setdefault(leases, {})[event_id] = self.now_ms + int(lease_ms)
             owner_table[event_id] = str(owner)
             return 1
-        if "microauth-usage-claim-v3" in script:
+        if "microauth-usage-claim-v4" in script:
             events, ready, leases, owners, counts = keys
             owner, limit, lease_ms, _ttl, att_prefix = args
             lease_table = self.zsets.setdefault(leases, {})
@@ -107,9 +107,7 @@ class FakeUsageRedis:
             event_table = self.hashes.setdefault(events, {})
             count_table = self.hashes.setdefault(counts, {})
             expired = sorted(
-                event_id
-                for event_id, deadline in lease_table.items()
-                if deadline <= self.now_ms
+                event_id for event_id, deadline in lease_table.items() if deadline <= self.now_ms
             )[: int(limit)]
             for event_id in expired:
                 del lease_table[event_id]
@@ -117,9 +115,7 @@ class FakeUsageRedis:
                 if event_id in event_table:
                     ready_table[event_id] = self.now_ms
             due = sorted(
-                event_id
-                for event_id, score in ready_table.items()
-                if score <= self.now_ms
+                event_id for event_id, score in ready_table.items() if score <= self.now_ms
             )[: int(limit)]
             claimed: list[str] = []
             for event_id in due:
@@ -133,13 +129,11 @@ class FakeUsageRedis:
                             event_id,
                             static,
                             count_table.get(event_id, "1"),
-                            "\n".join(
-                                self.lists.get(str(att_prefix) + event_id, [])
-                            ),
+                            "\n".join(self.lists.get(str(att_prefix) + event_id, [])),
                         ]
                     )
             return claimed
-        if "microauth-usage-ack-v3" in script:
+        if "microauth-usage-ack-v4" in script:
             events, ready, leases, owners, counts = keys
             owner, _ttl, att_prefix, tok_prefix, *event_ids = args
             removed = 0
@@ -154,7 +148,7 @@ class FakeUsageRedis:
                     self.sets.pop(str(tok_prefix) + event_id, None)
                     removed += 1
             return removed
-        if "microauth-usage-release-v3" in script:
+        if "microauth-usage-release-v4" in script:
             events, ready, leases, owners = keys
             owner, delay_ms, _ttl, *event_ids = args
             released = 0
@@ -163,23 +157,19 @@ class FakeUsageRedis:
                     self.hashes.get(owners, {}).pop(event_id, None)
                     self.zsets.get(leases, {}).pop(event_id, None)
                     if event_id in self.hashes.get(events, {}):
-                        self.zsets.setdefault(ready, {})[event_id] = (
-                            self.now_ms + int(delay_ms)
-                        )
+                        self.zsets.setdefault(ready, {})[event_id] = self.now_ms + int(delay_ms)
                     released += 1
             return released
-        if "microauth-usage-extend-v3" in script:
+        if "microauth-usage-extend-v4" in script:
             leases, owners = keys
             owner, lease_ms, _ttl, *event_ids = args
             extended = 0
             for event_id in map(str, event_ids):
                 if self.hashes.get(owners, {}).get(event_id) == str(owner):
-                    self.zsets.setdefault(leases, {})[event_id] = (
-                        self.now_ms + int(lease_ms)
-                    )
+                    self.zsets.setdefault(leases, {})[event_id] = self.now_ms + int(lease_ms)
                     extended += 1
             return extended
-        if "microauth-usage-dead-letter-v3" in script:
+        if "microauth-usage-dead-letter-v4" in script:
             events, ready, leases, owners, counts, dead = keys
             owner, event_id, record, _ttl, att_prefix, tok_prefix = args
             event_id = str(event_id)
@@ -270,9 +260,7 @@ def test_merges_are_o1_and_reassemble_into_one_counted_event() -> None:
         event_id, payload = claimed[0]
         assert event_id == "event-1"
         assert payload["item"]["count"] == 4
-        assert payload["attachments"] == [
-            attachment_for("event-1", index) for index in range(4)
-        ]
+        assert payload["attachments"] == [attachment_for("event-1", index) for index in range(4)]
 
     run(exercise())
 
@@ -420,7 +408,7 @@ def test_reporter_records_durably_and_acks_after_delivery() -> None:
     redis = FakeUsageRedis()
     store = make_store(redis)
     client = ScriptedClient([acknowledge])
-    reporter = UsageReporter(client, 60, spool_path=None, store=store)
+    reporter = Reporter(client, 60, store=store)
 
     async def exercise() -> None:
         event_id = await reporter.record(API_KEY_ID, 200)
@@ -438,10 +426,9 @@ def test_second_reporter_recovers_a_dead_workers_events() -> None:
     redis = FakeUsageRedis()
     dead_store = make_store(redis, lease_ms=1_000)
     dead_client = ScriptedClient([])
-    dead_reporter = UsageReporter(
+    dead_reporter = Reporter(
         dead_client,
         60,
-        spool_path=None,
         store=dead_store,
     )
 
@@ -452,10 +439,9 @@ def test_second_reporter_recovers_a_dead_workers_events() -> None:
     async def on_restored(attachments: list[dict[str, Any]]) -> None:
         restored.extend(attachments)
 
-    survivor = UsageReporter(
+    survivor = Reporter(
         survivor_client,
         60,
-        spool_path=None,
         store=survivor_store,
         on_restored=on_restored,
     )
@@ -484,10 +470,9 @@ def test_shutdown_hands_undelivered_events_back_to_the_queue() -> None:
     from microauth_fastapi.exceptions import MicroAuthAPIError
 
     failing_client = ScriptedClient([MicroAuthAPIError(503, "down")])
-    reporter = UsageReporter(
+    reporter = Reporter(
         failing_client,
         60,
-        spool_path=None,
         store=store,
     )
 
@@ -500,10 +485,9 @@ def test_shutdown_hands_undelivered_events_back_to_the_queue() -> None:
         assert await store.pending_count() == 1
 
         rescuer_client = ScriptedClient([acknowledge])
-        rescuer = UsageReporter(
+        rescuer = Reporter(
             rescuer_client,
             60,
-            spool_path=None,
             store=make_store(redis),
         )
         await rescuer.start()
@@ -523,10 +507,9 @@ def test_events_past_the_45_day_age_limit_are_dead_lettered() -> None:
     async def on_rejected(attachments: list[dict[str, Any]]) -> None:
         rejected.extend(attachments)
 
-    reporter = UsageReporter(
+    reporter = Reporter(
         client,
         60,
-        spool_path=None,
         store=store,
         on_rejected=on_rejected,
     )
@@ -584,26 +567,25 @@ def test_ambiguous_merge_timeout_is_deduplicated_on_retry() -> None:
 def test_live_journals_are_not_stolen_and_theft_triggers_a_resnapshot(
     tmp_path: Any,
 ) -> None:
-    spool = tmp_path / "shared.sqlite3"
 
     async def exercise() -> None:
-        worker_a = UsageReporter(ScriptedClient([acknowledge]), 60, spool_path=spool)
+        worker_a = Reporter(ScriptedClient([acknowledge]), 60, journal_dir=tmp_path)
         event_id = await worker_a.record(API_KEY_ID, 200)
         await worker_a.record(API_KEY_ID, 200)
         assert worker_a.pending_requests == 2
 
         # A restarting worker must not adopt a live worker's fresh journal.
-        bystander = UsageReporter(ScriptedClient([]), 60, spool_path=spool)
+        bystander = Reporter(ScriptedClient([]), 60, journal_dir=tmp_path)
         await bystander.start()
         assert bystander.pending_items == 0
 
         # A worker recovering after the grace period adopts the file whole
         # (atomic rename), taking a copy of the event with both requests.
-        thief = UsageReporter(
+        thief = Reporter(
             ScriptedClient([]),
             60,
-            spool_path=spool,
-            spool_claim_grace=0,
+            journal_dir=tmp_path,
+            journal_claim_grace=0,
         )
         await thief.start()
         assert thief.pending_items == 1
@@ -630,7 +612,6 @@ def test_one_transient_journal_failure_does_not_poison_the_reporter(
 ) -> None:
     from microauth_fastapi.journal import WalJournal
 
-    spool = tmp_path / "usage.sqlite3"
     real_apply = WalJournal.apply
     failures = {"remaining": 1}
 
@@ -641,7 +622,7 @@ def test_one_transient_journal_failure_does_not_poison_the_reporter(
         return real_apply(self, *args, **kwargs)
 
     monkeypatch.setattr(WalJournal, "apply", flaky_apply)
-    reporter = UsageReporter(ScriptedClient([acknowledge]), 60, spool_path=spool)
+    reporter = Reporter(ScriptedClient([acknowledge]), 60, journal_dir=tmp_path)
 
     async def exercise() -> None:
         from microauth_fastapi.exceptions import UsageStoreError
@@ -662,11 +643,48 @@ def test_one_transient_journal_failure_does_not_poison_the_reporter(
     run(exercise())
 
 
+def test_redis_dead_letters_keep_the_reason_the_status_and_the_event() -> None:
+    redis = FakeUsageRedis()
+    store = make_store(redis)
+
+    def refuse(items: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "results": [
+                {
+                    "idempotency_key": items[0]["idempotency_key"],
+                    "status": "rejected",
+                    "http_status": 422,
+                    "detail": "period_start is outside the usage policy's validity",
+                }
+            ]
+        }
+
+    reporter = Reporter(ScriptedClient([refuse]), 60, store=store)
+
+    async def exercise() -> None:
+        event_id = await reporter.record(API_KEY_ID, 200, unit_charge_micro=40)
+        await reporter.flush()
+        assert reporter.pending_items == 0
+        assert await store.pending_count() == 0
+        assert await store.dead_letter_count() == 1
+        ((dead_id, record),) = await store.dead_letters()
+        assert dead_id == event_id
+        assert record["http_status"] == 422
+        assert record["detail"] == "period_start is outside the usage policy's validity"
+        assert record["rejected_at"].endswith("Z")
+        assert record["event"]["item"]["unit_charge_micro"] == 40
+        assert await store.dead_letters(limit=0) == []
+
+    run(exercise())
+    stats = reporter.stats()
+    assert (stats.rejected_items, stats.rejected_requests) == (1, 1)
+
+
 def test_redis_outage_at_record_degrades_without_losing_the_request() -> None:
     redis = FakeUsageRedis()
     store = make_store(redis)
     client = ScriptedClient([acknowledge])
-    reporter = UsageReporter(client, 60, spool_path=None, store=store)
+    reporter = Reporter(client, 60, store=store)
 
     async def exercise() -> None:
         redis.fail = True

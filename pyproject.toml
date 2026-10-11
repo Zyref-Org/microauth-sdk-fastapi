@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "microauth-fastapi"
-version = "2.9.0"
-description = "MicroAuth SDK for FastAPI - API key auth, rate limiting and metered billing in one dependency"
+version = "3.0.0"
+description = "MicroAuth SDK for FastAPI: API key auth, rate limiting and metered billing with a receipt for every charge"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -16,7 +16,13 @@ classifiers = [
     "Framework :: FastAPI",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Internet :: WWW/HTTP",
+    "Typing :: Typed",
 ]
 dependencies = [
     "fastapi>=0.141.1",
@@ -29,7 +35,10 @@ dev = ["build", "mypy", "pip-audit", "pytest", "ruff"]
 
 [project.urls]
 Homepage = "https://microauth.com"
+Documentation = "https://microauth.com/docs/fastapi"
+Changelog = "https://github.com/Zyref-Org/microauth-sdk-fastapi/blob/main/CHANGELOG.md"
 Repository = "https://github.com/Zyref-Org/microauth-sdk-fastapi"
+Issues = "https://github.com/Zyref-Org/microauth-sdk-fastapi/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["microauth_fastapi"]

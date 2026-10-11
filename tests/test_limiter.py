@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from support import POLICY_ID, POLICY_VALID_UNTIL
 
 from microauth_fastapi.exceptions import LimitBackendUnavailable
 from microauth_fastapi.limiter import (
@@ -37,6 +38,7 @@ def make_snapshot(
     price: int = 10,
     generated_at: datetime | None = None,
     refresh_started_at: float | None = None,
+    balance_seq: int = 0,
 ) -> tuple[Snapshot, CustomerState]:
     generated_at = generated_at or datetime.now(timezone.utc)
     period_end = datetime(
@@ -57,6 +59,9 @@ def make_snapshot(
             billing_model="payg",
             source="plan",
         ),
+        usage_policy_id=POLICY_ID,
+        policy_valid_until=POLICY_VALID_UNTIL,
+        balance_seq=balance_seq,
     )
     snapshot = Snapshot(
         customers={customer.id: customer},
@@ -70,9 +75,7 @@ def make_snapshot(
         generated_at=generated_at,
         fetched_at=1.0,
         refresh_started_at=(
-            generated_at.timestamp()
-            if refresh_started_at is None
-            else refresh_started_at
+            generated_at.timestamp() if refresh_started_at is None else refresh_started_at
         ),
     )
     return snapshot, customer
@@ -101,13 +104,9 @@ class FakeRedis:
         self.calls.append((script, keys, args))
         if self.fail:
             raise OSError("redis down")
-        if "microauth-rps-v3" in script:
-            key = keys[0]
-            self.rps[key] = self.rps.get(key, 0) + 1
-            return self.rps[key]
         if "microauth-request-reserve-v5" in script:
             return self._reserve(keys, args)
-        if "microauth-request-finalize-v3" in script:
+        if "microauth-request-finalize-v4" in script:
             return self._finalize(keys, args)
         if "microauth-request-acknowledge-v4" in script:
             return self._acknowledge(keys, args)
@@ -175,17 +174,9 @@ class FakeRedis:
         reason = 0
         if enforce_quota and quota_limit >= 0 and quota["count"] >= quota_limit:
             reason = 2
-        elif (
-            enforce_balance
-            and spend
-            and balance["balance"] - balance["reserved"] < spend
-        ):
+        elif enforce_balance and spend and balance["balance"] - balance["reserved"] < spend:
             reason = 1
-        elif (
-            enforce_platform
-            and hard_cap
-            and platform["count"] >= platform_limit
-        ):
+        elif enforce_platform and hard_cap and platform["count"] >= platform_limit:
             reason = 3
         elif (
             quota["count"] >= maximum
@@ -199,9 +190,7 @@ class FakeRedis:
             platform["count"] += 1
             balance["reserved"] += spend
             reservations[token] = spend
-        quota_remaining = (
-            -1 if quota_limit < 0 else max(0, quota_limit - quota["count"])
-        )
+        quota_remaining = -1 if quota_limit < 0 else max(0, quota_limit - quota["count"])
         return [
             reason,
             max(0, balance["balance"] - balance["reserved"]),
@@ -308,30 +297,49 @@ class FakeRedis:
         self.closed = True
 
 
-def test_memory_rps_uses_same_fixed_window_semantics_as_redis(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_memory_rps_is_a_fixed_one_second_window_per_credential() -> None:
+    now = 1000.25
+    limiter = MemoryLimiter(time_fn=lambda: now)
+    snapshot, customer = make_snapshot(quota=None, balance=1_000, price=0)
+
+    async def admit(token: str, credential: str) -> str:
+        try:
+            await limiter.reserve_request(
+                "tenant",
+                customer,
+                snapshot,
+                token,
+                potential_spend_micro=0,
+                enforce_balance=False,
+                enforce_quota=False,
+                enforce_platform=True,
+                rps=1,
+                credential_id=credential,
+            )
+        except ReservationDenied as exc:
+            return exc.reason
+        return "accepted"
+
+    async def exercise() -> list[str]:
+        nonlocal now
+        outcomes = [
+            await admit("a1", "key-a"),
+            await admit("a2", "key-a"),
+            await admit("b1", "key-b"),
+        ]
+        now = 1001.0
+        outcomes.append(await admit("a3", "key-a"))
+        return outcomes
+
+    from microauth_fastapi.limiter import DENIED_RPS
+
+    assert run(exercise()) == ["accepted", DENIED_RPS, "accepted", "accepted"]
+
+
+def test_memory_reserve_enforces_rps_inside_the_same_admission_decision() -> None:
     import microauth_fastapi.limiter as limiter_module
 
-    monkeypatch.setattr(limiter_module.time, "time", lambda: 1000.25)
-    limiter = MemoryLimiter()
-
-    async def exercise() -> tuple[bool, bool, bool]:
-        first = await limiter.allow("customer", "key-a", 1)
-        second = await limiter.allow("customer", "key-a", 1)
-        other_key = await limiter.allow("customer", "key-b", 1)
-        return first, second, other_key
-
-    assert run(exercise()) == (True, False, True)
-
-
-def test_memory_reserve_enforces_rps_inside_the_same_admission_decision(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import microauth_fastapi.limiter as limiter_module
-
-    monkeypatch.setattr(limiter_module.time, "time", lambda: 1000.25)
-    limiter = MemoryLimiter()
+    limiter = MemoryLimiter(time_fn=lambda: 1000.25)
     snapshot, customer = make_snapshot(quota=100, balance=1_000, price=1)
 
     async def exercise() -> str:
@@ -545,12 +553,14 @@ def test_acknowledged_spend_reconciles_only_after_later_snapshot() -> None:
             )
         assert caught.value.reason == DENIED_BALANCE
 
+        # MicroAuth bumps balance_seq with every committed balance change.
         refreshed, refreshed_customer = make_snapshot(
             balance=20,
             price=10,
             quota=10,
             generated_at=first_snapshot.generated_at + timedelta(seconds=1),  # type: ignore[operator]
             refresh_started_at=time_now() + 1,
+            balance_seq=1,
         )
         await limiter.sync_snapshot("tenant", refreshed)
         assert (
@@ -584,17 +594,13 @@ def test_acknowledgements_are_batched_per_customer_and_credential() -> None:
             "spend_micro": 10,
         }
 
-    attachments = [
-        attachment(f"token-{index}", "customer-a") for index in range(500)
-    ] + [attachment(f"other-{index}", "customer-b") for index in range(500)]
+    attachments = [attachment(f"token-{index}", "customer-a") for index in range(500)] + [
+        attachment(f"other-{index}", "customer-b") for index in range(500)
+    ]
 
     run(limiter.acknowledge(attachments))
 
-    ack_calls = [
-        call
-        for call in redis.calls
-        if "microauth-request-acknowledge-v4" in call[0]
-    ]
+    ack_calls = [call for call in redis.calls if "microauth-request-acknowledge-v4" in call[0]]
     # One round trip per customer/credential pair, not one per event.
     assert len(ack_calls) == 2
     assert {len(call[2]) - 4 for call in ack_calls} == {500}
@@ -641,9 +647,7 @@ def test_redis_reservation_is_shared_across_instances() -> None:
         assert caught.value.reason == DENIED_QUOTA
 
     run(exercise())
-    reserve_calls = [
-        call for call in redis.calls if "microauth-request-reserve-v5" in call[0]
-    ]
+    reserve_calls = [call for call in redis.calls if "microauth-request-reserve-v5" in call[0]]
     assert len({call[1][0] for call in reserve_calls}) == 1
     assert all("{" in key and "}" in key for key in reserve_calls[0][1])
 
@@ -707,9 +711,7 @@ def test_redis_restore_is_idempotent_and_ttl_exceeds_31_days() -> None:
         await limiter.restore([attachment], snapshot)
 
     run(exercise())
-    restore_calls = [
-        call for call in redis.calls if "microauth-request-restore-v4" in call[0]
-    ]
+    restore_calls = [call for call in redis.calls if "microauth-request-restore-v4" in call[0]]
     assert restore_calls
     ttl_ms = int(restore_calls[0][2][-2])
     assert ttl_ms > 31 * 24 * 60 * 60 * 1000
@@ -734,14 +736,6 @@ def test_redis_limits_fail_closed_when_backend_is_down() -> None:
                 enforce_platform=True,
             )
         )
-
-
-def test_redis_rps_fails_open_during_short_outage() -> None:
-    redis = FakeRedis()
-    redis.fail = True
-    limiter = RedisLimiter(redis_client=redis)
-    assert run(limiter.allow("customer", "key", 1)) is True
-    assert run(limiter.allow("customer", "key", 1)) is True
 
 
 def test_external_redis_is_not_closed() -> None:

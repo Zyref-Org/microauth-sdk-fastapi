@@ -1,31 +1,44 @@
 {
-  "accepted": 1,
+  "accepted": 2,
   "results": [
     {
-      "idempotency_key": "req_01J4FY9N8NCE4Q4M7FZT2QY6K3",
-      "status": "accepted"
+      "idempotency_key": "0d5c8a1e-3b7f-4e29-a6d4-1f8b2c9e7a30",
+      "status": "accepted",
+      "customer_id": "2b7c1f8e-5d34-4a9b-8c21-6e0f3d9a7b55",
+      "charged_micro": 42000,
+      "recorded_at": "2026-10-11T09:30:05.25Z"
     },
     {
-      "idempotency_key": "req_01J4FY9N8NCE4Q4M7FZT2QY6K4",
-      "status": "duplicate"
+      "idempotency_key": "1e6d9b2f-4c80-4f3a-b7e5-2a9c3d0f8b41",
+      "status": "accepted",
+      "customer_id": "2b7c1f8e-5d34-4a9b-8c21-6e0f3d9a7b55",
+      "charged_micro": 0,
+      "recorded_at": "2026-10-11T09:30:05.25Z"
     },
     {
-      "idempotency_key": "req_01J4FY9N8NCE4Q4M7FZT2QY6K5",
+      "idempotency_key": "2f7e0c3a-5d91-4a4b-8cf6-3b0d4e1a9c52",
+      "status": "duplicate",
+      "customer_id": "2b7c1f8e-5d34-4a9b-8c21-6e0f3d9a7b55",
+      "charged_micro": 42000,
+      "recorded_at": "2026-10-11T09:29:58.004Z"
+    },
+    {
+      "idempotency_key": "3a8f1d4b-6ea2-4b5c-9d07-4c1e5f2b0d63",
       "status": "rejected",
-      "http_status": 402,
-      "detail": "insufficient credit balance"
+      "http_status": 422,
+      "detail": "period_start is outside the usage policy's validity"
     },
     {
-      "idempotency_key": "req_01J4FY9N8NCE4Q4M7FZT2QY6K6",
-      "status": "retry",
-      "http_status": 503,
-      "detail": "usage processing is temporarily unavailable"
+      "idempotency_key": "4b9a2e5c-7fb3-4c6d-ae18-5d2f6a3c1e74",
+      "status": "rejected",
+      "http_status": 409,
+      "detail": "idempotency_key was already used for a different request"
     }
   ],
   "customers": [
     {
       "id": "2b7c1f8e-5d34-4a9b-8c21-6e0f3d9a7b55",
-      "credit_balance_micro": 4997000,
+      "credit_balance_micro": 4958000,
       "balance_seq": 8
     }
   ]

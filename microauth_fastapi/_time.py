@@ -22,5 +22,5 @@ def parse_iso8601(raw: str) -> datetime:
     match = _FRACTION.search(value)
     if match is not None:
         micros = match.group(1)[:6].ljust(6, "0")
-        value = f"{value[: match.start()]}.{micros}{value[match.end():]}"
+        value = f"{value[: match.start()]}.{micros}{value[match.end() :]}"
     return datetime.fromisoformat(value)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,7 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Response, Security
+from support import SECRET, TENANT_ID
 
 from microauth_fastapi import (
     Customer,
@@ -48,7 +50,7 @@ def snapshot_payload(
     price: int = 0,
     billing_model: str = "none",
     rps: int = 0,
-    tenant_id: str | None = None,
+    tenant_id: str = TENANT_ID,
 ) -> dict[str, Any]:
     generated_at = generated_at or datetime.now(timezone.utc)
     period_end = datetime(
@@ -58,6 +60,8 @@ def snapshot_payload(
         tzinfo=timezone.utc,
     )
     payload: dict[str, Any] = {
+        "tenant_id": tenant_id,
+        "tenant_name": "Weather API",
         "generated_at": iso(generated_at),
         "billable_status_codes": [200] if statuses is None else statuses,
         "platform_monthly_limit": platform_limit,
@@ -70,6 +74,7 @@ def snapshot_payload(
                 "id": "customer-1",
                 "status": "active",
                 "credit_balance_micro": balance,
+                "balance_seq": 0,
                 "month_requests": month_requests,
                 "usage_policy_id": POLICY_ID,
                 "policy_valid_until": iso(generated_at + timedelta(hours=24)),
@@ -90,8 +95,6 @@ def snapshot_payload(
             }
         ],
     }
-    if tenant_id is not None:
-        payload["tenant_id"] = tenant_id
     return payload
 
 
@@ -120,16 +123,28 @@ class ControlPlane:
                 200,
                 json={
                     "accepted": len(body["items"]),
-                    "results": [
-                        {
-                            "idempotency_key": item["idempotency_key"],
-                            "status": "accepted",
-                        }
-                        for item in body["items"]
-                    ],
+                    "results": [self.receipt(item) for item in body["items"]],
                 },
             )
         raise AssertionError(f"unexpected control-plane path {request.url.path}")
+
+    def receipt(self, item: dict[str, Any]) -> dict[str, Any]:
+        # The platform's charging rule: count times price, for billable
+        # statuses under a priced billing model.
+        customer = self.snapshot["customers"][0]
+        effective = customer["effective"]
+        billable = (
+            item["status_code"] in self.snapshot["billable_status_codes"]
+            and effective["billing_model"] != "none"
+        )
+        price = effective["price_per_request_micro"] if billable else 0
+        return {
+            "idempotency_key": item["idempotency_key"],
+            "status": "accepted",
+            "customer_id": customer["id"],
+            "charged_micro": item["count"] * price,
+            "recorded_at": iso(datetime.now(timezone.utc)),
+        }
 
 
 def run(coroutine: Any) -> Any:
@@ -207,12 +222,12 @@ def test_every_completed_authenticated_status_is_reported() -> None:
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
         )
-        auth._snapshot = _parse_snapshot(plane.snapshot)
+        await auth._apply_snapshot(_parse_snapshot(plane.snapshot))
         auth._started = True
 
         @app.get("/custom", status_code=299)
@@ -227,12 +242,8 @@ def test_every_completed_authenticated_status_is_reported() -> None:
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as caller:
-            assert (
-                await caller.get("/custom", headers={"X-API-Key": API_KEY})
-            ).status_code == 299
-            assert (
-                await caller.get("/missing", headers={"X-API-Key": API_KEY})
-            ).status_code == 404
+            assert (await caller.get("/custom", headers={"X-API-Key": API_KEY})).status_code == 299
+            assert (await caller.get("/missing", headers={"X-API-Key": API_KEY})).status_code == 404
             spec = (await caller.get("/openapi.json")).json()
             assert spec["components"]["securitySchemes"]["APIKey"]["name"] == "X-API-Key"
 
@@ -270,12 +281,12 @@ def test_vercel_flushes_after_the_response_only_when_the_batch_is_due(
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
         )
-        auth._snapshot = _parse_snapshot(plane.snapshot)
+        await auth._apply_snapshot(_parse_snapshot(plane.snapshot))
         auth._started = True
 
         @app.get("/protected")
@@ -327,14 +338,14 @@ def test_trailing_flush_delivers_the_last_batch_without_further_traffic(
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
             report_interval=0.2,
             trailing_flush=True,
         )
-        auth._snapshot = _parse_snapshot(plane.snapshot)
+        await auth._apply_snapshot(_parse_snapshot(plane.snapshot))
         auth._started = True
 
         @app.get("/protected")
@@ -349,10 +360,7 @@ def test_trailing_flush_delivers_the_last_batch_without_further_traffic(
             base_url="http://test",
         ) as caller:
             responses = await asyncio.gather(
-                *(
-                    caller.get("/protected", headers={"X-API-Key": API_KEY})
-                    for _ in range(3)
-                )
+                *(caller.get("/protected", headers={"X-API-Key": API_KEY}) for _ in range(3))
             )
         assert [response.status_code for response in responses] == [200, 200, 200]
         # The burst was below the batch size and inside the interval, yet it
@@ -375,7 +383,7 @@ def test_trailing_flush_is_inert_off_serverless(
     monkeypatch.delenv("VERCEL", raising=False)
     monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
     auth = MicroAuth(
-        secret_key="mas_test",
+        secret_key=SECRET,
         persist_usage=False,
         trailing_flush=True,
     )
@@ -403,12 +411,12 @@ def test_nonbillable_outcomes_release_money_but_consume_quota() -> None:
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
         )
-        auth._snapshot = _parse_snapshot(plane.snapshot)
+        await auth._apply_snapshot(_parse_snapshot(plane.snapshot))
         auth._started = True
 
         @app.get("/nonbillable")
@@ -457,12 +465,12 @@ def test_nonbillable_outcome_does_not_release_platform_allowance() -> None:
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
         )
-        auth._snapshot = _parse_snapshot(plane.snapshot)
+        await auth._apply_snapshot(_parse_snapshot(plane.snapshot))
         auth._started = True
 
         @app.get("/nonbillable")
@@ -483,9 +491,7 @@ def test_nonbillable_outcome_does_not_release_platform_allowance() -> None:
             )
         assert first.status_code == 200
         assert second.status_code == 429
-        assert second.json()["detail"] == (
-            "Platform monthly request allowance exhausted"
-        )
+        assert second.json()["detail"] == ("Platform monthly request allowance exhausted")
         await auth._reporter.flush()
         await auth.aclose()
         await control.aclose()
@@ -509,12 +515,12 @@ def test_150_concurrent_requests_report_as_one_counted_item() -> None:
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
         )
-        auth._snapshot = _parse_snapshot(plane.snapshot)
+        await auth._apply_snapshot(_parse_snapshot(plane.snapshot))
         auth._started = True
 
         @app.get("/protected")
@@ -562,12 +568,12 @@ def test_concurrent_requests_cannot_oversubscribe_customer_quota() -> None:
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
         )
-        auth._snapshot = _parse_snapshot(plane.snapshot)
+        await auth._apply_snapshot(_parse_snapshot(plane.snapshot))
         auth._started = True
 
         @app.get("/protected")
@@ -617,12 +623,12 @@ def test_snapshot_refresh_preserves_unacknowledged_local_usage() -> None:
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
         )
-        auth._snapshot = _parse_snapshot(initial)
+        await auth._apply_snapshot(_parse_snapshot(initial))
         auth._started = True
 
         @app.get("/protected")
@@ -679,12 +685,12 @@ def test_authoritative_control_plane_denial_invalidates_cached_auth(status: int)
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
         )
-        auth._snapshot = _parse_snapshot(snapshot_payload())
+        await auth._apply_snapshot(_parse_snapshot(snapshot_payload()))
         auth._started = True
         with pytest.raises(MicroAuthAuthorizationError):
             await auth._refresh()
@@ -717,12 +723,12 @@ def test_transient_snapshot_outage_keeps_fresh_cached_auth() -> None:
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
         )
-        auth._snapshot = _parse_snapshot(snapshot_payload(statuses=[]))
+        await auth._apply_snapshot(_parse_snapshot(snapshot_payload(statuses=[])))
         auth._started = True
         with pytest.raises(MicroAuthAPIError):
             await auth._refresh()
@@ -761,12 +767,12 @@ def test_expired_usage_policy_refreshes_before_authorizing() -> None:
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
         )
-        auth._snapshot = _parse_snapshot(expired)
+        await auth._apply_snapshot(_parse_snapshot(expired))
         auth._started = True
 
         @app.get("/protected")
@@ -801,12 +807,12 @@ def test_expired_usage_policy_fails_closed_when_refresh_is_unavailable() -> None
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
         )
-        auth._snapshot = _parse_snapshot(expired)
+        await auth._apply_snapshot(_parse_snapshot(expired))
         auth._started = True
 
         @app.get("/protected")
@@ -842,7 +848,7 @@ def test_fail_open_has_an_absolute_stale_snapshot_bound() -> None:
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
@@ -850,7 +856,7 @@ def test_fail_open_has_an_absolute_stale_snapshot_bound() -> None:
             max_stale_snapshot_age=10,
             fail_open=True,
         )
-        auth._snapshot = _parse_snapshot(plane.snapshot)
+        await auth._apply_snapshot(_parse_snapshot(plane.snapshot))
         auth._started = True
 
         @app.get("/protected")
@@ -875,66 +881,167 @@ def test_fail_open_has_an_absolute_stale_snapshot_bound() -> None:
     assert run(request_with_age(15)) == 503
 
 
-def test_stable_tenant_identifier_survives_secret_rotation() -> None:
-    payload = snapshot_payload(tenant_id="tenant-stable-id")
+OTHER_TENANT_ID = "1a7c3e5f-9b2d-4f4a-8c6e-8d3f2b5a7c91"
 
-    async def scope(secret: str) -> str:
-        plane = ControlPlane(payload)
-        control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
-        auth = MicroAuth(
-            secret_key=secret,
-            http_client=control,
-            persist_usage=False,
+
+async def bind(
+    secret: str,
+    payload: dict[str, Any],
+    **options: Any,
+) -> tuple[MicroAuth, httpx.AsyncClient]:
+    control = httpx.AsyncClient(transport=httpx.MockTransport(ControlPlane(payload)))
+    auth = MicroAuth(secret_key=secret, http_client=control, **options)
+    await auth._refresh()
+    return auth, control
+
+
+def test_queued_usage_belongs_to_the_api_not_the_secret(tmp_path: Path) -> None:
+    async def placement(secret: str, tenant_id: str) -> tuple[str, Path | None]:
+        auth, control = await bind(
+            secret,
+            snapshot_payload(tenant_id=tenant_id),
+            journal_dir=tmp_path,
         )
-        await auth._refresh()
-        result = auth._tenant_scope
+        result = auth._tenant_scope, auth._reporter.journal_dir
         await auth.aclose()
         await control.aclose()
         return result
 
-    assert run(scope("mas_old")) == run(scope("mas_rotated"))
+    rotated = "mas_" + "Rotated0" * 5
+    original = run(placement(SECRET, TENANT_ID))
+    # Rotating the secret keeps the same journal and Redis queue, so usage
+    # queued before the rotation is still delivered after it.
+    assert run(placement(rotated, TENANT_ID)) == original
+    # Another API never shares (or adopts) this API's queued usage.
+    other = run(placement(SECRET, OTHER_TENANT_ID))
+    assert other[0] != original[0]
+    assert other[1] != original[1]
+    assert original[1] is not None and original[1].parent == tmp_path
 
 
-def test_stable_tenant_identifier_selects_same_default_journal(
+def test_journal_directory_is_labelled_with_the_api_it_belongs_to(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import microauth_fastapi.sdk as sdk_module
+    from microauth_fastapi.journal import read_api_metadata
 
-    monkeypatch.setattr(sdk_module.tempfile, "gettempdir", lambda: str(tmp_path))
-    payload = snapshot_payload(tenant_id="tenant-stable-id")
-
-    async def journal(secret: str) -> Path | None:
-        plane = ControlPlane(payload)
-        control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
-        auth = MicroAuth(
-            secret_key=secret,
-            http_client=control,
-            persist_usage=True,
-        )
-        await auth._refresh()
-        result = auth._reporter.spool_path
+    async def exercise() -> Path | None:
+        auth, control = await bind(SECRET, snapshot_payload(), journal_dir=tmp_path)
+        directory = auth._reporter.journal_dir
         await auth.aclose()
         await control.aclose()
-        return result
+        return directory
 
-    assert run(journal("mas_old")) == run(journal("mas_rotated"))
+    directory = run(exercise())
+    assert directory is not None
+    assert read_api_metadata(directory) == {
+        "base_url": "https://api.microauth.com",
+        "tenant_id": TENANT_ID,
+        "tenant_name": "Weather API",
+    }
 
 
-def test_explicit_persistence_namespace_is_stable_without_api_field() -> None:
-    first = MicroAuth(
-        secret_key="mas_old",
-        persistence_namespace="tenant-stable-id",
-        persist_usage=False,
+def test_a_snapshot_for_a_different_api_is_refused() -> None:
+    async def exercise() -> None:
+        auth, control = await bind(SECRET, snapshot_payload(), persist_usage=False)
+        assert auth.tenant_id == TENANT_ID
+        assert auth.tenant_name == "Weather API"
+        foreign = _parse_snapshot(snapshot_payload(tenant_id=OTHER_TENANT_ID))
+        with pytest.raises(SnapshotValidationError, match="different MicroAuth API"):
+            await auth._apply_snapshot(foreign)
+        # The bound API's snapshot stays in place.
+        assert auth._snapshot is not None
+        assert auth._snapshot.tenant_id == TENANT_ID
+        await auth.aclose()
+        await control.aclose()
+
+    run(exercise())
+
+
+class Lifespan:
+    """Runs an ASGI app's lifespan the way a server does."""
+
+    def __init__(self, app: Any) -> None:
+        self._app = app
+        self._inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._outbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._task: asyncio.Task[None] | None = None
+
+    async def __aenter__(self) -> None:
+        scope = {"type": "lifespan", "asgi": {"version": "3.0"}, "state": {}}
+        self._task = asyncio.create_task(self._app(scope, self._inbox.get, self._outbox.put))
+        await self._inbox.put({"type": "lifespan.startup"})
+        assert (await self._outbox.get())["type"] == "lifespan.startup.complete"
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self._inbox.put({"type": "lifespan.shutdown"})
+        assert (await self._outbox.get())["type"] == "lifespan.shutdown.complete"
+        assert self._task is not None
+        await self._task
+
+
+def test_the_sdk_is_ready_before_the_first_request(tmp_path: Path) -> None:
+    plane = ControlPlane(snapshot_payload())
+
+    async def exercise() -> None:
+        control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
+        app = FastAPI()
+        auth = MicroAuth(app, secret_key=SECRET, http_client=control, journal_dir=tmp_path)
+        async with Lifespan(app):
+            assert plane.snapshot_calls == 1
+            assert auth.tenant_id == TENANT_ID
+            assert auth.usage_stats().durability == "journal"
+        await control.aclose()
+
+    run(exercise())
+
+
+def test_a_restarted_app_recovers_a_crashed_process_usage_without_traffic(
+    tmp_path: Path,
+) -> None:
+    from microauth_fastapi.journal import JournalOp, WalJournal
+    from microauth_fastapi.sdk import _stable_scope
+
+    crashed = WalJournal(
+        tmp_path / _stable_scope("https://api.microauth.com", TENANT_ID),
+        max_items=100,
+        grace_seconds=120,
     )
-    second = MicroAuth(
-        secret_key="mas_new",
-        persistence_namespace="tenant-stable-id",
-        persist_usage=False,
-    )
-    assert first._tenant_scope == second._tenant_scope
-    run(first.aclose())
-    run(second.aclose())
+    hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    item = {
+        "idempotency_key": "crashed-0001",
+        "api_key_id": KEY_ID,
+        "usage_policy_id": POLICY_ID,
+        "status_code": 200,
+        "count": 3,
+        "period_start": iso(hour),
+    }
+    crashed.apply([JournalOp(op="create", event={"item": item, "attachments": []})], None)
+    # The process was killed ten minutes ago, with no chance to hand it back.
+    stale = time.time() - 600
+    os.utime(crashed.path, (stale, stale))
+    plane = ControlPlane(snapshot_payload())
+
+    async def exercise() -> None:
+        control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
+        app = FastAPI()
+        MicroAuth(
+            app,
+            secret_key=SECRET,
+            http_client=control,
+            journal_dir=tmp_path,
+            report_interval=0.05,
+        )
+        async with Lifespan(app):
+            for _ in range(100):
+                if plane.usage_calls:
+                    break
+                await asyncio.sleep(0.02)
+            assert plane.usage_calls, "the recovered usage waited for traffic"
+        await control.aclose()
+
+    run(exercise())
+    (call,) = plane.usage_calls
+    assert [(i["idempotency_key"], i["count"]) for i in call["items"]] == [("crashed-0001", 3)]
 
 
 def test_api_client_classifies_auth_separately_without_retry(
@@ -954,7 +1061,7 @@ def test_api_client_classifies_auth_separately_without_retry(
         external = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         client = APIClient(
             "https://api.microauth.test",
-            "mas_test",
+            SECRET,
             1,
             http_client=external,
         )
@@ -987,7 +1094,7 @@ def test_api_client_retries_transient_control_plane_statuses(
         external = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         client = APIClient(
             "https://api.microauth.test",
-            "mas_test",
+            SECRET,
             1,
             http_client=external,
         )
@@ -1010,13 +1117,11 @@ def test_external_resources_are_not_closed() -> None:
 
     async def exercise() -> None:
         external_http = httpx.AsyncClient(
-            transport=httpx.MockTransport(
-                lambda request: httpx.Response(200, json={})
-            )
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json={}))
         )
         external_redis = ExternalRedis()
         auth = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=external_http,
             redis_client=external_redis,
             persist_usage=False,
@@ -1029,33 +1134,40 @@ def test_external_resources_are_not_closed() -> None:
     run(exercise())
 
 
+@pytest.mark.parametrize(
+    "secret",
+    ["wrong", "mas_test", "mas_" + "a" * 31, "mas_" + "a" * 39 + "-", "MAS_" + "a" * 40],
+)
+def test_malformed_secrets_are_refused_before_any_request(secret: str) -> None:
+    with pytest.raises(MicroAuthConfigurationError, match="Connect tab"):
+        MicroAuth(secret_key=secret, persist_usage=False)
+
+
 def test_configuration_errors_are_typed(tmp_path: Path) -> None:
     with pytest.raises(MicroAuthConfigurationError):
-        MicroAuth(secret_key="wrong", persist_usage=False)
-    with pytest.raises(MicroAuthConfigurationError):
         MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             max_snapshot_age=10,
             max_stale_snapshot_age=5,
             persist_usage=False,
         )
-    with pytest.raises(MicroAuthConfigurationError):
-        MicroAuth(
-            secret_key="mas_test",
-            persistence_namespace="",
-            usage_spool_path=tmp_path / "usage.sqlite3",
-        )
+    not_a_directory = tmp_path / "journal"
+    not_a_directory.write_text("")
+    with pytest.raises(MicroAuthConfigurationError, match="journal"):
+        MicroAuth(secret_key=SECRET, journal_dir=not_a_directory)
+    with pytest.raises(MicroAuthConfigurationError, match="on_receipts"):
+        MicroAuth(secret_key=SECRET, persist_usage=False, on_receipts="print")  # type: ignore[arg-type]
 
 
 def test_dependency_only_use_is_rejected_without_status_middleware() -> None:
     async def exercise() -> None:
         app = FastAPI()
         auth = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             persist_usage=False,
             enforce_rps=False,
         )
-        auth._snapshot = _parse_snapshot(snapshot_payload())
+        await auth._apply_snapshot(_parse_snapshot(snapshot_payload()))
         auth._started = True
 
         @app.get("/protected")
@@ -1104,7 +1216,7 @@ def test_cancelled_finalization_releases_reservations() -> None:
 
     async def exercise() -> None:
         auth = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             persist_usage=False,
             enforce_rps=False,
         )
@@ -1177,7 +1289,7 @@ def test_journal_failure_releases_the_billable_monetary_reservation() -> None:
 
     async def exercise() -> None:
         auth = MicroAuth(
-            secret_key="mas_test",
+            secret_key=SECRET,
             persist_usage=False,
             enforce_rps=False,
         )
@@ -1427,14 +1539,25 @@ def test_cancellation_after_journaling_recovers_the_event_for_fallback() -> None
     assert flush_completed
 
 
-def test_unknown_customer_status_denies_only_that_customer() -> None:
-    other_key = "map_billing_suspended"
+@pytest.mark.parametrize(
+    ("status", "detail"),
+    [
+        ("pending", "This account is waiting for approval"),
+        ("suspended", "This account is suspended"),
+        ("closed", "This account is suspended"),
+    ],
+)
+def test_customers_that_are_not_active_are_denied_with_their_reason(
+    status: str,
+    detail: str,
+) -> None:
+    other_key = f"map_{status}_customer"
     payload = snapshot_payload()
     payload["customers"].append(
         {
             **deepcopy(payload["customers"][0]),
             "id": "customer-2",
-            "status": "billing_suspended",
+            "status": status,
         }
     )
     payload["keys"].append(
@@ -1451,12 +1574,12 @@ def test_unknown_customer_status_denies_only_that_customer() -> None:
         app = FastAPI()
         auth = MicroAuth(
             app,
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
             enforce_rps=False,
         )
-        auth._snapshot = _parse_snapshot(payload)
+        await auth._apply_snapshot(_parse_snapshot(payload))
         auth._started = True
 
         @app.get("/protected")
@@ -1471,6 +1594,7 @@ def test_unknown_customer_status_denies_only_that_customer() -> None:
             denied = await caller.get("/protected", headers={"X-API-Key": other_key})
         assert active.status_code == 200
         assert denied.status_code == 403
+        assert denied.json()["detail"] == detail
         await auth.aclose()
         await control.aclose()
 
@@ -1493,7 +1617,7 @@ def test_api_client_sends_user_agent_and_revalidates_snapshots() -> None:
 
     async def exercise() -> None:
         external = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        client = APIClient("https://api.microauth.test", "mas_test", 1, http_client=external)
+        client = APIClient("https://api.microauth.test", SECRET, 1, http_client=external)
         first = await client.snapshot()
         second = await client.snapshot()
         assert first == body
@@ -1542,13 +1666,13 @@ def test_verified_keys_never_mutate_a_published_snapshot() -> None:
         control = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         auth = MicroAuth(
             FastAPI(),
-            secret_key="mas_test",
+            secret_key=SECRET,
             http_client=control,
             persist_usage=False,
         )
         published = _parse_snapshot(payload)
         published_keys = dict(published.keys)
-        auth._snapshot = published
+        await auth._apply_snapshot(published)
         auth._started = True
 
         record = await auth._do_verify(new_hash)
