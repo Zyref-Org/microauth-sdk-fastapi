@@ -310,6 +310,7 @@ class UsageReporter:
         self._flush_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._wake = asyncio.Event()
+        self._closing = False
         self._flush_deadline: float | None = None
         self._restored = False
         self._store_error: UsageStoreError | None = None
@@ -761,6 +762,7 @@ class UsageReporter:
                 await self._ensure_restored()
                 await self._maybe_sweep()
             if self._task is None or self._task.done():
+                self._closing = False
                 self._task = asyncio.create_task(
                     self._loop(),
                     name="microauth-usage-reporter",
@@ -781,7 +783,9 @@ class UsageReporter:
         self._restored = True
 
     async def _loop(self) -> None:
-        while True:
+        # aclose() also sets _closing, so the loop ends even when code it
+        # awaits swallows the cancellation.
+        while not self._closing:
             deadline = self._flush_deadline
             if deadline is None:
                 if self._store is None and self._journal_dir is None:
@@ -791,25 +795,15 @@ class UsageReporter:
                 # Idle workers still sweep the shared queue (or the journal
                 # directory) so a dead worker's events are recovered without
                 # waiting for local traffic.
-                try:
-                    await asyncio.wait_for(
-                        self._wake.wait(),
-                        timeout=self._interval,
-                    )
-                except asyncio.TimeoutError:
-                    await self._maybe_sweep()
-                else:
+                if await _wait_event(self._wake, self._interval):
                     self._wake.clear()
+                else:
+                    await self._maybe_sweep()
                 continue
             delay = deadline - time.monotonic()
-            if delay > 0:
-                try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=delay)
-                except asyncio.TimeoutError:
-                    pass
-                else:
-                    self._wake.clear()
-                    continue
+            if delay > 0 and await _wait_event(self._wake, delay):
+                self._wake.clear()
+                continue
             await self._maybe_sweep()
             try:
                 await self.flush()
@@ -1031,6 +1025,8 @@ class UsageReporter:
         """Stop the loop and drain, or raise ``UsageDrainError`` clearly."""
 
         if self._task is not None:
+            self._closing = True
+            self._wake.set()
             self._task.cancel()
             try:
                 await self._task
@@ -2169,6 +2165,23 @@ def _event_from_store_payload(
         queued_at=queued_at,
         attachments=attachments,
     )
+
+
+async def _wait_event(event: asyncio.Event, timeout: float) -> bool:
+    """Wait up to ``timeout`` seconds for ``event`` and say whether it was set.
+
+    Not ``asyncio.wait_for``: before Python 3.12 it swallows a cancellation
+    that arrives just as the event is set.
+    """
+
+    if event.is_set():
+        return True
+    waiter = asyncio.ensure_future(event.wait())
+    try:
+        done, _ = await asyncio.wait((waiter,), timeout=timeout)
+    finally:
+        waiter.cancel()
+    return bool(done)
 
 
 def _datetime(epoch: float | None) -> datetime | None:

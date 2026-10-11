@@ -106,6 +106,10 @@ It also contains the changes prepared as 2.9.0, which was never published.
 
 ### Other changes
 
+- **Shutdown no longer hangs on Python 3.10 and 3.11.** When the usage loop
+  was woken just as the app stopped, for example by a request that finished
+  a moment earlier, `asyncio.wait_for` on those versions swallowed the
+  cancellation and left the loop running, so shutdown waited forever.
 - A customer status the SDK doesn't know denies that customer with `403`.
   Before, one such customer made the whole snapshot fail validation.
 - The usage reporter understands the per item `retry` status: the item stays

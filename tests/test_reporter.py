@@ -61,6 +61,25 @@ def run(coroutine: Any) -> Any:
     return asyncio.run(coroutine)
 
 
+def test_shutdown_stops_the_loop_when_a_wake_and_the_cancel_arrive_together() -> None:
+    async def exercise() -> None:
+        reporter = Reporter(ScriptedClient([acknowledge]), 60)
+        await reporter.start()
+        await reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        await asyncio.sleep(0.01)
+
+        async def close() -> None:
+            reporter._wake.set()
+            await reporter.aclose()
+
+        closing = asyncio.ensure_future(close())
+        done, _ = await asyncio.wait((closing,), timeout=5)
+        assert closing in done, "aclose() left the usage loop running"
+        assert reporter.pending_items == 0
+
+    run(exercise())
+
+
 def test_wire_payload_uses_canonical_names_and_stable_retry() -> None:
     client = ScriptedClient(
         [
