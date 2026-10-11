@@ -110,6 +110,9 @@ It also contains the changes prepared as 2.9.0, which was never published.
   was woken just as the app stopped, for example by a request that finished
   a moment earlier, `asyncio.wait_for` on those versions swallowed the
   cancellation and left the loop running, so shutdown waited forever.
+- Shutdown lets a delivery already in flight finish within
+  `shutdown_timeout`, instead of cancelling it and sending the same items
+  again, so their receipts are not repeated.
 - A customer status the SDK doesn't know denies that customer with `403`.
   Before, one such customer made the whole snapshot fail validation.
 - The usage reporter understands the per item `retry` status: the item stays

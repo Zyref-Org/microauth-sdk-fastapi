@@ -1024,7 +1024,7 @@ def test_a_restarted_app_recovers_a_crashed_process_usage_without_traffic(
     async def exercise() -> None:
         control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
         app = FastAPI()
-        MicroAuth(
+        auth = MicroAuth(
             app,
             secret_key=SECRET,
             http_client=control,
@@ -1032,12 +1032,15 @@ def test_a_restarted_app_recovers_a_crashed_process_usage_without_traffic(
             report_interval=0.05,
         )
         async with Lifespan(app):
-            for _ in range(100):
+            for _ in range(250):
                 if plane.usage_calls:
                     break
                 await asyncio.sleep(0.02)
             assert plane.usage_calls, "the recovered usage waited for traffic"
         await control.aclose()
+        stats = auth.usage_stats()
+        assert stats.delivered_requests == 3
+        assert stats.queued_items == 0
 
     run(exercise())
     (call,) = plane.usage_calls

@@ -1024,12 +1024,21 @@ class UsageReporter:
     async def aclose(self) -> None:
         """Stop the loop and drain, or raise ``UsageDrainError`` clearly."""
 
-        if self._task is not None:
+        deadline = time.monotonic() + self._shutdown_timeout
+        task = self._task
+        if task is not None:
             self._closing = True
             self._wake.set()
-            self._task.cancel()
             try:
-                await self._task
+                # The loop stops on its own after its current step. A delivery
+                # in flight must finish: cancelling it would send the same
+                # items again and repeat their receipts.
+                await asyncio.wait((task,), timeout=self._shutdown_timeout)
+            finally:
+                if not task.done():
+                    task.cancel()
+            try:
+                await task
             except asyncio.CancelledError:
                 pass
             except Exception:
@@ -1052,7 +1061,7 @@ class UsageReporter:
         try:
             await asyncio.wait_for(
                 self._drain(),
-                timeout=self._shutdown_timeout,
+                timeout=max(0.0, deadline - time.monotonic()),
             )
         except Exception as exc:
             await self._cancel_response_flush()

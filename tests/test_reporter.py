@@ -20,6 +20,7 @@ from microauth_fastapi.exceptions import (
     UsageQueueFull,
 )
 from microauth_fastapi.journal import read_records
+from microauth_fastapi.models import UsageReceipt
 
 Outcome = dict[str, Any] | Exception | Callable[[list[dict[str, Any]]], dict[str, Any]]
 
@@ -61,7 +62,7 @@ def run(coroutine: Any) -> Any:
     return asyncio.run(coroutine)
 
 
-def test_shutdown_stops_the_loop_when_a_wake_and_the_cancel_arrive_together() -> None:
+def test_shutdown_stops_a_loop_that_a_request_woke_just_before() -> None:
     async def exercise() -> None:
         reporter = Reporter(ScriptedClient([acknowledge]), 60)
         await reporter.start()
@@ -78,6 +79,44 @@ def test_shutdown_stops_the_loop_when_a_wake_and_the_cancel_arrive_together() ->
         assert reporter.pending_items == 0
 
     run(exercise())
+
+
+def test_shutdown_lets_a_delivery_in_flight_finish_instead_of_sending_it_again() -> None:
+    calls: list[list[dict[str, Any]]] = []
+    receipts: list[UsageReceipt] = []
+
+    async def exercise() -> None:
+        answer = asyncio.Event()
+
+        class SlowClient:
+            async def report_usage(self, items: list[dict[str, Any]]) -> dict[str, Any]:
+                calls.append([dict(item) for item in items])
+                await answer.wait()
+                return acknowledge(items)
+
+        async def keep(batch: list[UsageReceipt]) -> None:
+            receipts.extend(batch)
+
+        reporter = Reporter(SlowClient(), 0.05, on_receipts=keep)
+        await reporter.start()
+        await reporter.record("11111111-1111-4111-8111-111111111111", 200)
+        for _ in range(200):
+            if calls:
+                break
+            await asyncio.sleep(0.01)
+        assert calls, "the loop never started a delivery"
+
+        closing = asyncio.ensure_future(reporter.aclose())
+        await asyncio.sleep(0.05)
+        assert not closing.done()
+        answer.set()
+        await asyncio.wait_for(closing, timeout=5)
+        assert reporter.pending_items == 0
+
+    run(exercise())
+    assert len(calls) == 1
+    assert [receipt.idempotency_key for receipt in receipts] == [calls[0][0]["idempotency_key"]]
+    assert receipts[0].outcome == "accepted"
 
 
 def test_wire_payload_uses_canonical_names_and_stable_retry() -> None:
