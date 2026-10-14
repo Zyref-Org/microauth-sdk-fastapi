@@ -6,6 +6,10 @@ renders them as regular JSON error responses and they show up in OpenAPI.
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
+from typing import Any
+
 from fastapi import HTTPException
 
 
@@ -28,6 +32,36 @@ class MicroAuthAPIError(MicroAuthError):
 
 class MicroAuthAuthorizationError(MicroAuthAPIError):
     """The tenant credential was authoritatively rejected with 401 or 403."""
+
+
+@dataclass(frozen=True, slots=True)
+class ErrorDetail:
+    """One entry of a problem's ``errors`` list: what is wrong and where."""
+
+    message: str
+    location: str | None = None
+    value: Any = None
+
+
+class AccountAPIError(MicroAuthAPIError):
+    """The Account API refused a request to manage API keys, or couldn't be reached.
+
+    ``status_code`` and ``detail`` come from MicroAuth's problem JSON
+    (RFC 9457), and ``errors`` says which fields were wrong. A
+    ``status_code`` of 0 means MicroAuth couldn't be reached at all.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+        *,
+        title: str | None = None,
+        errors: tuple[ErrorDetail, ...] = (),
+    ) -> None:
+        self.title = title
+        self.errors = errors
+        super().__init__(status_code, detail)
 
 
 class MicroAuthResponseError(MicroAuthError):
@@ -120,6 +154,20 @@ class RateLimited(AuthDenied):
         )
 
 
+class TooManyRequests(RateLimited):
+    """A caller of ``TokenAuth`` went over a limit for API keys.
+
+    Either the key's owner used up the requests per minute the API allows
+    each person, or this client address sent too many unknown keys.
+    ``Retry-After`` says how many seconds to wait.
+    """
+
+    def __init__(self, retry_after: float, detail: str) -> None:
+        super().__init__(retry_after)
+        self.headers = {"Retry-After": str(max(1, math.ceil(retry_after)))}
+        self.detail = detail
+
+
 class QuotaExceeded(AuthDenied):
     def __init__(self) -> None:
         super().__init__(status_code=429, detail="Monthly request quota exceeded")
@@ -186,16 +234,35 @@ class InvalidToken(AuthDenied):
 
 
 class InsufficientScope(AuthDenied):
-    """The access token is valid but lacks a scope the route requires.
+    """The caller is valid but lacks a scope the route requires.
 
     ``scopes`` is every scope the route needs, which the challenge lists so a
     client can ask for all of them in one step.
     """
 
-    def __init__(self, scopes: frozenset[str], www_authenticate: str) -> None:
+    def __init__(
+        self,
+        scopes: frozenset[str],
+        www_authenticate: str,
+        detail: str = "The access token is missing a scope this request needs",
+    ) -> None:
         self.scopes = scopes
         super().__init__(
             status_code=403,
-            detail="The access token is missing a scope this request needs",
+            detail=detail,
             headers={"WWW-Authenticate": www_authenticate},
         )
+
+
+class ReauthenticationRequired(AuthDenied):
+    """MicroAuth wants a recent sign in before this action (RFC 9470).
+
+    Send the browser to ``login_url``. It signs the person in again and
+    brings them back to the page they were on. Left unhandled, it becomes a
+    ``401`` problem JSON response that carries ``login_url``.
+    """
+
+    def __init__(self, login_url: str, max_age: int | None = None) -> None:
+        self.login_url = login_url
+        self.max_age = max_age
+        super().__init__(status_code=401, detail="Sign in again to continue")

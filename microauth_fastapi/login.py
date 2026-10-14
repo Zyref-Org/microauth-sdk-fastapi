@@ -38,7 +38,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
-from urllib.parse import quote_plus, urlencode, urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 from fastapi import APIRouter, Request
@@ -64,6 +64,7 @@ from ._oidc import (
     ProviderMetadata,
     TokenRejected,
     add_query,
+    basic_credentials,
     origin_of,
     require_sign_in_support,
     token_hash,
@@ -74,6 +75,7 @@ from ._oidc import (
     verify_jwt,
 )
 from ._problem import USER_DENIALS, install_handlers
+from .api_keys import ACCOUNT_API_SCOPE, MAX_LOGIN_MAX_AGE, APIKeys
 from .client import USER_AGENT
 from .exceptions import (
     AuthUnavailable,
@@ -183,9 +185,12 @@ class _Session:
     expires_at: int
     ends_at: int
     claims: dict[str, Any]
+    # Refreshed tokens keep the scopes of the original grant, so only a new
+    # sign in that asked for microauth:api_keys can call the Account API.
+    api_keys: bool = False
 
     def payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "v": _SESSION_VERSION,
             "id": self.id_token,
             "rt": self.refresh_token,
@@ -193,6 +198,9 @@ class _Session:
             "exp": self.expires_at,
             "end": self.ends_at,
         }
+        if self.api_keys:
+            payload["ak"] = True
+        return payload
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> _Session | None:
@@ -213,7 +221,15 @@ class _Session:
         claims = unverified_claims(id_token)
         if claims is None or not isinstance(claims.get("sub"), str):
             return None
-        return cls(id_token, refresh_token, access_token, expires_at, ends_at, claims)
+        return cls(
+            id_token,
+            refresh_token,
+            access_token,
+            expires_at,
+            ends_at,
+            claims,
+            api_keys=payload.get("ak") is True,
+        )
 
 
 class _SignedOut:
@@ -450,12 +466,6 @@ def _names(value: str | Iterable[str], what: str) -> frozenset[str]:
     return frozenset(items)
 
 
-def _basic_credentials(client_id: str, client_secret: str) -> str:
-    # RFC 6749 section 2.3.1: both parts are form encoded before base64.
-    pair = f"{quote_plus(client_id, safe='')}:{quote_plus(client_secret, safe='')}"
-    return "Basic " + base64.b64encode(pair.encode("utf-8")).decode("ascii")
-
-
 def _pkce_pair() -> tuple[str, str]:
     verifier = secrets.token_urlsafe(48)
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
@@ -536,6 +546,10 @@ class UserAuth:
         keep_access_token: Keep the access token in the session so your
             server can call APIs with ``await auth.access_token(request)``.
             It makes the cookie about twice as large. Default False.
+        api_keys: Let signed in people manage their own API keys through
+            ``auth.api_keys``. It asks for the ``microauth:api_keys`` scope
+            and keeps the access token. Can't be combined with ``resource``.
+            Default False.
         cookie_name: Base name of the cookies. On https the session cookie is
             ``__Host-<name>`` and the sign in state cookie is
             ``__Host-<name>-login``. Default ``microauth``.
@@ -563,6 +577,7 @@ class UserAuth:
         after_sign_in: str = "/",
         after_sign_out: str = "/",
         keep_access_token: bool = False,
+        api_keys: bool = False,
         cookie_name: str = "microauth",
         session_max_age: int = 30 * 24 * 3600,
         max_age: int | None = None,
@@ -594,6 +609,14 @@ class UserAuth:
             raise MicroAuthConfigurationError("scopes must be single words such as 'profile'")
         if "openid" not in scope_list:
             scope_list.insert(0, "openid")
+        if api_keys:
+            if self.resource:
+                raise MicroAuthConfigurationError(
+                    "api_keys=True can't be combined with resource=...: the Account API "
+                    "accepts access tokens issued for MicroAuth itself, and a session holds "
+                    "one access token. Call your API with its own credentials instead."
+                )
+            scope_list.append(ACCOUNT_API_SCOPE)
         self.scopes = tuple(dict.fromkeys(scope_list))
 
         prefix = prefix.rstrip("/")
@@ -621,7 +644,7 @@ class UserAuth:
         if timeout <= 0:
             raise MicroAuthConfigurationError("timeout must be positive")
 
-        self.keep_access_token = bool(keep_access_token)
+        self.keep_access_token = bool(keep_access_token or api_keys)
         self.session_max_age = session_max_age
         self.max_age = max_age
         self.leeway = leeway
@@ -632,7 +655,7 @@ class UserAuth:
         self.redirect_uri = f"{self.app_url}{self.prefix}/callback"
         self.post_logout_redirect_uri = f"{self.app_url}{self.after_sign_out}"
         self._app_origin = origin_of(self.app_url)
-        self._basic = _basic_credentials(self.client_id, client_secret)
+        self._basic = basic_credentials(self.client_id, client_secret)
         self._session_sealer = CookieSealer(secrets_, "session", compress=True)
         self._login_sealer = CookieSealer(secrets_, "login state", compress=False)
         self._http = HttpClient(http_client, timeout)
@@ -641,6 +664,7 @@ class UserAuth:
         self._scope_key = f"microauth.user_session.{id(self)}"
         self._refreshing: dict[str, asyncio.Future[_RefreshOutcome]] = {}
         self._recent: OrderedDict[str, tuple[float, _RefreshOutcome]] = OrderedDict()
+        self._api_keys = APIKeys(self) if api_keys else None
 
         self.router = APIRouter()
         self.router.add_api_route(
@@ -676,14 +700,30 @@ class UserAuth:
         """Close the HTTP client this instance created. Idempotent."""
         await self._http.aclose()
 
-    def login_url(self, next: str | None = None) -> str:
-        """The local sign in link, coming back to ``next`` afterwards."""
+    def login_url(self, next: str | None = None, max_age: int | None = None) -> str:
+        """The local sign in link, coming back to ``next`` afterwards.
+
+        With ``max_age``, MicroAuth asks people to sign in again unless they
+        did within that many seconds.
+        """
         url = f"{self.prefix}/login"
+        params: dict[str, str] = {}
         if next is not None:
             if safe_path(next) is None:
                 raise ValueError("next must be a path on this site")
-            url = f"{url}?{urlencode({'next': next})}"
-        return url
+            params["next"] = next
+        if max_age is not None:
+            if type(max_age) is not int or not 0 <= max_age <= MAX_LOGIN_MAX_AGE:
+                raise ValueError(f"max_age must be between 0 and {MAX_LOGIN_MAX_AGE} seconds")
+            params["max_age"] = str(max_age)
+        return f"{url}?{urlencode(params)}" if params else url
+
+    @property
+    def api_keys(self) -> APIKeys:
+        """The signed in person's API keys. Needs ``UserAuth(api_keys=True)``."""
+        if self._api_keys is None:
+            raise MicroAuthConfigurationError("auth.api_keys needs UserAuth(api_keys=True)")
+        return self._api_keys
 
     # Dependencies
 
@@ -763,6 +803,23 @@ class UserAuth:
         if request.url.query:
             target = f"{target}?{request.url.query}"
         return safe_path(target) or self.after_sign_in
+
+    def _return_path(self, request: Request) -> str:
+        """The page to come back to after signing in again mid action.
+
+        A form post can't be replayed after a redirect, so for unsafe
+        methods this is the page the form was on, when it's on this site.
+        """
+        if request.method in SAFE_METHODS:
+            return self._target(request)
+        referer = request.headers.get("referer")
+        if referer is not None and origin_of(referer) == self._app_origin:
+            parts = urlsplit(referer)
+            path = f"{parts.path or '/'}?{parts.query}" if parts.query else parts.path or "/"
+            found = safe_path(path)
+            if found is not None:
+                return found
+        return safe_path(request.url.path) or self.after_sign_in
 
     def same_origin(self, headers: Headers) -> bool:
         """Whether ``Origin``, or ``Referer`` without it, is this app's origin."""
@@ -929,6 +986,7 @@ class UserAuth:
             expires_at=expires_at,
             ends_at=ends_at,
             claims=claims,
+            api_keys=previous.api_keys if previous is not None else self._api_keys is not None,
         )
 
     # Protocol
@@ -1169,9 +1227,15 @@ class UserAuth:
         login_hint = query.get("login_hint")
         if login_hint is not None and len(login_hint) > 256:
             login_hint = None
+        raw_max_age = query.get("max_age")
+        max_age = None
+        if raw_max_age is not None:
+            if not re.fullmatch(r"[0-9]{1,5}", raw_max_age) or int(raw_max_age) > MAX_LOGIN_MAX_AGE:
+                return _page(400, "This sign in link can't be used", "It has an invalid max_age.")
+            max_age = int(raw_max_age)
         try:
             return await self.login_redirect(
-                request, next=target, prompt=prompt, login_hint=login_hint
+                request, next=target, prompt=prompt, login_hint=login_hint, max_age=max_age
             )
         except MicroAuthError as exc:
             logger.error("microauth: can't start sign in (%s)", exc)

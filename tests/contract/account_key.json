@@ -1,0 +1,19 @@
+{
+  "id": "e7a3d9c1-2b4f-4e6a-9c8d-0f1b3a5c7e92",
+  "name": "Backup script",
+  "prefix": "cms_pbXUUd",
+  "resources": [
+    {
+      "identifier": "https://api.example.com",
+      "name": "Blog API"
+    }
+  ],
+  "permissions": [
+    "posts:read"
+  ],
+  "created_at": "2026-10-12T10:13:20Z",
+  "created_by_app": null,
+  "expires_at": null,
+  "last_used_at": null,
+  "old_secret_expires_at": null
+}

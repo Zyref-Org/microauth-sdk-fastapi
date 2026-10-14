@@ -17,12 +17,20 @@ from .exceptions import (
     InsufficientScope,
     InvalidToken,
     PermissionDenied,
+    ReauthenticationRequired,
     SignInRedirect,
     SignInRequired,
+    TooManyRequests,
 )
 
-USER_DENIALS = (SignInRequired, PermissionDenied, CrossSiteRequest, SignInRedirect)
-TOKEN_DENIALS = (InvalidToken, InsufficientScope)
+USER_DENIALS = (
+    SignInRequired,
+    PermissionDenied,
+    CrossSiteRequest,
+    SignInRedirect,
+    ReauthenticationRequired,
+)
+TOKEN_DENIALS = (InvalidToken, InsufficientScope, TooManyRequests)
 
 
 async def problem_response(request: Request, exc: Exception) -> Response:
@@ -43,6 +51,9 @@ async def problem_response(request: Request, exc: Exception) -> Response:
     }
     if isinstance(exc, InsufficientScope):
         body["scopes"] = sorted(exc.scopes)
+    if isinstance(exc, ReauthenticationRequired):
+        body["login_url"] = exc.login_url
+        headers["Cache-Control"] = "no-store"
     return JSONResponse(
         body, status_code=status, headers=headers, media_type="application/problem+json"
     )

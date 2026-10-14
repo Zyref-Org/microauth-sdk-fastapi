@@ -1,0 +1,25 @@
+{
+  "key": {
+    "id": "c41e7b2a-9f3d-4a6e-8b15-2d7f0e9a3c64",
+    "name": "Zapier",
+    "prefix": "cms_kYBhn9",
+    "resources": [
+      {
+        "identifier": "https://api.example.com",
+        "name": "Blog API"
+      }
+    ],
+    "permissions": [
+      "posts:read"
+    ],
+    "created_at": "2026-10-14T15:00:00.204118Z",
+    "created_by_app": {
+      "client_id": "3f9a1c7e-6b2d-4e8f-a051-9c7d2b4e6f18",
+      "name": "Blog CMS"
+    },
+    "expires_at": "2027-01-12T15:00:00.204118Z",
+    "last_used_at": null,
+    "old_secret_expires_at": null
+  },
+  "secret": "cms_kYBhn9pUbWLeMKXMo9xYRpJvSRHF3irSjKgWoebe41Ms4z"
+}

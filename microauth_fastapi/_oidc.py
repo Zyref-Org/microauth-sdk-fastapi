@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, TypeVar
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote_plus, urlencode, urlsplit
 
 import httpx
 import jwt
@@ -174,6 +174,13 @@ def origin_of(url: str) -> str | None:
 def add_query(url: str, params: Mapping[str, str]) -> str:
     separator = "&" if "?" in url else "?"
     return f"{url}{separator}{urlencode(params)}"
+
+
+def basic_credentials(client_id: str, client_secret: str) -> str:
+    """The ``Authorization`` value for client_secret_basic."""
+    # RFC 6749 section 2.3.1: both parts are form encoded before base64.
+    pair = f"{quote_plus(client_id, safe='')}:{quote_plus(client_secret, safe='')}"
+    return "Basic " + base64.b64encode(pair.encode("utf-8")).decode("ascii")
 
 
 # Discovery

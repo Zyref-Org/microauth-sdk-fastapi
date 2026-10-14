@@ -1,0 +1,17 @@
+{
+  "title": "Unprocessable Entity",
+  "status": 422,
+  "detail": "validation failed",
+  "errors": [
+    {
+      "message": "posts:delete can't be given to a key for Blog MCP server",
+      "location": "body.permissions[1]",
+      "value": "posts:delete"
+    },
+    {
+      "message": "expected number <= 365",
+      "location": "body.expires_in_days",
+      "value": 400
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "max_days": 365,
+  "allow_no_expiry": false,
+  "resources": [
+    {
+      "identifier": "https://api.example.com",
+      "name": "Blog API",
+      "permissions": [
+        {
+          "name": "posts:read",
+          "description": "Read published and draft posts",
+          "sensitive": false
+        },
+        {
+          "name": "posts:write",
+          "description": "Create and edit posts",
+          "sensitive": false
+        },
+        {
+          "name": "posts:delete",
+          "description": "Delete posts for good",
+          "sensitive": true
+        }
+      ]
+    },
+    {
+      "identifier": "https://mcp.example.com/mcp",
+      "name": "Blog MCP server",
+      "permissions": [
+        {
+          "name": "posts:read",
+          "description": "Read published and draft posts",
+          "sensitive": false
+        }
+      ]
+    }
+  ]
+}

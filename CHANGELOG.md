@@ -2,8 +2,9 @@
 
 ## 3.1.0
 
-Sign users in, protect APIs with access tokens and protect MCP servers, all
-against your MicroAuth service. Nothing changes for `MicroAuth` and API keys.
+Sign users in, and protect APIs and MCP servers with access tokens and with
+API keys your users make for their own accounts, all against your MicroAuth
+service. Nothing changes for `MicroAuth` and the API keys you sell.
 
 ### Sign users in
 
@@ -40,14 +41,60 @@ against your MicroAuth service. Nothing changes for `MicroAuth` and API keys.
 - `MicroAuthTokenVerifier` is a `TokenVerifier` for servers that use the MCP
   SDK's own auth settings.
 
+### Your users' API keys
+
+- `TokenAuth(api_keys=True)` and `McpAuth(api_keys=True)` accept API keys
+  that people make for their own accounts, next to access tokens. Keys are
+  checked with token introspection (RFC 7662) using the API's server
+  credentials, `MICROAUTH_RESOURCE_CLIENT_ID` and
+  `MICROAUTH_RESOURCE_SECRET`.
+- A key with the wrong shape or checksum is refused without a network call.
+  Answers are cached by the key's SHA-256 for as long as MicroAuth's
+  `Cache-Control` allows, at most 5 minutes, and an active key keeps working
+  through a MicroAuth outage for `stale_if_error` seconds (600 by default).
+- MicroAuth's per person requests per minute limit is enforced, and one
+  address may send only `unknown_key_limit` unknown keys a minute (20 by
+  default). Both work in memory or shared through Redis with
+  `MICROAUTH_REDIS_URL`, `redis_url` or `redis_client`. `client_address`
+  finds the real address behind a proxy.
+- `TokenClaims` gains `via` (`"access_token"`, `"api_key"` or `"session"`)
+  and `key_id`. `client_id` and `expires_at` can be `None`.
+- `MicroAuthTokenVerifier(api_keys=True)` accepts keys too, without the
+  limits.
+
+### One route for sessions and keys
+
+- `TokenAuth(sessions=auth)` lets a browser signed in with `UserAuth` call
+  the same routes as tokens and keys, with the user's permissions as scopes.
+  A request with an `Authorization` header is judged by that header alone.
+
+### Managing keys from your app
+
+- `UserAuth(api_keys=True)` asks for the `microauth:api_keys` scope, keeps
+  the access token and adds `auth.api_keys`, with `options`, `list`,
+  `create`, `rename`, `roll`, `revoke` and `revoke_all` on MicroAuth's
+  Account API.
+- Creating and rolling a key needs a recent sign in. Without one the helpers
+  raise `ReauthenticationRequired` with a `login_url`, and `/auth/login`
+  takes `max_age` to ask for a fresh sign in. Refusals raise
+  `AccountAPIError` with MicroAuth's details.
+- New types: `APIKeys`, `APIKey`, `NewAPIKey`, `APIKeyOptions`,
+  `APIKeyResourceOption`, `APIKeyPermission`, `APIKeyResource` and
+  `APIKeyApp`.
+
 ### Other changes
 
 - New exceptions, all subclasses of `AuthDenied`: `SignInRequired`,
-  `SignInRedirect`, `PermissionDenied`, `CrossSiteRequest`, `InvalidToken`
-  and `InsufficientScope`.
+  `SignInRedirect`, `PermissionDenied`, `CrossSiteRequest`, `InvalidToken`,
+  `InsufficientScope`, `ReauthenticationRequired` and `TooManyRequests`.
+  `AccountAPIError` is a `MicroAuthAPIError` that lists each problem field
+  as an `ErrorDetail`.
+- `TokenAuth` and `McpAuth` close the HTTP and Redis clients they made when
+  the app shuts down.
 - `cryptography` and `PyJWT[crypto]` are now dependencies. The new `mcp`
   extra installs the MCP Python SDK 2.0 or newer.
-- New examples: `examples/blog_cms.py` and `examples/invoices_mcp.py`.
+- New examples: `examples/blog_cms.py` and `examples/invoices_mcp.py`. Both
+  take API keys.
 
 ## 3.0.0
 

@@ -12,12 +12,18 @@ When a tool needs more, the client gets a 403 naming the scopes and asks the
 user to approve them. Scopes only decide what kind of action a client may
 take; the tools themselves make sure people only touch their own invoices.
 
+Clients that can't do OAuth can send an API key instead, made by the user on
+their MicroAuth account page. The key's permissions work like scopes, so a
+key with only invoices:read can list invoices but not create them.
+
 Setup:
     1. In the MicroAuth dashboard, register an MCP server with the resource
-       http://localhost:8000/mcp and the three scopes above.
+       http://localhost:8000/mcp and the three scopes above. Turn on
+       "API keys for your users" and copy the server credentials.
     2. pip install "microauth-fastapi[mcp]" uvicorn
-    3. Set MICROAUTH_ISSUER and MICROAUTH_RESOURCE=http://localhost:8000/mcp,
-       then run uvicorn examples.invoices_mcp:app
+    3. Set MICROAUTH_ISSUER, MICROAUTH_RESOURCE=http://localhost:8000/mcp,
+       MICROAUTH_RESOURCE_CLIENT_ID and MICROAUTH_RESOURCE_SECRET, then run
+       uvicorn examples.invoices_mcp:app
 """
 
 import itertools
@@ -31,8 +37,9 @@ from microauth_fastapi import McpAuth, current_identity
 
 mcp = MCPServer("Invoices")
 
-# Reads MICROAUTH_ISSUER and MICROAUTH_RESOURCE.
-auth = McpAuth(scopes=["invoices:read"])
+# Reads MICROAUTH_ISSUER, MICROAUTH_RESOURCE and, for API keys, the server
+# credentials.
+auth = McpAuth(scopes=["invoices:read"], api_keys=True)
 
 
 @dataclass

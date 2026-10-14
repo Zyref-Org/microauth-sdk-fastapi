@@ -26,6 +26,10 @@ scope the tool needs, so the client can step up in one round trip.
 Scopes only say what kind of thing a client may do. Whether this user may
 touch this record is still your code's call: read ``current_identity().sub``
 inside the tool and check ownership there.
+
+Clients that can't do OAuth can send an API key their user made instead,
+with ``McpAuth(api_keys=True)``. The key's permissions act as its scopes, so
+per tool scopes apply to it the same way.
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ import binascii
 import functools
 import json
 import logging
+import math
 from collections.abc import Callable, Iterable, Mapping
 from contextvars import ContextVar
 from types import MappingProxyType
@@ -43,19 +48,24 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import httpx
 from starlette.authentication import AuthCredentials
 from starlette.datastructures import Headers
+from starlette.requests import Request
 
 from ._env import getenv
+from ._keys import DEFAULT_STALE_IF_ERROR, DEFAULT_UNKNOWN_KEY_LIMIT, KeyCheckUnavailable
+from ._limits import RequestThrottled
 from ._oidc import LEEWAY_SECONDS, TokenRejected, validate_issuer, validate_resource
 from .exceptions import MicroAuthConfigurationError, MicroAuthError
 from .tokens import (
     METADATA_PREFIX,
-    AccessTokenVerifier,
+    ClientAddress,
     TokenClaims,
     bearer_challenge,
     bearer_token,
+    bearer_verifier,
     metadata_document,
     metadata_path,
     metadata_url,
+    missing_scope_detail,
     normalize_scopes,
 )
 
@@ -106,7 +116,9 @@ def _mcp_access_token(cls: Any, token: str, claims: TokenClaims, resource: str) 
     fields = getattr(cls, "model_fields", {})
     values: dict[str, Any] = {
         "token": token,
-        "client_id": claims.client_id,
+        # The MCP SDK requires a client_id and binds sessions to it. An API key
+        # has no OAuth client, so the key's id stands in.
+        "client_id": claims.client_id if claims.client_id is not None else claims.key_id,
         "scopes": sorted(claims.scopes),
         "expires_at": claims.expires_at,
         "resource": resource,
@@ -224,8 +236,26 @@ class McpAuth:
             meant as the minimum for basic use. Defaults to ``scopes``.
         tool_scopes: Scopes per tool name, as an alternative to the
             ``@auth.tool(...)`` decorator.
+        api_keys: Also accept API keys your users made for their accounts.
+            Needs the server's credentials. Default False.
+        resource_client_id: The server credential ID, for checking keys.
+            Defaults to ``MICROAUTH_RESOURCE_CLIENT_ID``.
+        resource_secret: The server credential secret. Defaults to
+            ``MICROAUTH_RESOURCE_SECRET``.
+        stale_if_error: Seconds an active key keeps working past its cached
+            answer when MicroAuth can't be reached. 0 turns it off.
+            Default 600.
+        unknown_key_limit: Unknown, revoked or mistyped keys one client
+            address may send per minute before it gets ``429``. 0 turns it
+            off. Default 20.
+        client_address: A function that takes the request and returns the
+            caller's address, for servers behind a proxy. Defaults to the
+            connection's peer address.
+        redis_url: Keep key answers and limits in Redis, shared by every
+            worker. Defaults to ``MICROAUTH_REDIS_URL``.
+        redis_client: Optional externally owned ``redis.asyncio`` client.
         leeway: Seconds of clock skew allowed on token times. Default 60.
-        timeout: HTTP timeout for discovery and key fetches. Default 10.
+        timeout: HTTP timeout for calls to MicroAuth. Default 10.
         jwks_refresh_interval: Seconds between scheduled refreshes of the
             signing keys. Default 900.
         max_body_size: Largest request body accepted, in bytes. Default 4 MiB.
@@ -240,6 +270,14 @@ class McpAuth:
         scopes: str | Iterable[str] | None = None,
         scopes_supported: Iterable[str] | None = None,
         tool_scopes: Mapping[str, str | Iterable[str]] | None = None,
+        api_keys: bool = False,
+        resource_client_id: str | None = None,
+        resource_secret: str | None = None,
+        stale_if_error: float = DEFAULT_STALE_IF_ERROR,
+        unknown_key_limit: int = DEFAULT_UNKNOWN_KEY_LIMIT,
+        client_address: ClientAddress | None = None,
+        redis_url: str | None = None,
+        redis_client: Any | None = None,
         leeway: float = LEEWAY_SECONDS,
         timeout: float = 10.0,
         jwks_refresh_interval: float = 900.0,
@@ -260,16 +298,30 @@ class McpAuth:
         self._tools: dict[str, frozenset[str]] = {}
         for name, needed in (tool_scopes or {}).items():
             self._add_tool(name, normalize_scopes(needed, f"tool_scopes[{name!r}]"))
+        if client_address is not None and not callable(client_address):
+            raise MicroAuthConfigurationError("client_address must be a function of the request")
+        self._client_address = client_address
         self.metadata_url = metadata_url(self.resource)
         self._metadata_paths = frozenset({metadata_path(self.resource), METADATA_PREFIX})
-        self.verifier = AccessTokenVerifier(
-            self.issuer,
-            self.resource,
+        self._bearer = bearer_verifier(
+            issuer=self.issuer,
+            resource=self.resource,
             leeway=leeway,
             timeout=timeout,
             jwks_refresh_interval=jwks_refresh_interval,
             http_client=http_client,
+            api_keys=api_keys,
+            resource_client_id=resource_client_id,
+            resource_secret=resource_secret,
+            stale_if_error=stale_if_error,
+            unknown_key_limit=unknown_key_limit,
+            redis_url=redis_url,
+            redis_client=redis_client,
         )
+        self.verifier = self._bearer.access
+        self.key_checks = self._bearer.keys
+        what = "a MicroAuth access token or API key" if api_keys else "a MicroAuth access token"
+        self._missing = f"Send {what} in the Authorization header"
         self._warned: set[str] = set()
 
     # Config
@@ -325,8 +377,9 @@ class McpAuth:
         return _ProtectedApp(self, inner)
 
     async def aclose(self) -> None:
-        """Close the HTTP client this instance created. Idempotent."""
-        await self.verifier.aclose()
+        """Close the HTTP and Redis clients this instance created and empty
+        its key caches. Idempotent; runs when the wrapped app shuts down."""
+        await self._bearer.aclose()
 
     # Serving
 
@@ -348,7 +401,7 @@ class McpAuth:
             await app(scope, receive, send)
             return
         try:
-            token, claims = await self._authenticate(Headers(scope=scope))
+            token, claims = await self._authenticate(scope)
             if method == "POST":
                 body = await _read_body(receive, self.max_body_size)
                 self._check_message(body, Headers(scope=scope), claims)
@@ -375,7 +428,7 @@ class McpAuth:
                 try:
                     await self.aclose()
                 except Exception:
-                    logger.exception("microauth: closing the MCP auth HTTP client failed")
+                    logger.exception("microauth: closing McpAuth at shutdown failed")
             await send(message)
 
         return lifespan_send
@@ -409,7 +462,8 @@ class McpAuth:
                 [("Allow", "GET, HEAD, OPTIONS")],
             )
 
-    async def _authenticate(self, headers: Headers) -> tuple[str, TokenClaims]:
+    async def _authenticate(self, scope: dict[str, Any]) -> tuple[str, TokenClaims]:
+        headers = Headers(scope=scope)
         try:
             token = bearer_token(headers.getlist("authorization"))
         except TokenRejected as exc:
@@ -417,19 +471,37 @@ class McpAuth:
         if token is None:
             raise self._unauthorized(None)
         try:
-            return token, await self.verifier.verify(token)
+            return token, await self._bearer.verify(token, self._address(scope))
         except TokenRejected as exc:
             raise self._unauthorized(exc.reason) from None
+        except RequestThrottled as exc:
+            raise _Reject(
+                429,
+                {"error": "rate_limited", "error_description": exc.reason},
+                [("Retry-After", str(max(1, math.ceil(exc.retry_after))))],
+            ) from None
+        except KeyCheckUnavailable:
+            raise self._unavailable() from None
         except MicroAuthError as exc:
             logger.error("microauth: MCP access tokens can't be checked right now (%s)", exc)
-            raise _Reject(
-                503,
-                {
-                    "error": "temporarily_unavailable",
-                    "error_description": "Authorization is temporarily unavailable",
-                },
-                [("Retry-After", "5")],
-            ) from None
+            raise self._unavailable() from None
+
+    def _address(self, scope: dict[str, Any]) -> str | None:
+        if self._client_address is not None:
+            return self._client_address(Request(scope))
+        client = scope.get("client")
+        return client[0] if client else None
+
+    @staticmethod
+    def _unavailable() -> _Reject:
+        return _Reject(
+            503,
+            {
+                "error": "temporarily_unavailable",
+                "error_description": "Authorization is temporarily unavailable",
+            },
+            [("Retry-After", "5")],
+        )
 
     def _unauthorized(self, reason: str | None) -> _Reject:
         challenge = bearer_challenge(
@@ -440,11 +512,7 @@ class McpAuth:
         )
         return _Reject(
             401,
-            {
-                "error": "invalid_token",
-                "error_description": reason
-                or "Send a MicroAuth access token in the Authorization header",
-            },
+            {"error": "invalid_token", "error_description": reason or self._missing},
             [("WWW-Authenticate", challenge)],
         )
 
@@ -524,7 +592,7 @@ class McpAuth:
                             error="insufficient_scope",
                             scope=scope,
                             resource_metadata=self.metadata_url,
-                            error_description="The access token is missing a scope this tool needs",
+                            error_description=missing_scope_detail(claims.via, "tool"),
                         ),
                     )
                 ],
@@ -565,11 +633,24 @@ class MicroAuthTokenVerifier:
     Tokens are checked exactly like ``TokenAuth`` checks them. Required scopes
     are left to the SDK's settings so a missing scope stays a ``403``.
 
+    With ``api_keys=True`` it accepts your users' API keys too. The MCP SDK
+    hands a verifier only the token, never the request, and has no way to
+    answer ``429``, so neither the unknown key throttle nor a key's
+    requests per minute applies here. Use ``McpAuth`` when you need them.
+
     Args:
         issuer: Defaults to ``MICROAUTH_ISSUER``.
         resource: The MCP server's URL. Defaults to ``MICROAUTH_RESOURCE``.
+        api_keys: Also accept API keys. Default False.
+        resource_client_id: Defaults to ``MICROAUTH_RESOURCE_CLIENT_ID``.
+        resource_secret: Defaults to ``MICROAUTH_RESOURCE_SECRET``.
+        stale_if_error: Seconds an active key keeps working past its cached
+            answer when MicroAuth can't be reached. Default 600.
+        redis_url: Keep key answers in Redis. Defaults to
+            ``MICROAUTH_REDIS_URL``.
+        redis_client: Optional externally owned ``redis.asyncio`` client.
         leeway: Seconds of clock skew allowed on token times. Default 60.
-        timeout: HTTP timeout for discovery and key fetches. Default 10.
+        timeout: HTTP timeout for calls to MicroAuth. Default 10.
         jwks_refresh_interval: Seconds between scheduled key refreshes.
         http_client: Optional externally owned ``httpx.AsyncClient``.
     """
@@ -579,6 +660,12 @@ class MicroAuthTokenVerifier:
         *,
         issuer: str | None = None,
         resource: str | None = None,
+        api_keys: bool = False,
+        resource_client_id: str | None = None,
+        resource_secret: str | None = None,
+        stale_if_error: float = DEFAULT_STALE_IF_ERROR,
+        redis_url: str | None = None,
+        redis_client: Any | None = None,
         leeway: float = LEEWAY_SECONDS,
         timeout: float = 10.0,
         jwks_refresh_interval: float = 900.0,
@@ -593,21 +680,33 @@ class MicroAuthTokenVerifier:
         self._access_token_class = types[0]
         self.issuer = validate_issuer(issuer or getenv("MICROAUTH_ISSUER"))
         self.resource = validate_resource(resource or getenv("MICROAUTH_RESOURCE"))
-        self.verifier = AccessTokenVerifier(
-            self.issuer,
-            self.resource,
+        self._bearer = bearer_verifier(
+            issuer=self.issuer,
+            resource=self.resource,
             leeway=leeway,
             timeout=timeout,
             jwks_refresh_interval=jwks_refresh_interval,
             http_client=http_client,
+            api_keys=api_keys,
+            resource_client_id=resource_client_id,
+            resource_secret=resource_secret,
+            stale_if_error=stale_if_error,
+            unknown_key_limit=0,
+            redis_url=redis_url,
+            redis_client=redis_client,
+            enforce_limits=False,
         )
+        self.verifier = self._bearer.access
+        self.key_checks = self._bearer.keys
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        """The SDK's ``AccessToken`` for a valid token, otherwise None."""
+        """The SDK's ``AccessToken`` for a valid token or key, otherwise None."""
         try:
-            claims = await self.verifier.verify(token)
+            claims = await self._bearer.verify(token, None)
         except TokenRejected as exc:
-            logger.debug("microauth: refused an MCP access token (%s)", exc.reason)
+            logger.debug("microauth: refused an MCP bearer credential (%s)", exc.reason)
+            return None
+        except KeyCheckUnavailable:
             return None
         except MicroAuthError as exc:
             logger.error("microauth: MCP access tokens can't be checked right now (%s)", exc)
@@ -618,5 +717,5 @@ class MicroAuthTokenVerifier:
         return access_token
 
     async def aclose(self) -> None:
-        """Close the HTTP client this instance created. Idempotent."""
-        await self.verifier.aclose()
+        """Close the HTTP and Redis clients this instance created. Idempotent."""
+        await self._bearer.aclose()

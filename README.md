@@ -5,7 +5,8 @@ one dependency:
 
 - **Sign users in** to your web app, with sessions, roles and permissions
   (`UserAuth`).
-- **Protect an API** that other apps call with MicroAuth access tokens
+- **Protect an API** that other apps call with MicroAuth access tokens, and
+  that your users call with API keys they make for their own accounts
   (`TokenAuth`).
 - **Protect an MCP server** so AI agents act for a user with only the scopes
   that user approved (`McpAuth`).
@@ -64,7 +65,8 @@ development, `http://localhost:8000` works as the app URL.
 `UserAuth(app)` adds these routes:
 
 - `GET /auth/login?next=/path` starts sign in and comes back to `next`,
-  which must be a path on your site.
+  which must be a path on your site. Add `max_age=600` to make people sign
+  in again unless they did in the last 10 minutes.
 - `GET /auth/signup?next=/path` does the same, opening on the sign up
   screen.
 - `GET /auth/callback` is where MicroAuth sends the browser back after sign
@@ -125,6 +127,9 @@ How sessions work:
 - `resource` (`None`) and `keep_access_token` (`False`): get an access token
   for one of your APIs and keep it, so `await auth.access_token(request)`
   can call that API from your server.
+- `api_keys` (`False`): let signed in people manage their own API keys from
+  your app with `auth.api_keys`. See
+  [Let people manage their keys from your app](#let-people-manage-their-keys-from-your-app).
 - `prefix` (`/auth`): where the routes live.
 - `after_sign_in` (`/`): where people land when the sign in link had no
   `next`.
@@ -171,10 +176,12 @@ MicroAuth, such as `https://api.example.com`.
   `/.well-known/oauth-protected-resource`, followed by the resource's path
   when it has one: `/.well-known/oauth-protected-resource/v1` for
   `https://api.example.com/v1`.
-- `TokenClaims` has `sub`, `client_id`, `scopes`, `audience`, `expires_at`,
-  `issued_at`, `token_id`, `session_id`, `auth_time` and the raw `claims`.
+- `TokenClaims` has `sub`, `via`, `client_id`, `scopes`, `audience`,
+  `expires_at`, `issued_at`, `token_id`, `session_id`, `auth_time`, `key_id`
+  and the raw `claims`. For an access token, `via` is `"access_token"`.
 - `TokenAuth(scopes=...)` adds scopes every route needs, and
   `Depends(api.require())` with no scopes needs only a valid token.
+- `TokenAuth(app)` closes the HTTP client it made when the app shuts down.
 
 ## Protect an MCP server
 
@@ -250,6 +257,209 @@ mcp = MCPServer(
     ),
 )
 ```
+
+## Accept your users' API keys
+
+Some of your users want to call your API from a script, a CI job or a tool
+that can't do OAuth. Turn on "API keys for your users" in the dashboard and
+people can make keys for their own accounts, on MicroAuth's account page or
+inside your app, each carrying the permissions they pick. `TokenAuth` and
+`McpAuth` accept them next to access tokens:
+
+```python
+api = TokenAuth(app, api_keys=True)
+
+
+@app.post("/posts")
+async def create_post(caller: TokenClaims = Depends(api.require("posts:write"))):
+    return {"author": caller.sub, "via": caller.via}
+```
+
+```bash
+# .env, next to your app
+MICROAUTH_RESOURCE_CLIENT_ID=...
+MICROAUTH_RESOURCE_SECRET=...
+```
+
+These are the API's server credentials, shown on its page under APIs and MCP
+servers in the dashboard. They let the SDK ask MicroAuth about keys and
+nothing else. Without them `TokenAuth(api_keys=True)` refuses to start.
+Callers send a key the way they send a token:
+
+```bash
+curl https://api.example.com/posts -H "Authorization: Bearer cms_..."
+```
+
+These keys belong to people who sign in to your app. They are not the keys
+`MicroAuth` checks when you [sell your API](#sell-your-api-with-api-keys),
+which belong to your paying customers and come with plans and billing.
+
+How a key is checked:
+
+- A bearer value with a dot is a JWT and is checked locally as before.
+  Anything else is treated as a key.
+- A key is your prefix, an underscore, 40 random characters and a 6
+  character checksum, such as `cms_` followed by 46 letters and digits. A
+  value with the wrong shape or checksum gets `401` without a call to
+  MicroAuth.
+- A well formed key is checked with token introspection (RFC 7662) at your
+  issuer, using the server credentials. MicroAuth answers whether the key
+  works at this API, whose it is, which permissions it carries right now,
+  and how many requests a minute you allow each person.
+- Answers are cached by the key's SHA-256, never the key itself, for as long
+  as MicroAuth's `Cache-Control` allows: 30 seconds today and never more
+  than 5 minutes. A revoked key, or a person who lost a role, stops working
+  within that time. Parallel requests with the same key share one check.
+- When MicroAuth can't be reached, a key that was active keeps working for
+  `stale_if_error` seconds past its cached answer: 10 minutes by default, and
+  0 turns this off. A key the SDK hasn't seen before gets `503`. Errors are
+  never cached.
+- When MicroAuth refuses the server credentials, callers with keys get `503`
+  and the SDK logs an error naming the two settings to check.
+- Raw keys never reach logs, caches or Redis.
+
+`TokenClaims` for a key has `via="api_key"`. `sub` is the person who made the
+key and `scopes` are its permissions, so `api.require(...)` works the same
+for keys and tokens, and a key missing a permission gets `403` with
+`error="insufficient_scope"`. `key_id` identifies the key, `client_id` is
+`None`, and `expires_at` is `None` for a key that never expires.
+
+Limits:
+
+- When you set "requests per minute for each person's keys" on the API, the
+  SDK enforces it across all of a person's keys, so making more keys doesn't
+  raise anyone's limit. A quiet person can use the whole minute's worth at
+  once, then gets one request every 60 / limit seconds. A caller over it
+  gets `429` with `Retry-After`. Access tokens don't count toward it.
+- After 20 unknown, revoked or mistyped keys from one client address in a
+  minute, that address gets `429` without MicroAuth being asked, so your API
+  can't be used to test stolen or guessed keys. Change the number with
+  `unknown_key_limit`, or set it to 0 to turn this off.
+- The client address is the connection's peer address. Behind a proxy, pass
+  `client_address=` a function that takes the request and returns the real
+  address, read from a header only your proxy sets.
+- With several workers, set `MICROAUTH_REDIS_URL` (or pass `redis_url=` or
+  `redis_client=`) and every worker shares the cached answers and both
+  limits. Each limit decision is one Lua script call and every key has a
+  TTL. If Redis goes down, answers are fetched from MicroAuth instead, but
+  limits can't be checked, so callers with keys get `503` unless both
+  limits are off.
+
+MCP servers take the same settings with `McpAuth(api_keys=True)`. A key's
+permissions act as its scopes, so per tool scopes apply to keys too, and
+`current_identity().via` is `"api_key"`. The MCP SDK's `AccessToken` gets the
+key's id as its `client_id`. `MicroAuthTokenVerifier(api_keys=True)` accepts
+keys as well, but the MCP SDK hands it only the token, so neither limit
+applies there. Use `McpAuth` when you need them.
+
+Settings for keys, with their defaults in brackets:
+
+- `api_keys` (`False`): accept keys.
+- `resource_client_id` (`$MICROAUTH_RESOURCE_CLIENT_ID`) and
+  `resource_secret` (`$MICROAUTH_RESOURCE_SECRET`): the server credentials.
+- `stale_if_error` (`600`): seconds an active key outlives its cached answer
+  during an outage.
+- `unknown_key_limit` (`20`): unknown keys one address may send per minute.
+- `client_address` (the peer address): a function of the request.
+- `redis_url` (`$MICROAUTH_REDIS_URL`) and `redis_client` (`None`): share
+  answers and limits between workers. A client you pass is never closed.
+
+## One route for sessions and keys
+
+A CMS's own pages and its users' scripts often need the same API.
+`TokenAuth(sessions=auth)` lets one route accept a browser signed in with
+`UserAuth` along with access tokens and keys:
+
+```python
+auth = UserAuth(app)
+api = TokenAuth(app, api_keys=True, sessions=auth)
+
+
+@app.post("/api/posts")
+async def create_post(caller: TokenClaims = Depends(api.require("posts:write"))): ...
+```
+
+- A request without an `Authorization` header and with a valid session is a
+  caller with `via="session"`. `sub` is the user's id and `scopes` are their
+  permissions, so `require("posts:write")` checks the same permission for
+  everyone.
+- A request with an `Authorization` header is judged by that header alone,
+  even when it also carries the session cookie.
+- Unsafe requests that use the session must come from your own origin, as
+  with `UserAuth`.
+- Permissions come with the `roles` scope, so `UserAuth` must ask for it (it
+  does by default), and both must use the same issuer.
+
+## Let people manage their keys from your app
+
+People can always manage their keys on MicroAuth's account page. To offer
+the same in your app, turn on `api_keys` in `UserAuth`:
+
+```python
+from microauth_fastapi import ReauthenticationRequired, User, UserAuth
+
+auth = UserAuth(app, api_keys=True)
+
+
+@app.post("/settings/api-keys")
+async def create_key(request: Request, user: User = Depends(auth.login_required)):
+    try:
+        new = await auth.api_keys.create(
+            request,
+            name="CI deploys",
+            resources=["https://api.example.com"],
+            permissions=["posts:write"],
+            expires_in_days=90,
+        )
+    except ReauthenticationRequired as exc:
+        return RedirectResponse(exc.login_url, status_code=303)
+    return show_once(new.secret)
+```
+
+`UserAuth(api_keys=True)` asks for the reserved `microauth:api_keys` scope and
+keeps the access token in the session. `auth.api_keys` calls MicroAuth's
+Account API with that token, so your app can only ever touch the signed in
+person's keys. Only web applications can get the scope, and it can't be
+combined with `resource=`. Sessions from before you turned it on didn't ask
+for the scope, so the helpers raise `ReauthenticationRequired` for them.
+
+Every method takes the request and acts for whoever is signed in on it:
+
+- `options(request)`: the servers, permissions and lifetimes this person may
+  put on a key, as `APIKeyOptions`.
+- `list(request)`: their keys as `APIKey` objects, without secrets.
+- `create(request, name=..., resources=[...], permissions=[...],
+  expires_in_days=...)`: a `NewAPIKey` with the key and its secret.
+  `resources` are server identifiers and `permissions` permission names,
+  both from `options()`. `expires_in_days=None` asks for a key that never
+  expires, which you may not allow.
+- `rename(request, key_id, name)`: the renamed `APIKey`.
+- `roll(request, key_id, old_secret_lasts_hours=0)`: a new secret with the
+  same settings. The old one keeps working for 0, 1 or 24 hours, so a CI job
+  can switch over without downtime.
+- `revoke(request, key_id)` and `revoke_all(request)`.
+
+The secret is shown once, in `NewAPIKey.secret`. MicroAuth keeps only its
+hash, so show it to the person right away, send that page with
+`Cache-Control: no-store`, and never store or log it. Call the helpers from
+routes on your own site: unsafe requests pass the same origin check as
+everything else that uses the session.
+
+When something goes wrong:
+
+- Creating and rolling a key needs a sign in from the last 10 minutes. When
+  it is older, MicroAuth answers with RFC 9470
+  `insufficient_user_authentication` and the helper raises
+  `ReauthenticationRequired`. Its `login_url` signs the person in again with
+  `max_age` and brings them back to the page they were on. Left unhandled,
+  it becomes a `401` problem JSON response that carries `login_url`.
+- Nobody signed in, or a session MicroAuth no longer accepts, raises
+  `SignInRequired`, and a stale session is cleared.
+- A refusal, such as an unknown key id, a name that's too long or a
+  permission the person can't give, raises `AccountAPIError` with
+  `status_code`, MicroAuth's `detail` and `errors`, one per problem field.
+- When MicroAuth won't let this app manage keys at all, the helper raises
+  `MicroAuthConfigurationError`.
 
 ## Sell your API with API keys
 
@@ -640,14 +850,17 @@ dashboard show which SDK version is connected.
 
 `UserAuth`, `TokenAuth` and `McpAuth` only talk to your issuer, through the
 endpoints its `/.well-known/openid-configuration` document lists: the
-signing keys, and for `UserAuth` the pushed authorization, token,
-revocation and end session endpoints. The discovery document is cached for
-an hour and must name exactly the issuer you configured.
+signing keys, the introspection endpoint for API keys, and for `UserAuth`
+the pushed authorization, token, revocation and end session endpoints. The
+discovery document is cached for an hour and must name exactly the issuer
+you configured. `auth.api_keys` also calls the Account API at
+`/api/v1/me/api-keys` on your issuer.
 
 MicroAuth generates golden fixtures of each response from its own types. The
 SDK's tests parse copies of them in `tests/contract`, and compare them byte
 for byte with the originals when both repositories are checked out side by
-side.
+side. The API key fixtures there (`introspect_*.json` and `account_*.json`)
+are the reference for what MicroAuth answers about keys.
 
 ## Example apps
 
@@ -659,7 +872,9 @@ MICROAUTH_SECRET_KEY=mas_... uvicorn examples.weather_api:app --reload
 
 [`examples/blog_cms.py`](https://github.com/Zyref-Org/microauth-sdk-fastapi/blob/main/examples/blog_cms.py)
 signs people in with `UserAuth`: anyone reads posts, editors write them and
-admins delete them.
+admins delete them. Its `/api/posts` takes the editor page's session and API
+keys alike, and `/settings/api-keys` lets people make keys with
+`auth.api_keys`.
 [`examples/invoices_mcp.py`](https://github.com/Zyref-Org/microauth-sdk-fastapi/blob/main/examples/invoices_mcp.py)
-is an MCP server with a scope per tool and an ownership check in each one.
-Their docstrings say how to set them up.
+is an MCP server with a scope per tool and an ownership check in each one,
+and it takes API keys too. Their docstrings say how to set them up.

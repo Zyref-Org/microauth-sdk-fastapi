@@ -1,0 +1,50 @@
+{
+  "keys": [
+    {
+      "id": "5f0c9a7e-3b2d-4c1e-9a8f-6d4b2e1c0a97",
+      "name": "CI deploys",
+      "prefix": "cms_D0rlAD",
+      "resources": [
+        {
+          "identifier": "https://api.example.com",
+          "name": "Blog API"
+        },
+        {
+          "identifier": "https://mcp.example.com/mcp",
+          "name": "Blog MCP server"
+        }
+      ],
+      "permissions": [
+        "posts:read",
+        "posts:write"
+      ],
+      "created_at": "2026-10-13T14:00:00Z",
+      "created_by_app": {
+        "client_id": "3f9a1c7e-6b2d-4e8f-a051-9c7d2b4e6f18",
+        "name": "Blog CMS"
+      },
+      "expires_at": "2027-01-11T14:00:00Z",
+      "last_used_at": "2026-10-14T13:53:20.481Z",
+      "old_secret_expires_at": "2026-10-15T09:30:12.5Z"
+    },
+    {
+      "id": "e7a3d9c1-2b4f-4e6a-9c8d-0f1b3a5c7e92",
+      "name": "Nightly backup",
+      "prefix": "cms_pbXUUd",
+      "resources": [
+        {
+          "identifier": "https://api.example.com",
+          "name": "Blog API"
+        }
+      ],
+      "permissions": [
+        "posts:read"
+      ],
+      "created_at": "2026-10-12T10:13:20Z",
+      "created_by_app": null,
+      "expires_at": null,
+      "last_used_at": null,
+      "old_secret_expires_at": null
+    }
+  ]
+}

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
+import time
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -9,10 +11,14 @@ from typing import Any
 import httpx
 import pytest
 from oidc_fake import (
+    API,
     APP_URL,
     CLIENT_ID,
     CLIENT_SECRET,
     COOKIE_SECRET,
+    RESOURCE_CLIENT_ID,
+    RESOURCE_SECRET,
+    Clock,
     FakeIssuer,
     FakeUser,
     sign_in,
@@ -20,6 +26,8 @@ from oidc_fake import (
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 SAME_SITE = {"Origin": APP_URL}
+SETTINGS_PAGE = {"Origin": APP_URL, "Referer": f"{APP_URL}/settings/api-keys"}
+SECRET = re.compile(r"cms_[0-9A-Za-z]{46}")
 
 
 def load(name: str) -> ModuleType:
@@ -37,8 +45,12 @@ def test_blog_cms_example(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MICROAUTH_CLIENT_SECRET", CLIENT_SECRET)
     monkeypatch.setenv("MICROAUTH_COOKIE_SECRET", COOKIE_SECRET)
     monkeypatch.setenv("MICROAUTH_APP_URL", APP_URL)
+    monkeypatch.setenv("MICROAUTH_RESOURCE", API)
+    monkeypatch.setenv("MICROAUTH_RESOURCE_CLIENT_ID", RESOURCE_CLIENT_ID)
+    monkeypatch.setenv("MICROAUTH_RESOURCE_SECRET", RESOURCE_SECRET)
     blog = load("blog_cms")
     blog.auth._http._client = fake.client()
+    blog.api.verifier._http._client = fake.client()
 
     def client() -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.ASGITransport(app=blog.app), base_url=APP_URL)
@@ -80,13 +92,109 @@ def test_blog_cms_example(monkeypatch: pytest.MonkeyPatch) -> None:
     asyncio.run(main())
 
 
+def test_blog_cms_api_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeIssuer()
+    for name, value in {
+        "MICROAUTH_ISSUER": fake.issuer,
+        "MICROAUTH_CLIENT_ID": CLIENT_ID,
+        "MICROAUTH_CLIENT_SECRET": CLIENT_SECRET,
+        "MICROAUTH_COOKIE_SECRET": COOKIE_SECRET,
+        "MICROAUTH_APP_URL": APP_URL,
+        "MICROAUTH_RESOURCE": API,
+        "MICROAUTH_RESOURCE_CLIENT_ID": RESOURCE_CLIENT_ID,
+        "MICROAUTH_RESOURCE_SECRET": RESOURCE_SECRET,
+    }.items():
+        monkeypatch.setenv(name, value)
+    blog = load("blog_cms")
+    blog.auth._http._client = fake.client()
+    blog.api.verifier._http._client = fake.client()
+    clock = Clock()
+    blog.api.key_checks.clock = clock
+
+    def client() -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.ASGITransport(app=blog.app), base_url=APP_URL)
+
+    async def main() -> None:
+        async with client() as editor:
+            assert (await editor.get("/settings/api-keys")).status_code == 303
+            await sign_in(editor, fake, next="/settings/api-keys")
+            page = await editor.get("/settings/api-keys")
+            assert page.status_code == 200
+            assert page.headers["cache-control"] == "no-store"
+            assert "No keys yet" in page.text
+            assert 'value="posts:write"' in page.text
+            assert 'value="never"' in page.text
+
+            form = "name=Deploy+script&permission=posts%3Awrite&days=90"
+            created = await editor.post(
+                "/settings/api-keys",
+                content=form,
+                headers={**SETTINGS_PAGE, "Content-Type": "application/x-www-form-urlencoded"},
+            )
+            assert created.status_code == 200, created.text
+            found = SECRET.search(created.text)
+            assert found is not None
+            secret = found.group(0)
+            assert "Deploy script" in created.text
+            assert secret not in (await editor.get("/settings/api-keys")).text
+
+        post = {"title": "From a script", "body": "Published with an API key"}
+        async with client() as script:
+            published = await script.post(
+                "/api/posts", json=post, headers={"Authorization": f"Bearer {secret}"}
+            )
+            assert published.status_code == 201, published.text
+            assert published.json()["author_id"] == "user_1"
+            assert published.json()["author_name"] is None
+            mistyped = secret[:-1] + ("x" if secret[-1] != "x" else "y")
+            wrong = await script.post(
+                "/api/posts", json=post, headers={"Authorization": f"Bearer {mistyped}"}
+            )
+            assert wrong.status_code == 401
+
+        async with client() as editor:
+            await sign_in(editor, fake, next="/settings/api-keys")
+            (key_id,) = list(fake.api_keys)
+            revoked = await editor.post(
+                f"/settings/api-keys/{key_id}/revoke", headers=SETTINGS_PAGE
+            )
+            assert revoked.status_code == 303
+            assert "No keys yet" in (await editor.get("/settings/api-keys")).text
+
+        clock.advance(31)
+        async with client() as script:
+            refused = await script.post(
+                "/api/posts", json=post, headers={"Authorization": f"Bearer {secret}"}
+            )
+            assert refused.status_code == 401
+
+        fake.last_sign_in = int(time.time()) - 3600
+        async with client() as stale:
+            await sign_in(stale, fake, next="/settings/api-keys")
+            again = await stale.post(
+                "/settings/api-keys",
+                content="name=Late&permission=posts%3Awrite&days=30",
+                headers={**SETTINGS_PAGE, "Content-Type": "application/x-www-form-urlencoded"},
+            )
+            assert again.status_code == 303
+            assert again.headers["location"] == (
+                "/auth/login?next=%2Fsettings%2Fapi-keys&max_age=600"
+            )
+
+    asyncio.run(main())
+
+
 def test_invoices_mcp_example(monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("mcp.server.mcpserver")
     mcp_types = pytest.importorskip("mcp_types")
     resource = "http://localhost:8000/mcp"
     fake = FakeIssuer()
+    fake.resource_clients["rs_local_invoices"] = resource
+    fake.resource_names[resource] = "Invoices"
     monkeypatch.setenv("MICROAUTH_ISSUER", fake.issuer)
     monkeypatch.setenv("MICROAUTH_RESOURCE", resource)
+    monkeypatch.setenv("MICROAUTH_RESOURCE_CLIENT_ID", "rs_local_invoices")
+    monkeypatch.setenv("MICROAUTH_RESOURCE_SECRET", RESOURCE_SECRET)
     invoices = load("invoices_mcp")
     invoices.auth.verifier._http._client = fake.client()
     meta = {
@@ -103,9 +211,13 @@ def test_invoices_mcp_example(monkeypatch: pytest.MonkeyPatch) -> None:
         ):
 
             async def call(
-                tool: str, arguments: dict[str, Any], scope: str, sub: str = "user_1"
+                tool: str,
+                arguments: dict[str, Any],
+                scope: str,
+                sub: str = "user_1",
+                credential: str | None = None,
             ) -> httpx.Response:
-                access = fake.access_token(aud=resource, scope=scope, sub=sub)
+                access = credential or fake.access_token(aud=resource, scope=scope, sub=sub)
                 return await client.post(
                     "/mcp",
                     json={
@@ -163,5 +275,25 @@ def test_invoices_mcp_example(monkeypatch: pytest.MonkeyPatch) -> None:
                 )
             )
             assert sent["status"] == "sent"
+
+            key = fake.add_key(
+                resources=[resource], permissions=["invoices:read", "invoices:write"]
+            ).secret
+            by_key = result(
+                await call(
+                    "create_invoice",
+                    {"customer": "Globex", "amount_cents": 900},
+                    "",
+                    credential=key,
+                )
+            )
+            assert by_key["owner"] == "user_1"
+            mine = result(await call("list_invoices", {}, "", credential=key))
+            assert [invoice["customer"] for invoice in mine] == ["Acme", "Globex"]
+            not_allowed = await call(
+                "send_invoice", {"invoice_id": by_key["id"]}, "", credential=key
+            )
+            assert not_allowed.status_code == 403
+            assert "The API key is missing a scope" in not_allowed.headers["www-authenticate"]
 
     asyncio.run(main())

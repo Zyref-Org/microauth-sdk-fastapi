@@ -1,0 +1,15 @@
+{
+  "active": true,
+  "token_use": "api_key",
+  "key_id": "5f0c9a7e-3b2d-4c1e-9a8f-6d4b2e1c0a97",
+  "sub": "8d2f6b1a-4c3e-4f5a-9b7d-1e0c2a4f6d83",
+  "scope": "posts:read posts:write",
+  "aud": [
+    "https://api.example.com",
+    "https://mcp.example.com/mcp"
+  ],
+  "iss": "https://auth.example.com",
+  "iat": 1791900000,
+  "exp": 1799676000,
+  "requests_per_minute": 120
+}
