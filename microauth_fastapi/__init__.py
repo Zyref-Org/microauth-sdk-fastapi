@@ -1,13 +1,17 @@
-"""MicroAuth SDK for FastAPI: API key auth, rate limits and metered billing
-for your API, with a receipt for every request MicroAuth charges."""
+"""MicroAuth SDK for FastAPI: sign users in, protect APIs and MCP servers with
+access tokens, and sell your API with keys, rate limits and metered billing,
+with a receipt for every request MicroAuth charges."""
 
 from ._version import __version__
 from .exceptions import (
     AuthDenied,
     AuthUnavailable,
+    CrossSiteRequest,
     CustomerPending,
     CustomerSuspended,
+    InsufficientScope,
     InvalidAPIKey,
+    InvalidToken,
     LimitBackendUnavailable,
     MicroAuthAPIError,
     MicroAuthAuthorizationError,
@@ -15,9 +19,12 @@ from .exceptions import (
     MicroAuthError,
     MicroAuthResponseError,
     PaymentRequired,
+    PermissionDenied,
     PlatformAllowanceExceeded,
     QuotaExceeded,
     RateLimited,
+    SignInRedirect,
+    SignInRequired,
     SnapshotCacheError,
     SnapshotValidationError,
     UsageAcknowledgementError,
@@ -26,6 +33,8 @@ from .exceptions import (
     UsageReportingError,
     UsageStoreError,
 )
+from .login import User, UserAuth
+from .mcp import McpAuth, MicroAuthTokenVerifier, current_identity
 from .models import (
     Customer,
     PlatformMonthlyAllowance,
@@ -34,28 +43,39 @@ from .models import (
     UsageStats,
 )
 from .sdk import MicroAuth
+from .tokens import TokenAuth, TokenClaims
 
 __all__ = [
     "AuthDenied",
     "AuthUnavailable",
+    "CrossSiteRequest",
     "Customer",
     "CustomerPending",
     "CustomerSuspended",
+    "InsufficientScope",
     "InvalidAPIKey",
+    "InvalidToken",
     "LimitBackendUnavailable",
+    "McpAuth",
     "MicroAuth",
     "MicroAuthAPIError",
     "MicroAuthAuthorizationError",
     "MicroAuthConfigurationError",
     "MicroAuthError",
     "MicroAuthResponseError",
+    "MicroAuthTokenVerifier",
     "PaymentRequired",
+    "PermissionDenied",
     "PlatformAllowanceExceeded",
     "PlatformMonthlyAllowance",
     "QuotaExceeded",
     "RateLimited",
+    "SignInRedirect",
+    "SignInRequired",
     "SnapshotCacheError",
     "SnapshotValidationError",
+    "TokenAuth",
+    "TokenClaims",
     "UsageAcknowledgementError",
     "UsageDrainError",
     "UsageQueueFull",
@@ -64,5 +84,8 @@ __all__ = [
     "UsageReportingError",
     "UsageStats",
     "UsageStoreError",
+    "User",
+    "UserAuth",
     "__version__",
+    "current_identity",
 ]

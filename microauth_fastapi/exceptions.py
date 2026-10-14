@@ -133,3 +133,69 @@ class PlatformAllowanceExceeded(AuthDenied):
 class AuthUnavailable(AuthDenied):
     def __init__(self) -> None:
         super().__init__(status_code=503, detail="Authorization is temporarily unavailable")
+
+
+class SignInRequired(AuthDenied):
+    """Nobody is signed in. Pages can use ``auth.login_required`` to redirect instead."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=401, detail="Sign in to continue")
+
+
+class SignInRedirect(AuthDenied):
+    """Sends a signed out visitor of a page to the sign in route, then back."""
+
+    def __init__(self, location: str) -> None:
+        self.location = location
+        super().__init__(
+            status_code=303, detail="Sign in to continue", headers={"Location": location}
+        )
+
+
+class PermissionDenied(AuthDenied):
+    """The signed in user lacks a role or permission the route requires."""
+
+    def __init__(self, missing_roles: frozenset[str], missing_permissions: frozenset[str]) -> None:
+        self.missing_roles = missing_roles
+        self.missing_permissions = missing_permissions
+        super().__init__(status_code=403, detail="You don't have permission to do this")
+
+
+class CrossSiteRequest(AuthDenied):
+    """An unsafe request that uses the session came from another site.
+
+    Raised when neither ``Origin`` nor ``Referer`` matches the app's own
+    origin, which is how a cross site form post looks.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(status_code=403, detail="This request came from another site")
+
+
+class InvalidToken(AuthDenied):
+    """The bearer token is missing, malformed, expired or not meant for this API.
+
+    ``headers`` carries the RFC 6750 ``WWW-Authenticate`` challenge, which
+    points clients at the protected resource metadata (RFC 9728).
+    """
+
+    def __init__(self, detail: str, www_authenticate: str) -> None:
+        super().__init__(
+            status_code=401, detail=detail, headers={"WWW-Authenticate": www_authenticate}
+        )
+
+
+class InsufficientScope(AuthDenied):
+    """The access token is valid but lacks a scope the route requires.
+
+    ``scopes`` is every scope the route needs, which the challenge lists so a
+    client can ask for all of them in one step.
+    """
+
+    def __init__(self, scopes: frozenset[str], www_authenticate: str) -> None:
+        self.scopes = scopes
+        super().__init__(
+            status_code=403,
+            detail="The access token is missing a scope this request needs",
+            headers={"WWW-Authenticate": www_authenticate},
+        )

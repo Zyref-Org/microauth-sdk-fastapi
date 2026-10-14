@@ -1,12 +1,260 @@
 # MicroAuth SDK for FastAPI
 
-API key authentication, per customer rate limiting and metered billing for
-your FastAPI API, powered by [MicroAuth](https://microauth.com), in one
-dependency.
+Everything a FastAPI app needs from [MicroAuth](https://microauth.com), in
+one dependency:
+
+- **Sign users in** to your web app, with sessions, roles and permissions
+  (`UserAuth`).
+- **Protect an API** that other apps call with MicroAuth access tokens
+  (`TokenAuth`).
+- **Protect an MCP server** so AI agents act for a user with only the scopes
+  that user approved (`McpAuth`).
+- **Sell your API** with API keys, per customer rate limits and metered
+  billing, with a receipt for every charge (`MicroAuth`).
 
 ```bash
 pip install microauth-fastapi
+pip install "microauth-fastapi[mcp]"  # adds the MCP SDK for McpAuth
 ```
+
+Settings come from the environment, and any `MICROAUTH_*` value that is not
+set there is read from a `.env` file in the working directory. The SDK needs
+Python 3.10 or newer.
+
+## Sign users in
+
+`UserAuth` adds sign in, sign up and sign out to a FastAPI web app. Your
+server runs the OpenID Connect code flow against your MicroAuth service and
+keeps the session in an encrypted, HttpOnly cookie, so browser JavaScript
+never holds a token and a cross site scripting bug can't steal one.
+
+```python
+from fastapi import Depends, FastAPI
+from microauth_fastapi import User, UserAuth
+
+app = FastAPI()
+auth = UserAuth(app)
+
+
+@app.get("/dashboard")
+async def dashboard(user: User = Depends(auth.login_required)):
+    return {"hello": user.name}
+
+
+@app.post("/api/posts")
+async def create_post(user: User = Depends(auth.require(permissions="posts:write"))): ...
+```
+
+```bash
+# .env, next to your app
+MICROAUTH_ISSUER=https://auth.example.com
+MICROAUTH_CLIENT_ID=...
+MICROAUTH_CLIENT_SECRET=...
+MICROAUTH_COOKIE_SECRET=...
+MICROAUTH_APP_URL=https://app.example.com
+```
+
+Create a web application in the MicroAuth dashboard with the redirect URI
+`https://app.example.com/auth/callback` and the sign out URL
+`https://app.example.com/`. The cookie secret is yours to make: at least 32
+random bytes, for example from
+`python -c 'import secrets; print(secrets.token_urlsafe(32))'`. For local
+development, `http://localhost:8000` works as the app URL.
+
+`UserAuth(app)` adds these routes:
+
+- `GET /auth/login?next=/path` starts sign in and comes back to `next`,
+  which must be a path on your site.
+- `GET /auth/signup?next=/path` does the same, opening on the sign up
+  screen.
+- `GET /auth/callback` is where MicroAuth sends the browser back after sign
+  in.
+- `POST /auth/logout` signs out here and at MicroAuth. Send it from a form
+  or `fetch` on your own site.
+- `GET /auth/me` returns the signed in user as JSON, or `401`.
+
+Use these as dependencies:
+
+- `auth.user` gives the `User`, or answers `401`.
+- `auth.optional` gives the `User`, or `None` when nobody is signed in.
+- `auth.login_required` gives the `User`, or redirects to sign in and back.
+  Use it for pages.
+- `auth.require(permissions=..., roles=...)` gives the `User` when they hold
+  every permission and role listed, and answers `403` otherwise. Add
+  `redirect=True` for pages.
+
+`User` has `id`, `email`, `email_verified`, `name`, `picture`, `roles`,
+`permissions`, `session_id` and the raw `claims`, plus `has_role()` and
+`has_permission()`. Roles and permissions come from the `roles` scope.
+`401` and `403` answers are problem JSON (RFC 9457) that keeps the `detail`
+field FastAPI clients already read.
+
+How sessions work:
+
+- Sign in uses PKCE, state and nonce, and pushed authorization requests when
+  MicroAuth offers them. The response must name your issuer in `iss`
+  (RFC 9207), and the ID token must be RS256, issued to this app and
+  unexpired.
+- The session cookie is `__Host-microauth` on https and `microauth` on plain
+  http: HttpOnly, `SameSite=Lax`, `Path=/`, and encrypted with AES-256-GCM.
+  A large session is split into `__Host-microauth.0`, `.1` and so on. A
+  cookie that doesn't decrypt counts as signed out.
+- Access tokens are short lived. The SDK refreshes them just before they
+  expire, once per session even under parallel requests, and writes the new
+  cookie on whatever response your route returns. That is when role changes
+  and suspensions reach your app. When MicroAuth ends the session, the user
+  is signed out.
+- POST, PUT, PATCH and DELETE requests that carry the session must come from
+  your own origin, checked with `Origin` or `Referer`. That stops cross site
+  form posts.
+- To rotate the cookie secret, set `MICROAUTH_COOKIE_SECRET=new,old`. The
+  first secret encrypts and all of them decrypt. Remove the old one once
+  sessions have been rewritten.
+
+`UserAuth` settings, with their defaults in brackets:
+
+- `issuer` (`$MICROAUTH_ISSUER`): your MicroAuth service, such as
+  `https://auth.example.com`.
+- `client_id` (`$MICROAUTH_CLIENT_ID`) and `client_secret`
+  (`$MICROAUTH_CLIENT_SECRET`): the web application's credentials.
+- `cookie_secret` (`$MICROAUTH_COOKIE_SECRET`): 32 or more random bytes,
+  comma separated to rotate.
+- `app_url` (`$MICROAUTH_APP_URL`): your app's public origin. The redirect
+  URI is built from it.
+- `scopes` (`openid profile email roles`): the scopes to ask for.
+- `resource` (`None`) and `keep_access_token` (`False`): get an access token
+  for one of your APIs and keep it, so `await auth.access_token(request)`
+  can call that API from your server.
+- `prefix` (`/auth`): where the routes live.
+- `after_sign_in` (`/`): where people land when the sign in link had no
+  `next`.
+- `after_sign_out` (`/`): where MicroAuth sends people after signing out.
+- `cookie_name` (`microauth`): the base name of the cookies.
+- `session_max_age` (30 days): the longest a session lasts, however often
+  it is refreshed.
+- `max_age` (`None`): make people sign in again when their last sign in is
+  older than this many seconds.
+
+## Protect an API with access tokens
+
+`TokenAuth` checks MicroAuth access tokens on an API that other apps,
+scripts or services call with `Authorization: Bearer <token>`.
+
+```python
+from fastapi import Depends, FastAPI
+from microauth_fastapi import TokenAuth, TokenClaims
+
+app = FastAPI()
+api = TokenAuth(app)  # reads MICROAUTH_ISSUER and MICROAUTH_RESOURCE
+
+
+@app.get("/posts")
+async def posts(token: TokenClaims = Depends(api.require("posts:read"))):
+    return {"user": token.sub, "app": token.client_id}
+```
+
+`MICROAUTH_RESOURCE` is the API's identifier exactly as you registered it in
+MicroAuth, such as `https://api.example.com`.
+
+- A token must be an RS256 JWT of type `at+jwt` from your issuer, with your
+  resource in `aud`. A token minted for a different API is refused even
+  when the same MicroAuth service issued it.
+- Signing keys are cached and refreshed every 15 minutes, and fetched again
+  right away (at most once a minute) when a token names a key the SDK hasn't
+  seen.
+- A missing or bad token gets `401` with
+  `WWW-Authenticate: Bearer resource_metadata="..."`, plus
+  `error="invalid_token"` when a token was sent. A token without a required
+  scope gets `403` with `error="insufficient_scope"` and every scope the
+  route needs.
+- The protected resource metadata (RFC 9728) is served at
+  `/.well-known/oauth-protected-resource`, followed by the resource's path
+  when it has one: `/.well-known/oauth-protected-resource/v1` for
+  `https://api.example.com/v1`.
+- `TokenClaims` has `sub`, `client_id`, `scopes`, `audience`, `expires_at`,
+  `issued_at`, `token_id`, `session_id`, `auth_time` and the raw `claims`.
+- `TokenAuth(scopes=...)` adds scopes every route needs, and
+  `Depends(api.require())` with no scopes needs only a valid token.
+
+## Protect an MCP server
+
+`McpAuth` puts MicroAuth in front of a remote MCP server built with the
+official MCP Python SDK, following the MCP 2026-07-28 authorization spec.
+Install it with `pip install "microauth-fastapi[mcp]"`.
+
+```python
+from mcp.server.mcpserver import MCPServer
+from microauth_fastapi import McpAuth, current_identity
+
+mcp = MCPServer("Invoices")
+auth = McpAuth(scopes=["invoices:read"])  # reads MICROAUTH_ISSUER and MICROAUTH_RESOURCE
+
+
+@mcp.tool()
+@auth.tool("invoices:read")
+def list_invoices() -> list[dict]:
+    return invoices_owned_by(current_identity().sub)
+
+
+@mcp.tool()
+@auth.tool("invoices:write")
+def create_invoice(customer: str, amount_cents: int) -> dict: ...
+
+
+app = auth.wrap(mcp.streamable_http_app(stateless_http=True, json_response=True))
+```
+
+Serve `app` at the root of its host, with `MICROAUTH_RESOURCE` set to the
+server's URL, such as `https://mcp.example.com/mcp`.
+
+- Every request needs a valid token for that resource holding the `scopes`
+  given to `McpAuth`. Without one the client gets `401` with a challenge
+  that names the metadata URL and those scopes, which is how MCP clients
+  find out where to sign in.
+- A `tools/call` also needs the scopes declared for that tool, with
+  `@auth.tool(...)` (named after the function, or pass `name=`) or with
+  `McpAuth(tool_scopes={"create_invoice": ["invoices:write"]})`. A token
+  missing one gets `403` with `error="insufficient_scope"` and every scope
+  the tool needs, so the client asks the user once. Tools without declared
+  scopes need only the base scopes, and the SDK logs a warning the first
+  time one is called.
+- The protected resource metadata is served at both
+  `/.well-known/oauth-protected-resource/mcp` and
+  `/.well-known/oauth-protected-resource`.
+- Each POST must carry one JSON-RPC message, as the 2026-07-28 transport
+  sends them. Batches are refused, and the `Mcp-Method` and `Mcp-Name`
+  headers must match the body.
+- Inside a tool, `current_identity()` returns the caller's `TokenClaims`.
+  The MCP SDK's own `get_access_token()` works too.
+- Scopes decide what kind of action a client may take, not which records it
+  may touch. Check ownership in the tool, as
+  [`examples/invoices_mcp.py`](https://github.com/Zyref-Org/microauth-sdk-fastapi/blob/main/examples/invoices_mcp.py)
+  does.
+
+If you would rather use the MCP SDK's own auth settings,
+`MicroAuthTokenVerifier` is a `TokenVerifier` that checks tokens exactly like
+`TokenAuth`:
+
+```python
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.mcpserver import MCPServer
+from microauth_fastapi import MicroAuthTokenVerifier
+
+mcp = MCPServer(
+    "Invoices",
+    token_verifier=MicroAuthTokenVerifier(),
+    auth=AuthSettings(
+        issuer_url="https://auth.example.com",
+        resource_server_url="https://mcp.example.com/mcp",
+        required_scopes=["invoices:read"],
+    ),
+)
+```
+
+## Sell your API with API keys
+
+`MicroAuth` adds API key authentication, per customer rate limiting and
+metered billing to your API.
 
 ```python
 from fastapi import FastAPI, Security
@@ -27,9 +275,7 @@ MICROAUTH_SECRET_KEY=mas_...
 ```
 
 That's the whole integration. Your API's SDK secret is on its **Connect** tab
-in the [MicroAuth dashboard](https://microauth.com/app). Settings come from
-the environment, and any `MICROAUTH_*` value that is not set there is read
-from a `.env` file in the working directory.
+in the [MicroAuth dashboard](https://microauth.com/app).
 
 Your customers sign up on your developer portal, create API keys, and pick a
 plan or add credit. Every request to `/forecast` is then authenticated, rate
@@ -37,7 +283,7 @@ limited and billed, and MicroAuth answers every charge with a receipt.
 
 The [FastAPI guide](https://microauth.com/docs/fastapi) explains each part in
 more depth, and the [SDK reference](https://microauth.com/docs/fastapi-reference)
-lists every option, field and error. The SDK needs Python 3.10 or newer.
+lists every option, field and error.
 
 ## Check your setup
 
@@ -386,21 +632,34 @@ journal and shutdown drain failures raise exported subclasses of
 
 ## Platform contract
 
-The SDK talks to three endpoints: `GET /sdk/v1/snapshot`,
+`MicroAuth` talks to three endpoints: `GET /sdk/v1/snapshot`,
 `GET /sdk/v1/keys/verify` and `POST /sdk/v1/usage`. They are documented in
 the [HTTP API guide](https://microauth.com/docs/http-api). Every call sends
 `User-Agent: microauth-fastapi/<version> python/<version>`, which lets the
 dashboard show which SDK version is connected.
+
+`UserAuth`, `TokenAuth` and `McpAuth` only talk to your issuer, through the
+endpoints its `/.well-known/openid-configuration` document lists: the
+signing keys, and for `UserAuth` the pushed authorization, token,
+revocation and end session endpoints. The discovery document is cached for
+an hour and must name exactly the issuer you configured.
 
 MicroAuth generates golden fixtures of each response from its own types. The
 SDK's tests parse copies of them in `tests/contract`, and compare them byte
 for byte with the originals when both repositories are checked out side by
 side.
 
-## Example app
+## Example apps
 
 See [`examples/weather_api.py`](https://github.com/Zyref-Org/microauth-sdk-fastapi/blob/main/examples/weather_api.py):
 
 ```bash
 MICROAUTH_SECRET_KEY=mas_... uvicorn examples.weather_api:app --reload
 ```
+
+[`examples/blog_cms.py`](https://github.com/Zyref-Org/microauth-sdk-fastapi/blob/main/examples/blog_cms.py)
+signs people in with `UserAuth`: anyone reads posts, editors write them and
+admins delete them.
+[`examples/invoices_mcp.py`](https://github.com/Zyref-Org/microauth-sdk-fastapi/blob/main/examples/invoices_mcp.py)
+is an MCP server with a scope per tool and an ownership check in each one.
+Their docstrings say how to set them up.

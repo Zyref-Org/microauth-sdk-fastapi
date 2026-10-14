@@ -37,9 +37,11 @@ jobs:
           cache: pip
 
       - name: Install test dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
         run: |
           python -m pip install --disable-pip-version-check --upgrade pip
-          python -m pip install --disable-pip-version-check -e ".[dev,redis]"
+          python -m pip install -e ".[dev,redis,mcp]"
 
       - name: Run tests
         run: python -m pytest

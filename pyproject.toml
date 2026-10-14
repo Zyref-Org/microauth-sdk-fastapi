@@ -4,13 +4,23 @@ build-backend = "hatchling.build"
 
 [project]
 name = "microauth-fastapi"
-version = "3.0.0"
-description = "MicroAuth SDK for FastAPI: API key auth, rate limiting and metered billing with a receipt for every charge"
+version = "3.1.0"
+description = "MicroAuth SDK for FastAPI: user sign in, access tokens for APIs and MCP servers, and API keys with metered billing"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "Zyref, LLC" }]
-keywords = ["fastapi", "api-keys", "authentication", "billing", "rate-limiting", "microauth"]
+keywords = [
+    "fastapi",
+    "authentication",
+    "oauth",
+    "openid-connect",
+    "mcp",
+    "api-keys",
+    "billing",
+    "rate-limiting",
+    "microauth",
+]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Framework :: FastAPI",
@@ -25,12 +35,16 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    "cryptography>=44.0.1",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
+    "PyJWT[crypto]>=2.10.1",
 ]
 
 [project.optional-dependencies]
 redis = ["redis>=5.0.1"]
+# 2.0 is the first MCP Python SDK release that speaks the 2026-07-28 protocol.
+mcp = ["mcp>=2.0"]
 dev = ["build", "mypy", "pip-audit", "pytest", "ruff"]
 
 [project.urls]
@@ -62,3 +76,8 @@ python_version = "3.10"
 packages = ["microauth_fastapi"]
 check_untyped_defs = true
 warn_unused_ignores = true
+
+# The MCP SDK is an optional extra, imported lazily.
+[[tool.mypy.overrides]]
+module = ["mcp", "mcp.*"]
+ignore_missing_imports = true

@@ -1,5 +1,54 @@
 # Changelog
 
+## 3.1.0
+
+Sign users in, protect APIs with access tokens and protect MCP servers, all
+against your MicroAuth service. Nothing changes for `MicroAuth` and API keys.
+
+### Sign users in
+
+- `UserAuth` runs the OpenID Connect code flow from your server, with PKCE,
+  state, nonce, pushed authorization requests and the RFC 9207 `iss` check.
+  It adds `/auth/login`, `/auth/signup`, `/auth/callback`, `/auth/logout`
+  and `/auth/me`.
+- Sessions live in an encrypted, HttpOnly cookie (`__Host-microauth` on
+  https), split into numbered chunks when large. Access tokens are refreshed
+  before they expire, once per session, and the new cookie is written on
+  whatever response the route returns.
+- Dependencies `auth.user`, `auth.optional`, `auth.login_required` and
+  `auth.require(permissions=..., roles=...)` hand routes a `User` with roles
+  and permissions.
+- Unsafe requests that carry the session must come from your own origin.
+- Settings: `MICROAUTH_ISSUER`, `MICROAUTH_CLIENT_ID`,
+  `MICROAUTH_CLIENT_SECRET`, `MICROAUTH_COOKIE_SECRET` (comma separated to
+  rotate) and `MICROAUTH_APP_URL`.
+
+### Access tokens
+
+- `TokenAuth` checks RS256 access tokens (RFC 9068) for one resource, set
+  with `MICROAUTH_RESOURCE`. `api.require(...)` gives routes `TokenClaims`.
+- Failures follow RFC 6750, pointing clients at the protected resource
+  metadata (RFC 9728) that `TokenAuth` serves.
+
+### MCP servers
+
+- `McpAuth` wraps a Streamable HTTP MCP server per the MCP 2026-07-28
+  authorization spec: metadata at both well-known locations, `401`
+  challenges with the scopes to ask for, and per tool scopes checked on
+  every `tools/call` with a `403` step up when one is missing.
+- `current_identity()` tells a tool who is calling.
+- `MicroAuthTokenVerifier` is a `TokenVerifier` for servers that use the MCP
+  SDK's own auth settings.
+
+### Other changes
+
+- New exceptions, all subclasses of `AuthDenied`: `SignInRequired`,
+  `SignInRedirect`, `PermissionDenied`, `CrossSiteRequest`, `InvalidToken`
+  and `InsufficientScope`.
+- `cryptography` and `PyJWT[crypto]` are now dependencies. The new `mcp`
+  extra installs the MCP Python SDK 2.0 or newer.
+- New examples: `examples/blog_cms.py` and `examples/invoices_mcp.py`.
+
 ## 3.0.0
 
 Built for the MicroAuth platform as it runs today, with a receipt for every
