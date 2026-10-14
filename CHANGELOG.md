@@ -49,6 +49,9 @@ service. Nothing changes for `MicroAuth` and the API keys you sell.
   needed and an `error_description` naming the missing ones, and the body
   is a JSON-RPC error with the same sentence, so the official MCP client
   shows it.
+- A POST refused with `401`, `429` or `503` gets a JSON-RPC error body too,
+  so a client holding a revoked API key shows why. OAuth discovery after a
+  `401` works as before. `503` and `429` carry `Retry-After`.
 - `auth.mount(app, mcp)` serves an `MCPServer` inside a FastAPI or
   Starlette app: the MCP endpoint, the metadata, the session manager in the
   app's lifespan, and closing `McpAuth` at shutdown. `auth.wrap()` still
@@ -56,7 +59,8 @@ service. Nothing changes for `MicroAuth` and the API keys you sell.
 - `current_identity()` tells a tool who is calling.
 - `MicroAuthTokenVerifier` is a `TokenVerifier` for servers that use the MCP
   SDK's own auth settings. The README lists what it can't do that `McpAuth`
-  does.
+  does, and its sample sets `validate_token_resource=True`, which MCP 2.3.0
+  warns about when missing.
 
 ### Your users' API keys
 
@@ -116,6 +120,14 @@ service. Nothing changes for `MicroAuth` and the API keys you sell.
   extra installs the MCP Python SDK 2.0 or newer.
 - New examples: `examples/blog_cms.py`, `examples/invoices_mcp.py` and
   `examples/api_and_mcp.py`. All three take API keys.
+- Every code sample in the README now runs as written, with its imports and
+  app. The README also explains which settings are read from a `.env` file
+  and why MCP samples pass `log_level` to `MCPServer`.
+- `PlatformMonthlyAllowance` isn't returned by any public method or field,
+  and its docstring now says so. It stays exported because earlier releases
+  exported it.
+- The tests' fake OpenID provider now behaves like the real server, from
+  discovery and audiences to refresh token rotation.
 
 ## 3.0.0
 

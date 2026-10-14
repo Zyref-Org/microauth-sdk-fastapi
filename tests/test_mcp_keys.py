@@ -119,6 +119,14 @@ def call(tool: str, credential: str | None) -> dict[str, Any]:
     return {"json": message, "headers": headers}
 
 
+def refused(response: httpx.Response) -> tuple[str, str]:
+    """The OAuth error code and the sentence of a JSON-RPC refusal."""
+    body = response.json()
+    assert body["jsonrpc"] == "2.0" and body["id"] is None
+    assert body["error"]["code"] == response.status_code
+    return body["error"]["data"]["error"], body["error"]["message"]
+
+
 def run(test: Callable[[], Any]) -> None:
     asyncio.run(test())
 
@@ -188,14 +196,15 @@ def test_an_unknown_key_gets_invalid_token() -> None:
             mistyped = await client.post("/mcp", **call("list_invoices", "cms_" + "0" * 46))
             missing = await client.post("/mcp", **call("list_invoices", None))
         assert unknown.status_code == 401
-        assert unknown.json() == {
-            "error": "invalid_token",
-            "error_description": "The API key is unknown, revoked or expired",
-        }
+        assert refused(unknown) == (
+            "invalid_token",
+            "The API key is unknown, revoked or expired.",
+        )
+        assert 'error_description="The API key is unknown' in unknown.headers["www-authenticate"]
         assert mistyped.status_code == 401
-        assert "mistyped" in mistyped.json()["error_description"]
-        assert missing.json()["error_description"] == (
-            "Send a MicroAuth access token or API key in the Authorization header"
+        assert "mistyped" in refused(mistyped)[1]
+        assert refused(missing)[1] == (
+            "Send a MicroAuth access token or API key in the Authorization header."
         )
         assert len(fake.introspections) == 1
 
@@ -227,20 +236,16 @@ def test_limits_answer_429_with_retry_after() -> None:
             over = await client.post("/mcp", **call("list_invoices", key.secret))
             assert over.status_code == 429
             assert over.headers["retry-after"] == "60"
-            assert over.json() == {
-                "error": "rate_limited",
-                "error_description": (
-                    "This API allows 1 requests a minute with each person's API keys"
-                ),
-            }
+            assert refused(over) == (
+                "rate_limited",
+                "This API allows 1 requests a minute with each person's API keys.",
+            )
             assert (
                 await client.post("/mcp", **call("list_invoices", make_key()))
             ).status_code == 401
             throttled = await client.post("/mcp", **call("list_invoices", make_key()))
             assert throttled.status_code == 429
-            assert throttled.json()["error_description"] == (
-                "Too many unknown API keys came from this address"
-            )
+            assert refused(throttled)[1] == "Too many unknown API keys came from this address."
 
     run(main)
 
@@ -274,7 +279,10 @@ def test_an_outage_answers_503() -> None:
         async with client_for(app) as client:
             response = await client.post("/mcp", **call("list_invoices", key.secret))
         assert response.status_code == 503
-        assert response.json()["error"] == "temporarily_unavailable"
+        assert refused(response) == (
+            "temporarily_unavailable",
+            "Authorization is temporarily unavailable.",
+        )
         assert response.headers["retry-after"] == "5"
 
     run(main)
@@ -328,9 +336,7 @@ def test_mcp_keys_are_off_by_default() -> None:
             response = await client.post("/mcp", **call("list_invoices", key.secret))
             missing = await client.post("/mcp", **call("list_invoices", None))
         assert response.status_code == 401
-        assert missing.json()["error_description"] == (
-            "Send a MicroAuth access token in the Authorization header"
-        )
+        assert refused(missing)[1] == "Send a MicroAuth access token in the Authorization header."
         assert fake.introspections == []
 
     run(main)

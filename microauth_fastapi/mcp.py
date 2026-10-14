@@ -101,6 +101,9 @@ _INSUFFICIENT_SCOPE = 403
 # spec's own tool names are 1 to 128 of these characters.
 _SAFE_TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 _NO_MESSAGE = object()
+# Refused before the body is read, so the JSON-RPC error has no id. The
+# official MCP client then uses the id of the request it sent.
+_AUTH_REFUSALS = frozenset({401, 429, 503})
 
 _identity: ContextVar[TokenClaims | None] = ContextVar("microauth_mcp_identity", default=None)
 
@@ -173,6 +176,14 @@ def _rpc_error(
     if data is not None:
         error["data"] = data
     return {"jsonrpc": "2.0", "id": request_id, "error": error}
+
+
+def _rpc_refusal(status: int, body: dict[str, Any]) -> dict[str, Any]:
+    """An OAuth style error ``body`` as a JSON-RPC error, which MCP clients show."""
+    message = body["error_description"]
+    if not message.endswith((".", "!", "?")):
+        message += "."
+    return _rpc_error(None, status, message, {"error": body["error"]})
 
 
 def _missing_scopes_detail(what: str, missing: Iterable[str], via: Via) -> str:
@@ -399,6 +410,8 @@ class McpAuth:
 
     @property
     def scopes_supported(self) -> frozenset[str]:
+        """The scopes the metadata document lists: ``scopes_supported`` when
+        given, otherwise ``scopes``. Per tool scopes aren't included."""
         if self._scopes_supported is not None:
             return self._scopes_supported
         return self.required_scopes
@@ -507,7 +520,7 @@ class McpAuth:
 
     # Serving
 
-    async def serve(self, app: Any, scope: dict[str, Any], receive: Any, send: Any) -> None:
+    async def _serve(self, app: Any, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] != "http":
             if scope["type"] == "websocket":
                 await send({"type": "websocket.close", "code": 1008})
@@ -533,7 +546,10 @@ class McpAuth:
             elif not self.required_scopes <= claims.scopes:
                 raise self._forbidden(_NO_MESSAGE, self.required_scopes, "This MCP server", claims)
         except _Reject as reject:
-            await _send_json(send, reject.status, reject.body, reject.headers)
+            answer = reject.body
+            if method == "POST" and reject.status in _AUTH_REFUSALS:
+                answer = _rpc_refusal(reject.status, answer)
+            await _send_json(send, reject.status, answer, reject.headers)
             return
         except _ClientGone:
             return
@@ -740,7 +756,7 @@ class _ProtectedApp:
         self.app = app
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        await self.auth.serve(self.app, scope, receive, send)
+        await self.auth._serve(self.app, scope, receive, send)
 
 
 class _MetadataApp:

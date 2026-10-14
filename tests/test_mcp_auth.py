@@ -139,8 +139,23 @@ def test_no_token_gets_401_with_the_metadata_url_and_scope() -> None:
         assert response.headers["www-authenticate"] == (
             f'Bearer resource_metadata="{METADATA}", scope="invoices:read"'
         )
-        assert response.json()["error"] == "invalid_token"
+        assert response.json() == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {
+                "code": 401,
+                "message": "Send a MicroAuth access token in the Authorization header.",
+                "data": {"error": "invalid_token"},
+            },
+        }
         assert server.calls == []
+        async with client_for(app) as client:
+            stream = await client.get("/mcp", headers=headers("tools/list"))
+        assert stream.status_code == 401
+        assert stream.json() == {
+            "error": "invalid_token",
+            "error_description": "Send a MicroAuth access token in the Authorization header",
+        }
 
     run(main)
 

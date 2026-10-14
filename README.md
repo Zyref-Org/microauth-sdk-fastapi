@@ -133,14 +133,18 @@ your app registered. `refusal_response(request, exc)` builds the answer the
 SDK would have sent, so your handler can still use it for API calls:
 
 ```python
-from fastapi import Request
-from microauth_fastapi import PermissionDenied, refusal_response
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+from microauth_fastapi import PermissionDenied, UserAuth, refusal_response
+
+app = FastAPI()
+auth = UserAuth(app)
 
 
 @app.exception_handler(PermissionDenied)
 async def permission_denied(request: Request, exc: PermissionDenied):
     if "text/html" in request.headers.get("accept", ""):
-        return templates.TemplateResponse(request, "403.html", status_code=403)
+        return HTMLResponse("<h1>You can't open this page</h1>", status_code=403)
     return await refusal_response(request, exc)
 ```
 
@@ -260,17 +264,22 @@ from microauth_fastapi import McpAuth, current_identity
 
 mcp = MCPServer("Invoices", log_level="WARNING")
 auth = McpAuth(scopes=["invoices:read"])  # reads MICROAUTH_ISSUER and MICROAUTH_RESOURCE
+INVOICES: list[dict] = []  # your database
 
 
 @mcp.tool()
 @auth.tool("invoices:read")
 def list_invoices() -> list[dict]:
-    return invoices_owned_by(current_identity().sub)
+    me = current_identity().sub
+    return [invoice for invoice in INVOICES if invoice["owner"] == me]
 
 
 @mcp.tool()
 @auth.tool("invoices:write")
-def create_invoice(customer: str, amount_cents: int) -> dict: ...
+def create_invoice(customer: str, amount_cents: int) -> dict:
+    invoice = {"owner": current_identity().sub, "customer": customer, "amount_cents": amount_cents}
+    INVOICES.append(invoice)
+    return invoice
 
 
 app = FastAPI()
@@ -345,7 +354,7 @@ so an API on the same host keeps its own document. MCP clients find it
 either way: the official Python client (2.3.0) tries the URL in the
 challenge first, then the path inserted URL, then the root.
 
-What MCP clients show for a missing scope today:
+What MCP clients show when a request is refused:
 
 - The official Python client (2.3.0), when it signed in with OAuth, treats
   the `403` as a step up. It asks the user to approve the scopes in the
@@ -357,10 +366,14 @@ What MCP clients show for a missing scope today:
   `Server returned an error response`.
 - Other clients show either the `error_description` from the header or the
   `message` from the body, which say the same thing.
-- A `401` body is an OAuth error, not JSON-RPC. A client that can't sign in,
-  such as one sending an unknown or revoked API key, shows only
-  `Server returned an error response`. The reason is in the body's
-  `error_description`, and for a bad credential in the header's too.
+- A POST refused with `401`, `429` or `503` also gets a JSON-RPC error body,
+  with the HTTP status as its `code`, the reason as its `message` and the
+  OAuth `error` in `data`. Its `id` is `null`, since the message wasn't read.
+  So a client that can't sign in, such as one sending a revoked API key,
+  shows `The API key is unknown, revoked or expired.` The `401` still starts
+  OAuth discovery as before, because clients look only at its status and
+  `WWW-Authenticate` header. A GET or DELETE gets a plain OAuth error body
+  with `error` and `error_description`.
 
 ### An API and an MCP server in one app
 
@@ -370,6 +383,12 @@ Pass each one its resource and credentials, since the `MICROAUTH_RESOURCE*`
 variables can hold only one of each:
 
 ```python
+import os
+
+from fastapi import FastAPI
+from mcp.server.mcpserver import MCPServer
+from microauth_fastapi import McpAuth, TokenAuth
+
 app = FastAPI()
 api = TokenAuth(
     app,
@@ -378,6 +397,7 @@ api = TokenAuth(
     resource_client_id=os.environ["API_CLIENT_ID"],
     resource_secret=os.environ["API_SECRET"],
 )
+mcp = MCPServer("Tasks", log_level="WARNING")
 mcp_auth = McpAuth(
     resource="https://example.com/mcp",
     scopes=["tasks:read"],
@@ -385,6 +405,7 @@ mcp_auth = McpAuth(
     resource_client_id=os.environ["MCP_CLIENT_ID"],
     resource_secret=os.environ["MCP_SECRET"],
 )
+# Routes use api.require(...), and tools use @mcp.tool() with @mcp_auth.tool(...).
 mcp_auth.mount(app, mcp)
 ```
 
@@ -415,9 +436,13 @@ mcp = MCPServer(
         issuer_url="https://auth.example.com",
         resource_server_url="https://mcp.example.com/mcp",
         required_scopes=["invoices:read"],
+        validate_token_resource=True,
     ),
 )
 ```
+
+`validate_token_resource=True` makes the MCP SDK check that each token was
+issued for this server. MCP 2.3.0 warns when it is left out.
 
 The MCP SDK lets a verifier only accept or refuse a token, so some of what
 `McpAuth` does isn't possible this way. An issuer outage looks like a bad
@@ -434,6 +459,10 @@ inside your app, each carrying the permissions they pick. `TokenAuth` and
 `McpAuth` accept them next to access tokens:
 
 ```python
+from fastapi import Depends, FastAPI
+from microauth_fastapi import TokenAuth, TokenClaims
+
+app = FastAPI()
 api = TokenAuth(app, api_keys=True)
 
 
@@ -543,6 +572,10 @@ A CMS's own pages and its users' scripts often need the same API.
 `UserAuth` along with access tokens and keys:
 
 ```python
+from fastapi import Depends, FastAPI
+from microauth_fastapi import TokenAuth, TokenClaims, UserAuth
+
+app = FastAPI()
 auth = UserAuth(app)
 api = TokenAuth(app, api_keys=True, sessions=auth)
 
@@ -568,8 +601,13 @@ People can always manage their keys on MicroAuth's account page. To offer
 the same in your app, turn on `api_keys` in `UserAuth`:
 
 ```python
+import html
+
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from microauth_fastapi import ReauthenticationRequired, User, UserAuth
 
+app = FastAPI()
 auth = UserAuth(app, api_keys=True)
 
 
@@ -585,7 +623,10 @@ async def create_key(request: Request, user: User = Depends(auth.login_required)
         )
     except ReauthenticationRequired as exc:
         return RedirectResponse(exc.login_url, status_code=303)
-    return show_once(new.secret)
+    return HTMLResponse(
+        f"<p>Copy your key now, it won't be shown again:</p><pre>{html.escape(new.secret)}</pre>",
+        headers={"Cache-Control": "no-store"},
+    )
 ```
 
 `UserAuth(api_keys=True)` asks for the reserved `microauth:api_keys` scope and
@@ -736,19 +777,26 @@ covers what to do when a check fails.
 Pass hooks to keep your own record of every charge and every refusal:
 
 ```python
+import logging
+
+from fastapi import FastAPI
 from microauth_fastapi import MicroAuth, UsageReceipt, UsageRejection
+
+logger = logging.getLogger("billing")
+LEDGER: dict[str, UsageReceipt] = {}  # your database
 
 
 async def keep_receipts(receipts: list[UsageReceipt]) -> None:
     for receipt in receipts:
-        await ledger.save(receipt.idempotency_key, receipt)
+        LEDGER[receipt.idempotency_key] = receipt
 
 
 async def flag_rejections(rejections: list[UsageRejection]) -> None:
     for rejection in rejections:
-        alerts.send(f"MicroAuth refused {rejection.count} request(s): {rejection.detail}")
+        logger.error("MicroAuth refused %d request(s): %s", rejection.count, rejection.detail)
 
 
+app = FastAPI()
 auth = MicroAuth(app, on_receipts=keep_receipts, on_rejections=flag_rejections)
 ```
 
@@ -823,6 +871,10 @@ across every worker and machine. The same Redis connection also shares
 snapshots and coordinates refreshes:
 
 ```python
+from fastapi import FastAPI
+from microauth_fastapi import MicroAuth
+
+app = FastAPI()
 auth = MicroAuth(app, redis_url="redis://localhost:6379/0")
 ```
 
@@ -857,7 +909,11 @@ managed plan's connection cap. Size it so instances times pool size stays
 under your plan's limit:
 
 ```python
-auth = MicroAuth(app, redis_url=redis_url, redis_max_connections=10)
+from fastapi import FastAPI
+from microauth_fastapi import MicroAuth
+
+app = FastAPI()
+auth = MicroAuth(app, redis_url="redis://localhost:6379/0", redis_max_connections=10)
 ```
 
 For full control, pass your own client with `redis_client=`. A passed client
@@ -901,6 +957,13 @@ starting configuration.
 For endpoints that serve both anonymous and authenticated traffic:
 
 ```python
+from fastapi import FastAPI, Security
+from microauth_fastapi import Customer, MicroAuth
+
+app = FastAPI()
+auth = MicroAuth(app)
+
+
 @app.get("/status")
 async def status(customer: Customer | None = Security(auth.optional)):
     return {"authenticated": customer is not None}
@@ -970,9 +1033,12 @@ FastAPI `HTTPException`), so you can add your own exception handler to
 reshape response bodies:
 
 ```python
-from fastapi import Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from microauth_fastapi import AuthDenied, PaymentRequired
+from microauth_fastapi import AuthDenied, MicroAuth, PaymentRequired
+
+app = FastAPI()
+auth = MicroAuth(app)
 
 
 @app.exception_handler(AuthDenied)

@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import FastAPI
-from oidc_fake import FakeIssuer
+from oidc_fake import MCP, MCP_CLIENT_ID, MCP_SECRET, FakeIssuer, make_key
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -218,5 +218,158 @@ def test_mount_serves_an_mcp_server_to_the_mcp_sdk_client() -> None:
 
             other_host = await plain.post("https://evil.example/mcp", **rpc_call("whoami", reader))
             assert other_host.status_code == 421
+
+    asyncio.run(main())
+
+
+def found(exc: BaseException, kind: type[BaseException]) -> BaseException | None:
+    """``exc`` or the first ``kind`` inside it, through exception groups and causes."""
+    if isinstance(exc, kind):
+        return exc
+    for inner in [*getattr(exc, "exceptions", ()), exc.__cause__, exc.__context__]:
+        if inner is not None and inner is not exc:
+            hit = found(inner, kind)
+            if hit is not None:
+                return hit
+    return None
+
+
+def test_the_mcp_sdk_client_shows_why_a_key_was_refused() -> None:
+    mcpserver = pytest.importorskip("mcp.server.mcpserver")
+    httpx2 = pytest.importorskip("httpx2")
+    from mcp import Client
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.shared.exceptions import MCPError
+
+    fake = FakeIssuer()
+    auth = McpAuth(
+        issuer=fake.issuer,
+        resource=MCP,
+        scopes=["invoices:read"],
+        api_keys=True,
+        resource_client_id=MCP_CLIENT_ID,
+        resource_secret=MCP_SECRET,
+        http_client=fake.client(),
+    )
+    server = mcpserver.MCPServer("Invoices", log_level="WARNING")
+
+    @server.tool()
+    @auth.tool("invoices:read")
+    def whoami() -> str:
+        return current_identity().sub
+
+    app = FastAPI()
+    auth.mount(app, server)
+    good = fake.add_key(resources=[MCP], permissions=["invoices:read"]).secret
+
+    def key_client(key: str) -> Client:
+        http = httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app),
+            base_url=HOST,
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        return Client(streamable_http_client(f"{HOST}/mcp", http_client=http))
+
+    async def main() -> None:
+        async with app.router.lifespan_context(app):
+            async with key_client(good) as client:
+                assert (await client.call_tool("whoami", {})).content[0].text == "user_1"
+            with pytest.raises(BaseException) as raised:
+                async with key_client(make_key()) as client:
+                    await client.call_tool("whoami", {})
+            refusal = found(raised.value, MCPError)
+            assert refusal is not None, raised.value
+            assert str(refusal) == "The API key is unknown, revoked or expired."
+
+    asyncio.run(main())
+
+
+def test_the_mcp_sdk_oauth_client_still_discovers_and_starts_sign_in() -> None:
+    mcpserver = pytest.importorskip("mcp.server.mcpserver")
+    httpx2 = pytest.importorskip("httpx2")
+    from urllib.parse import parse_qs, urlsplit
+
+    from mcp import Client
+    from mcp.client.auth import OAuthClientProvider
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata
+
+    fake = FakeIssuer()
+    auth = make_auth(fake)
+    server = mcpserver.MCPServer("Invoices", log_level="WARNING")
+
+    @server.tool()
+    @auth.tool("invoices:read")
+    def whoami() -> str:
+        return current_identity().sub
+
+    app = FastAPI()
+    auth.mount(app, server)
+    to_app = httpx2.ASGITransport(app=app)
+    issuer_host = urlsplit(fake.issuer).netloc
+
+    def issuer_documents(request: Any) -> Any:
+        assert request.url.path.startswith("/.well-known/"), request.url
+        return httpx2.Response(200, json=fake.discovery())
+
+    to_issuer = httpx2.MockTransport(issuer_documents)
+    seen: list[tuple[str, int]] = []
+
+    class Router(httpx2.AsyncBaseTransport):
+        async def handle_async_request(self, request: Any) -> Any:
+            target = to_issuer if request.url.netloc.decode() == issuer_host else to_app
+            response = await target.handle_async_request(request)
+            seen.append((str(request.url).split("?")[0], response.status_code))
+            return response
+
+    class Stop(Exception):
+        pass
+
+    redirects: list[str] = []
+
+    async def redirect_handler(url: str) -> None:
+        redirects.append(url)
+        raise Stop
+
+    async def callback_handler() -> Any:
+        raise AssertionError("the test never signs in")
+
+    class Storage:
+        async def get_tokens(self) -> None:
+            return None
+
+        async def set_tokens(self, tokens: Any) -> None: ...
+
+        async def get_client_info(self) -> Any:
+            return OAuthClientInformationFull(
+                client_id="probe", redirect_uris=["http://127.0.0.1:9/callback"]
+            )
+
+        async def set_client_info(self, client_info: Any) -> None:
+            raise AssertionError("the client must not register")
+
+    provider = OAuthClientProvider(
+        server_url=RESOURCE,
+        client_metadata=OAuthClientMetadata(redirect_uris=["http://127.0.0.1:9/callback"]),
+        storage=Storage(),
+        redirect_handler=redirect_handler,
+        callback_handler=callback_handler,
+    )
+
+    async def main() -> None:
+        async with app.router.lifespan_context(app):
+            http = httpx2.AsyncClient(transport=Router(), auth=provider)
+            with pytest.raises(BaseException) as raised:
+                async with Client(streamable_http_client(RESOURCE, http_client=http)) as client:
+                    await client.list_tools()
+            assert found(raised.value, Stop) is not None, raised.value
+        assert seen[0] == (RESOURCE, 401)
+        assert (METADATA, 200) in seen
+        assert any(url.startswith(fake.issuer + "/.well-known/") for url, _ in seen)
+        (url,) = redirects
+        query = parse_qs(urlsplit(url).query)
+        assert url.startswith(fake.discovery()["authorization_endpoint"])
+        assert query["resource"] == [RESOURCE]
+        assert "invoices:read" in query["scope"][0].split()
 
     asyncio.run(main())

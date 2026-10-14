@@ -535,6 +535,9 @@ class TokenAuth:
 
     @property
     def scopes_supported(self) -> frozenset[str]:
+        """The scopes the metadata document lists: ``scopes_supported`` when
+        given, otherwise every scope in ``scopes`` and in the ``require()``
+        calls made so far."""
         if self._scopes_supported is not None:
             return self._scopes_supported
         return frozenset(self._declared)

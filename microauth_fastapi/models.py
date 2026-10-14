@@ -56,7 +56,11 @@ class CustomerBalance:
 
 @dataclass(frozen=True, slots=True)
 class PlatformMonthlyAllowance:
-    """Your MicroAuth plan's monthly request allowance."""
+    """Your MicroAuth plan's monthly request allowance.
+
+    No public method or field returns this type. It stays exported because
+    earlier releases exported it.
+    """
 
     limit: int
     used: int
