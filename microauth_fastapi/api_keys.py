@@ -41,10 +41,12 @@ from urllib.parse import quote
 import httpx
 from fastapi import Request
 
+from ._oidc import OUTAGE_RETRY_AFTER
 from ._time import parse_iso8601
 from .client import USER_AGENT
 from .exceptions import (
     AccountAPIError,
+    AccountAPIUnavailable,
     AuthUnavailable,
     ErrorDetail,
     MicroAuthConfigurationError,
@@ -66,6 +68,7 @@ MAX_LOGIN_MAX_AGE = 86_400
 _MAX_RESPONSE_BYTES = 1024 * 1024
 _MAX_KEY_ID_LENGTH = 128
 _CHALLENGE_PARAM = re.compile(r'([A-Za-z0-9_-]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^\s,"]*))')
+_PLAIN_FIRST_WORD = re.compile(r"[a-z]+(?:'[a-z]+)?(?:\s|$)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +274,20 @@ def parse_options(value: Any) -> APIKeyOptions:
     )
 
 
+def sentence(words: str) -> str:
+    """``words`` as a sentence: a capital first letter and a closing period.
+
+    Only a plain lowercase first word is capitalized, so a message that
+    starts with a name such as ``posts:delete`` keeps it as written.
+    """
+    words = words.strip()
+    if _PLAIN_FIRST_WORD.match(words):
+        words = words[0].upper() + words[1:]
+    if words and words[-1] not in ".!?":
+        words += "."
+    return words
+
+
 def parse_problem(status: int, body: Any) -> AccountAPIError:
     """The typed error for an RFC 9457 problem response."""
     title = detail = None
@@ -289,7 +306,12 @@ def parse_problem(status: int, body: Any) -> AccountAPIError:
                         value=item.get("value"),
                     )
                 )
-    message = detail or title or f"the Account API answered {status}"
+    if errors:
+        message = " ".join(sentence(error.message) for error in errors if error.message.strip())
+    else:
+        message = sentence(detail or title or "")
+    if not message:
+        message = f"The request to manage API keys was refused with status {status}."
     return AccountAPIError(status, message[:500], title=title, errors=tuple(errors))
 
 
@@ -338,7 +360,9 @@ class APIKeys:
     Every method takes the current request and acts for whoever is signed in
     on it. Nobody signed in raises ``SignInRequired``. A session MicroAuth
     no longer accepts is signed out and raises ``SignInRequired`` too.
-    Refusals raise ``AccountAPIError`` with MicroAuth's ``detail``.
+    Refusals raise ``AccountAPIError``, whose ``detail`` you can show the
+    person. When MicroAuth can't be reached or fails on its side, that is
+    ``AccountAPIUnavailable``.
 
     Calls that change keys are unsafe requests, so they pass the same
     origin check as everything else that uses the session.
@@ -436,7 +460,7 @@ class APIKeys:
                 "microauth: the session's access token expired and couldn't be refreshed, "
                 "so API keys can't be managed right now"
             )
-            raise AuthUnavailable()
+            raise AuthUnavailable(OUTAGE_RETRY_AFTER)
         url = self.url + path
         headers = {
             "Authorization": f"Bearer {session.access_token}",
@@ -448,7 +472,10 @@ class APIKeys:
                 method, url, json=json, headers=headers, timeout=auth._timeout
             )
         except httpx.HTTPError as exc:
-            raise AccountAPIError(0, f"could not reach {url} ({type(exc).__name__})") from exc
+            logger.warning(
+                "microauth: couldn't reach the Account API at %s (%s)", url, type(exc).__name__
+            )
+            raise AccountAPIUnavailable() from exc
         if response.status_code == expect:
             return None if expect == 204 else _json(response)
         raise self._refusal(request, response)
@@ -456,6 +483,9 @@ class APIKeys:
     def _refusal(self, request: Request, response: httpx.Response) -> Exception:
         auth = self._auth
         status = response.status_code
+        if status >= 500:
+            logger.warning("microauth: the Account API answered %s", status)
+            return AccountAPIUnavailable(status)
         challenge = parse_challenge(response.headers.get("www-authenticate"))
         error = challenge.get("error")
         if status == 401 and error == "insufficient_user_authentication":

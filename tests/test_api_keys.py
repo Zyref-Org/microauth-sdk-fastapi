@@ -416,8 +416,8 @@ def test_refused_server_credentials_are_a_logged_503(caplog: pytest.LogCaptureFi
         errors = [record for record in caplog.records if record.levelno == logging.ERROR]
         assert len(errors) == 1
         message = errors[0].getMessage()
-        assert "MICROAUTH_RESOURCE_CLIENT_ID" in message
-        assert "MICROAUTH_RESOURCE_SECRET" in message
+        assert "resource_client_id= and resource_secret=" in message
+        assert API in message
         assert "the-wrong-secret" not in caplog.text
         assert RESOURCE_CLIENT_ID not in caplog.text
         assert key.secret not in caplog.text
@@ -428,16 +428,20 @@ def test_refused_server_credentials_are_a_logged_503(caplog: pytest.LogCaptureFi
 
 @pytest.mark.parametrize("status", [400, 401])
 def test_a_400_or_401_from_introspection_is_a_misconfiguration(
-    status: int, caplog: pytest.LogCaptureFixture
+    status: int, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def main() -> None:
         fake = FakeIssuer()
         fake.introspect_failure = status
-        app, _ = build(fake)
+        monkeypatch.setenv("MICROAUTH_RESOURCE_CLIENT_ID", RESOURCE_CLIENT_ID)
+        monkeypatch.setenv("MICROAUTH_RESOURCE_SECRET", RESOURCE_SECRET)
+        app, _ = build(fake, resource_client_id=None, resource_secret=None)
         key = fake.add_key()
         async with client_for(app) as client:
-            assert (await client.get("/posts", headers=bearer(key.secret))).status_code == 503
-        assert "MICROAUTH_RESOURCE_SECRET" in caplog.text
+            response = await client.get("/posts", headers=bearer(key.secret))
+            assert response.status_code == 503
+            assert response.headers["retry-after"] == "5"
+        assert "MICROAUTH_RESOURCE_CLIENT_ID and MICROAUTH_RESOURCE_SECRET" in caplog.text
 
     run(main)
 
@@ -485,6 +489,7 @@ def test_an_outage_without_a_cached_answer_is_503_and_not_cached(
             response = await client.get("/posts", headers=bearer(key.secret))
             assert response.status_code == 503
             assert response.json()["detail"] == "Authorization is temporarily unavailable"
+            assert response.headers["retry-after"] == "5"
             fake.introspect_failure = None
             assert (await client.get("/posts", headers=bearer(key.secret))).status_code == 200
         assert len(fake.introspections) == 2
@@ -951,6 +956,19 @@ def test_keys_need_the_server_credentials(monkeypatch: pytest.MonkeyPatch) -> No
     api = TokenAuth(issuer=fake.issuer, resource=API, api_keys=True)
     assert api.key_checks is not None
     assert TokenAuth(issuer=fake.issuer, resource=API).key_checks is None
+
+
+def test_one_credential_argument_never_borrows_the_other_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeIssuer()
+    monkeypatch.setenv("MICROAUTH_RESOURCE_CLIENT_ID", RESOURCE_CLIENT_ID)
+    monkeypatch.setenv("MICROAUTH_RESOURCE_SECRET", RESOURCE_SECRET)
+    for given in ({"resource_client_id": "rs_other"}, {"resource_secret": "other"}):
+        with pytest.raises(MicroAuthConfigurationError) as caught:
+            TokenAuth(issuer=fake.issuer, resource=API, api_keys=True, **given)
+        assert "together" in str(caught.value)
+        assert RESOURCE_SECRET not in str(caught.value)
 
 
 def test_keys_read_the_credentials_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:

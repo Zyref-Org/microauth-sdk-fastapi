@@ -59,6 +59,7 @@ from ._cookies import (
 from ._env import getenv
 from ._oidc import (
     LEEWAY_SECONDS,
+    OUTAGE_RETRY_AFTER,
     HttpClient,
     Issuer,
     ProviderMetadata,
@@ -117,6 +118,11 @@ class User:
     ``roles`` and ``permissions`` come from the ``roles`` scope and are
     current as of the last token refresh, at most one access token lifetime
     ago.
+
+    ``amr`` says how the person signed in (RFC 8176), such as ``"pwd"``,
+    ``"otp"``, ``"hwk"`` and ``"mfa"`` when more than one factor was used.
+    ``auth_time`` is when they last signed in, in Unix seconds. Neither
+    changes when tokens are refreshed.
     """
 
     id: str
@@ -128,6 +134,8 @@ class User:
     permissions: frozenset[str]
     session_id: str | None
     claims: Mapping[str, Any]
+    amr: frozenset[str] = frozenset()
+    auth_time: int | None = None
 
     def has_role(self, *roles: str) -> bool:
         """True when the user holds every role given."""
@@ -148,6 +156,8 @@ class User:
             "roles": sorted(self.roles),
             "permissions": sorted(self.permissions),
             "session_id": self.session_id,
+            "amr": sorted(self.amr),
+            "auth_time": self.auth_time,
         }
 
 
@@ -162,6 +172,7 @@ def _string(value: Any) -> str | None:
 
 
 def user_from_claims(claims: Mapping[str, Any]) -> User:
+    auth_time = claims.get("auth_time")
     return User(
         id=claims["sub"],
         email=_string(claims.get("email")),
@@ -172,6 +183,8 @@ def user_from_claims(claims: Mapping[str, Any]) -> User:
         permissions=_strings(claims.get("permissions")),
         session_id=_string(claims.get("sid")),
         claims=MappingProxyType(dict(claims)),
+        amr=_strings(claims.get("amr")),
+        auth_time=auth_time if type(auth_time) is int else None,
     )
 
 
@@ -735,8 +748,16 @@ class UserAuth:
         return user_from_claims(session.claims)
 
     async def optional(self, request: Request) -> User | None:
-        """The signed in user, or None."""
-        session = await self._current(request)
+        """The signed in user, or None.
+
+        An unsafe request from another site, such as a cross site form post,
+        counts as signed out here. ``user``, ``login_required`` and
+        ``require`` refuse it with ``CrossSiteRequest`` instead.
+        """
+        try:
+            session = await self._current(request)
+        except CrossSiteRequest:
+            return None
         return user_from_claims(session.claims) if session is not None else None
 
     async def login_required(self, request: Request) -> User:
@@ -876,7 +897,7 @@ class UserAuth:
         if now < session.expires_at + STALE_GRACE_SECONDS:
             return session
         logger.error("microauth: the session can't be refreshed (%s)", outcome.reason)
-        raise AuthUnavailable()
+        raise AuthUnavailable(OUTAGE_RETRY_AFTER)
 
     async def _refresh_once(self, session: _Session) -> _RefreshOutcome:
         """Refresh at most once per refresh token in this process.

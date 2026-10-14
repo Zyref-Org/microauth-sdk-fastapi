@@ -18,8 +18,13 @@ service. Nothing changes for `MicroAuth` and the API keys you sell.
   whatever response the route returns.
 - Dependencies `auth.user`, `auth.optional`, `auth.login_required` and
   `auth.require(permissions=..., roles=...)` hand routes a `User` with roles
-  and permissions.
+  and permissions, plus `amr` and `auth_time` from the sign in.
 - Unsafe requests that carry the session must come from your own origin.
+  `auth.optional` treats one from another site as signed out and gives
+  `None`, while the other dependencies refuse it with `403`.
+- Refusals are answered by `refusal_response`, which apps can call from
+  their own exception handlers to keep the SDK's answer for some requests.
+  A handler the app registered for a refusal class is never replaced.
 - Settings: `MICROAUTH_ISSUER`, `MICROAUTH_CLIENT_ID`,
   `MICROAUTH_CLIENT_SECRET`, `MICROAUTH_COOKIE_SECRET` (comma separated to
   rotate) and `MICROAUTH_APP_URL`.
@@ -29,17 +34,29 @@ service. Nothing changes for `MicroAuth` and the API keys you sell.
 - `TokenAuth` checks RS256 access tokens (RFC 9068) for one resource, set
   with `MICROAUTH_RESOURCE`. `api.require(...)` gives routes `TokenClaims`.
 - Failures follow RFC 6750, pointing clients at the protected resource
-  metadata (RFC 9728) that `TokenAuth` serves.
+  metadata (RFC 9728) that `TokenAuth` serves at the path inserted URL for
+  its resource. Only a resource without a path uses the bare root URL.
+- When the issuer can't be reached, the answer is `503` with
+  `Retry-After: 5`.
 
 ### MCP servers
 
-- `McpAuth` wraps a Streamable HTTP MCP server per the MCP 2026-07-28
-  authorization spec: metadata at both well-known locations, `401`
-  challenges with the scopes to ask for, and per tool scopes checked on
-  every `tools/call` with a `403` step up when one is missing.
+- `McpAuth` protects a Streamable HTTP MCP server per the MCP 2026-07-28
+  authorization spec: metadata at the path inserted URL for its resource,
+  `401` challenges with the scopes to ask for, the base scopes checked on
+  every request, and per tool scopes checked on every `tools/call`.
+- A missing scope gets `403` with `error="insufficient_scope"`, every scope
+  needed and an `error_description` naming the missing ones, and the body
+  is a JSON-RPC error with the same sentence, so the official MCP client
+  shows it.
+- `auth.mount(app, mcp)` serves an `MCPServer` inside a FastAPI or
+  Starlette app: the MCP endpoint, the metadata, the session manager in the
+  app's lifespan, and closing `McpAuth` at shutdown. `auth.wrap()` still
+  serves an MCP server that is the whole site.
 - `current_identity()` tells a tool who is calling.
 - `MicroAuthTokenVerifier` is a `TokenVerifier` for servers that use the MCP
-  SDK's own auth settings.
+  SDK's own auth settings. The README lists what it can't do that `McpAuth`
+  does.
 
 ### Your users' API keys
 
@@ -47,7 +64,9 @@ service. Nothing changes for `MicroAuth` and the API keys you sell.
   that people make for their own accounts, next to access tokens. Keys are
   checked with token introspection (RFC 7662) using the API's server
   credentials, `MICROAUTH_RESOURCE_CLIENT_ID` and
-  `MICROAUTH_RESOURCE_SECRET`.
+  `MICROAUTH_RESOURCE_SECRET`, or `resource_client_id=` and
+  `resource_secret=` so each resource in one app can have its own. The two
+  arguments must come together.
 - A key with the wrong shape or checksum is refused without a network call.
   Answers are cached by the key's SHA-256 for as long as MicroAuth's
   `Cache-Control` allows, at most 5 minutes, and an active key keeps working
@@ -77,7 +96,9 @@ service. Nothing changes for `MicroAuth` and the API keys you sell.
 - Creating and rolling a key needs a recent sign in. Without one the helpers
   raise `ReauthenticationRequired` with a `login_url`, and `/auth/login`
   takes `max_age` to ask for a fresh sign in. Refusals raise
-  `AccountAPIError` with MicroAuth's details.
+  `AccountAPIError`, whose `detail` is full sentences ready to show to the
+  person. When MicroAuth can't be reached or fails, the helpers raise its
+  subclass `AccountAPIUnavailable` with a generic `503` message.
 - New types: `APIKeys`, `APIKey`, `NewAPIKey`, `APIKeyOptions`,
   `APIKeyResourceOption`, `APIKeyPermission`, `APIKeyResource` and
   `APIKeyApp`.
@@ -93,8 +114,8 @@ service. Nothing changes for `MicroAuth` and the API keys you sell.
   the app shuts down.
 - `cryptography` and `PyJWT[crypto]` are now dependencies. The new `mcp`
   extra installs the MCP Python SDK 2.0 or newer.
-- New examples: `examples/blog_cms.py` and `examples/invoices_mcp.py`. Both
-  take API keys.
+- New examples: `examples/blog_cms.py`, `examples/invoices_mcp.py` and
+  `examples/api_and_mcp.py`. All three take API keys.
 
 ## 3.0.0
 

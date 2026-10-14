@@ -376,12 +376,14 @@ class KeyIntrospector:
         timeout: float,
         leeway: float,
         stale_if_error: float,
+        credential_settings: str = CREDENTIAL_SETTINGS,
     ) -> None:
         self._issuer = issuer
         self._http = http
         self.answers = answers
         self._resource = resource
         self._basic = basic
+        self._credential_settings = credential_settings
         self._timeout = timeout
         self.leeway = leeway
         self.stale_if_error = stale_if_error
@@ -508,7 +510,7 @@ class KeyIntrospector:
         if status in (400, 401):
             raise KeyCheckMisconfigured(
                 f"MicroAuth refused this API's server credentials ({status}). Check "
-                f"{CREDENTIAL_SETTINGS}: they must be the server credentials of "
+                f"{self._credential_settings}: they must be the server credentials of "
                 f"{self._resource} from the MicroAuth dashboard"
             )
         if status != 200:
@@ -591,6 +593,7 @@ class KeyChecks:
         redis_url: str | None,
         redis_client: Any | None,
         enforce_limits: bool = True,
+        credential_settings: str = CREDENTIAL_SETTINGS,
     ) -> None:
         client_id = (client_id or "").strip()
         client_secret = (client_secret or "").strip()
@@ -639,6 +642,7 @@ class KeyChecks:
             timeout=timeout,
             leeway=leeway,
             stale_if_error=stale_if_error,
+            credential_settings=credential_settings,
         )
         self.limits = KeyLimits(gcra, namespace, unknown_key_limit=unknown_key_limit)
         self._warned_unenforced = False

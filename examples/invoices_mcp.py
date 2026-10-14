@@ -16,6 +16,9 @@ Clients that can't do OAuth can send an API key instead, made by the user on
 their MicroAuth account page. The key's permissions work like scopes, so a
 key with only invoices:read can list invoices but not create them.
 
+The MCP server is mounted at /mcp inside an ordinary FastAPI app, so the
+app can serve other pages next to it.
+
 Setup:
     1. In the MicroAuth dashboard, register an MCP server with the resource
        http://localhost:8000/mcp and the three scopes above. Turn on
@@ -30,12 +33,14 @@ import itertools
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from fastapi import FastAPI
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from microauth_fastapi import McpAuth, current_identity
 
-mcp = MCPServer("Invoices")
+# The MCP SDK logs every request at INFO otherwise.
+mcp = MCPServer("Invoices", log_level="WARNING")
 
 # Reads MICROAUTH_ISSUER, MICROAUTH_RESOURCE and, for API keys, the server
 # credentials.
@@ -98,4 +103,12 @@ def send_invoice(invoice_id: int) -> dict[str, Any]:
     return asdict(invoice)
 
 
-app = auth.wrap(mcp.streamable_http_app(stateless_http=True, json_response=True))
+app = FastAPI(title="Invoices")
+
+
+@app.get("/")
+def home() -> dict[str, str]:
+    return {"mcp": "/mcp"}
+
+
+auth.mount(app, mcp)

@@ -418,7 +418,9 @@ def test_the_problem_fixture() -> None:
         error = caught.value
         assert error.status_code == 422
         assert error.title == "Unprocessable Entity"
-        assert error.detail == "validation failed"
+        assert error.detail == (
+            "posts:delete can't be given to a key for Blog MCP server. Expected number <= 365."
+        )
         assert [(e.location, e.value) for e in error.errors] == [
             ("body.permissions[1]", "posts:delete"),
             ("body.expires_in_days", 400),

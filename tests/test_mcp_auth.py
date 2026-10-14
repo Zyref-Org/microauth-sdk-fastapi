@@ -166,29 +166,46 @@ def test_a_token_for_another_resource_gets_invalid_token() -> None:
     run(main)
 
 
-def test_metadata_is_served_at_both_well_known_locations() -> None:
+def test_metadata_is_served_only_at_the_path_inserted_url() -> None:
     async def main() -> None:
         fake = FakeIssuer()
         server = StandInServer()
-        app = make_auth(fake).wrap(server)
+        auth = make_auth(fake)
+        app = auth.wrap(server)
         expected = {
             "resource": RESOURCE,
             "authorization_servers": [fake.issuer],
             "bearer_methods_supported": ["header"],
             "scopes_supported": ["invoices:read"],
         }
+        assert auth.metadata_url == METADATA
+        path = "/.well-known/oauth-protected-resource/mcp"
         async with client_for(app) as client:
-            for path in (
-                "/.well-known/oauth-protected-resource/mcp",
-                "/.well-known/oauth-protected-resource",
-            ):
-                response = await client.get(path)
-                assert response.status_code == 200
-                assert response.json() == expected
-                assert response.headers["access-control-allow-origin"] == "*"
-                assert (await client.head(path)).status_code == 200
-                assert (await client.options(path)).status_code == 204
-                assert (await client.post(path)).status_code == 405
+            response = await client.get(path)
+            assert response.status_code == 200
+            assert response.json() == expected
+            assert response.headers["access-control-allow-origin"] == "*"
+            assert (await client.head(path)).status_code == 200
+            assert (await client.options(path)).status_code == 204
+            assert (await client.post(path)).status_code == 405
+            assert server.calls == []
+            root = await client.get("/.well-known/oauth-protected-resource")
+            assert root.status_code == 401
+        assert server.calls == []
+
+    run(main)
+
+
+def test_a_resource_without_a_path_serves_metadata_at_the_root() -> None:
+    async def main() -> None:
+        fake = FakeIssuer()
+        server = StandInServer()
+        auth = make_auth(fake, resource=HOST)
+        assert auth.metadata_url == f"{HOST}/.well-known/oauth-protected-resource"
+        async with client_for(auth.wrap(server)) as client:
+            response = await client.get("/.well-known/oauth-protected-resource")
+        assert response.status_code == 200
+        assert response.json()["resource"] == HOST
         assert server.calls == []
 
     run(main)
@@ -209,15 +226,28 @@ def test_a_read_token_lists_and_calls_read_tools_but_not_write_tools() -> None:
             assert read.status_code == 200
             assert read.json()["result"] == {"sub": "user_1"}
 
-            write = await client.post("/mcp", **call("create_invoice", reader))
+            write = await client.post("/mcp", **call("create_invoice", reader, request_id=7))
             assert write.status_code == 403
             assert write.headers["www-authenticate"] == (
                 'Bearer error="insufficient_scope", scope="invoices:read invoices:write", '
                 f'resource_metadata="{METADATA}", '
-                'error_description="The access token is missing a scope this tool needs"'
+                'error_description="The create_invoice tool needs the invoices:write scope, '
+                "and this access token doesn't have it\""
             )
-            assert write.json()["error"] == "insufficient_scope"
-            assert write.json()["scope"] == "invoices:read invoices:write"
+            assert write.headers["content-type"] == "application/json"
+            assert write.json() == {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "error": {
+                    "code": 403,
+                    "message": "The create_invoice tool needs the invoices:write scope, and "
+                    "this access token doesn't have it.",
+                    "data": {
+                        "error": "insufficient_scope",
+                        "scope": "invoices:read invoices:write",
+                    },
+                },
+            }
             assert len(server.calls) == 2
 
             writer = token(fake, "invoices:read invoices:write")
@@ -363,7 +393,7 @@ def test_an_undeclared_tool_needs_only_the_base_scopes(caplog: pytest.LogCapture
     assert len(warnings) == 1
 
 
-def test_other_requests_need_only_a_valid_token() -> None:
+def test_other_requests_need_a_valid_token_with_the_base_scopes() -> None:
     async def main() -> None:
         fake = FakeIssuer()
         server = StandInServer()
@@ -375,8 +405,68 @@ def test_other_requests_need_only_a_valid_token() -> None:
             assert allowed.status_code == 200
             preflight = await client.options("/mcp")
             assert preflight.status_code == 200
+            stream = await client.get(
+                "/mcp", headers={"Authorization": f"Bearer {token(fake, scope='other')}"}
+            )
+            assert stream.status_code == 403
+            assert stream.json() == {
+                "error": "insufficient_scope",
+                "error_description": "This MCP server needs the invoices:read scope, and this "
+                "access token doesn't have it",
+                "scope": "invoices:read",
+            }
+            assert 'scope="invoices:read"' in stream.headers["www-authenticate"]
         assert [call["method"] for call in server.calls] == ["GET", "OPTIONS"]
         assert server.calls[1]["sub"] is None
+
+    run(main)
+
+
+@pytest.mark.parametrize("method", ["initialize", "tools/list", "resources/read", "prompts/get"])
+def test_every_message_needs_the_base_scopes(method: str) -> None:
+    async def main() -> None:
+        fake = FakeIssuer()
+        server = StandInServer()
+        app = make_auth(fake).wrap(server)
+        async with client_for(app) as client:
+            refused = await client.post(
+                "/mcp",
+                json=rpc(method, {}, request_id=3),
+                headers=headers(method, None, token(fake, scope="other")),
+            )
+            assert refused.status_code == 403
+            assert refused.json()["id"] == 3
+            assert refused.json()["error"]["message"] == (
+                "This MCP server needs the invoices:read scope, and this access token doesn't "
+                "have it."
+            )
+            challenge = refused.headers["www-authenticate"]
+            assert 'error="insufficient_scope", scope="invoices:read"' in challenge
+            allowed = await client.post(
+                "/mcp", json=rpc(method, {}), headers=headers(method, None, token(fake))
+            )
+            assert allowed.status_code == 200
+        assert len(server.calls) == 1
+
+    run(main)
+
+
+def test_a_tool_name_unsafe_for_a_header_is_left_out_of_it() -> None:
+    async def main() -> None:
+        fake = FakeIssuer()
+        server = StandInServer()
+        auth = make_auth(fake, tool_scopes={'say "hi" é': "invoices:write"})
+        name = 'say "hi" é'
+        async with client_for(auth.wrap(server)) as client:
+            response = await client.post(
+                "/mcp",
+                json=rpc("tools/call", {"name": name, "arguments": {}}),
+                headers=headers("tools/call", None, token(fake)),
+            )
+        assert response.status_code == 403
+        challenge = response.headers["www-authenticate"]
+        assert 'error_description="This tool needs the invoices:write scope' in challenge
+        assert response.json()["error"]["message"].startswith("This tool needs")
 
     run(main)
 

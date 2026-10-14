@@ -16,6 +16,8 @@ from oidc_fake import (
     CLIENT_ID,
     CLIENT_SECRET,
     COOKIE_SECRET,
+    MCP_CLIENT_ID,
+    MCP_SECRET,
     RESOURCE_CLIENT_ID,
     RESOURCE_SECRET,
     Clock,
@@ -184,6 +186,76 @@ def test_blog_cms_api_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     asyncio.run(main())
 
 
+def test_api_and_mcp_example(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("mcp.server.mcpserver")
+    api_resource = "http://localhost:8000"
+    mcp_resource = "http://localhost:8000/mcp"
+    fake = FakeIssuer()
+    fake.resource_clients = {RESOURCE_CLIENT_ID: api_resource, MCP_CLIENT_ID: mcp_resource}
+    fake.resource_names.update({api_resource: "Tasks API", mcp_resource: "Tasks MCP server"})
+    for name, value in {
+        "MICROAUTH_ISSUER": fake.issuer,
+        "TASKS_API_CLIENT_ID": RESOURCE_CLIENT_ID,
+        "TASKS_API_SECRET": RESOURCE_SECRET,
+        "TASKS_MCP_CLIENT_ID": MCP_CLIENT_ID,
+        "TASKS_MCP_SECRET": MCP_SECRET,
+    }.items():
+        monkeypatch.setenv(name, value)
+    # Neither resource may fall back on these.
+    monkeypatch.setenv("MICROAUTH_RESOURCE_CLIENT_ID", "rs_wrong")
+    monkeypatch.setenv("MICROAUTH_RESOURCE_SECRET", "wrong")
+    tasks = load("api_and_mcp")
+    tasks.api.verifier._http._client = fake.client()
+    tasks.mcp_auth.verifier._http._client = fake.client()
+    api_key = fake.add_key(resources=[api_resource], permissions=["tasks:read", "tasks:write"])
+    mcp_key = fake.add_key(resources=[mcp_resource], permissions=["tasks:read", "tasks:write"])
+
+    def tool(name: str, arguments: dict[str, Any], credential: str) -> dict[str, Any]:
+        return {
+            "json": {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+            "headers": {
+                "Authorization": f"Bearer {credential}",
+                "Mcp-Method": "tools/call",
+                "Mcp-Name": name,
+                "Accept": "application/json, text/event-stream",
+            },
+        }
+
+    async def main() -> None:
+        transport = httpx.ASGITransport(app=tasks.app)
+        async with (
+            tasks.app.router.lifespan_context(tasks.app),
+            httpx.AsyncClient(transport=transport, base_url=api_resource) as client,
+        ):
+            root = await client.get("/.well-known/oauth-protected-resource")
+            assert root.json()["resource"] == api_resource
+            inserted = await client.get("/.well-known/oauth-protected-resource/mcp")
+            assert inserted.json()["resource"] == mcp_resource
+
+            by_key = {"Authorization": f"Bearer {api_key.secret}"}
+            added = await client.post("/tasks", json={"title": "Write docs"}, headers=by_key)
+            assert added.status_code == 201, added.text
+            listed = await client.post("/mcp", **tool("list_tasks", {}, mcp_key.secret))
+            assert listed.status_code == 200, listed.text
+            assert listed.json()["result"]["structuredContent"] == {"result": ["Write docs"]}
+            token = fake.access_token(aud=mcp_resource, scope="tasks:read tasks:write")
+            more = await client.post("/mcp", **tool("add_task", {"title": "Ship"}, token))
+            assert more.status_code == 200, more.text
+            assert (await client.get("/tasks", headers=by_key)).json() == ["Write docs", "Ship"]
+
+            wrong_place = await client.post("/mcp", **tool("list_tasks", {}, api_key.secret))
+            assert wrong_place.status_code == 401
+            mcp_token = {"Authorization": f"Bearer {token}"}
+            assert (await client.get("/tasks", headers=mcp_token)).status_code == 401
+
+    asyncio.run(main())
+
+
 def test_invoices_mcp_example(monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("mcp.server.mcpserver")
     mcp_types = pytest.importorskip("mcp_types")
@@ -206,9 +278,13 @@ def test_invoices_mcp_example(monkeypatch: pytest.MonkeyPatch) -> None:
     async def main() -> None:
         transport = httpx.ASGITransport(app=invoices.app)
         async with (
-            invoices.mcp.session_manager.run(),
+            invoices.app.router.lifespan_context(invoices.app),
             httpx.AsyncClient(transport=transport, base_url="http://localhost:8000") as client,
         ):
+            assert (await client.get("/")).json() == {"mcp": "/mcp"}
+            metadata = await client.get("/.well-known/oauth-protected-resource/mcp")
+            assert metadata.json()["resource"] == resource
+            assert (await client.get("/.well-known/oauth-protected-resource")).status_code == 404
 
             async def call(
                 tool: str,
@@ -294,6 +370,9 @@ def test_invoices_mcp_example(monkeypatch: pytest.MonkeyPatch) -> None:
                 "send_invoice", {"invoice_id": by_key["id"]}, "", credential=key
             )
             assert not_allowed.status_code == 403
-            assert "The API key is missing a scope" in not_allowed.headers["www-authenticate"]
+            assert not_allowed.json()["error"]["message"] == (
+                "The send_invoice tool needs the invoices:send permission, and this API key "
+                "doesn't have it."
+            )
 
     asyncio.run(main())

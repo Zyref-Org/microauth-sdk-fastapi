@@ -45,6 +45,7 @@ from fastapi.security import HTTPBearer
 
 from ._env import getenv
 from ._keys import (
+    CREDENTIAL_SETTINGS,
     DEFAULT_STALE_IF_ERROR,
     DEFAULT_UNKNOWN_KEY_LIMIT,
     KeyAnswer,
@@ -56,6 +57,7 @@ from ._lifespan import CloseOnShutdown
 from ._limits import RequestThrottled
 from ._oidc import (
     LEEWAY_SECONDS,
+    OUTAGE_RETRY_AFTER,
     HttpClient,
     Issuer,
     TokenRejected,
@@ -202,10 +204,10 @@ def credential_name(via: Via) -> str:
     return {"access_token": "access token", "api_key": "API key", "session": "session"}[via]
 
 
-def missing_scope_detail(via: Via, what: str = "request") -> str:
+def missing_scope_detail(via: Via) -> str:
     if via == "session":
-        return f"You don't have a permission this {what} needs"
-    return f"The {credential_name(via)} is missing a scope this {what} needs"
+        return "You don't have a permission this request needs"
+    return f"The {credential_name(via)} is missing a scope this request needs"
 
 
 def claims_from_key(answer: KeyAnswer) -> TokenClaims:
@@ -361,6 +363,18 @@ def bearer_verifier(
     redis_client: Any | None,
     enforce_limits: bool = True,
 ) -> BearerVerifier:
+    if (resource_client_id is None) != (resource_secret is None):
+        raise MicroAuthConfigurationError(
+            "Pass resource_client_id= and resource_secret= together, or neither to use "
+            f"{CREDENTIAL_SETTINGS}. Mixing one with the other's setting could pair one "
+            "resource's ID with another resource's secret."
+        )
+    settings = CREDENTIAL_SETTINGS
+    if resource_client_id is None:
+        resource_client_id = getenv("MICROAUTH_RESOURCE_CLIENT_ID")
+        resource_secret = getenv("MICROAUTH_RESOURCE_SECRET")
+    else:
+        settings = "resource_client_id= and resource_secret="
     access = AccessTokenVerifier(
         issuer,
         resource,
@@ -375,8 +389,9 @@ def bearer_verifier(
             access.keys,
             access._http,
             resource=resource,
-            client_id=resource_client_id or getenv("MICROAUTH_RESOURCE_CLIENT_ID"),
-            client_secret=resource_secret or getenv("MICROAUTH_RESOURCE_SECRET"),
+            client_id=resource_client_id,
+            client_secret=resource_secret,
+            credential_settings=settings,
             timeout=timeout,
             leeway=leeway,
             stale_if_error=stale_if_error,
@@ -408,7 +423,8 @@ class TokenAuth:
         api_keys: Also accept API keys your users made for their accounts.
             Needs this API's server credentials. Default False.
         resource_client_id: This API's server credential ID, for checking
-            keys. Defaults to ``MICROAUTH_RESOURCE_CLIENT_ID``.
+            keys. Pass it with ``resource_secret`` when one app protects more
+            than one resource. Defaults to ``MICROAUTH_RESOURCE_CLIENT_ID``.
         resource_secret: This API's server credential secret. Defaults to
             ``MICROAUTH_RESOURCE_SECRET``.
         stale_if_error: Seconds an active key keeps working past its cached
@@ -584,10 +600,10 @@ class TokenAuth:
         except RequestThrottled as exc:
             raise TooManyRequests(exc.retry_after, exc.reason) from None
         except KeyCheckUnavailable:
-            raise AuthUnavailable() from None
+            raise AuthUnavailable(OUTAGE_RETRY_AFTER) from None
         except MicroAuthError as exc:
             logger.error("microauth: access tokens can't be checked right now (%s)", exc)
-            raise AuthUnavailable() from None
+            raise AuthUnavailable(OUTAGE_RETRY_AFTER) from None
 
     def _address(self, request: Request) -> str | None:
         if self._client_address is not None:

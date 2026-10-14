@@ -14,20 +14,28 @@ import httpx
 import jwt
 import pytest
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from oidc_fake import (
     API,
     APP_URL,
     CLIENT_ID,
     CLIENT_SECRET,
     COOKIE_SECRET,
+    Clock,
     FakeIssuer,
     hmac_token,
     sign_in,
     unsigned_token,
 )
 
-from microauth_fastapi import MicroAuthConfigurationError, User, UserAuth
+from microauth_fastapi import (
+    MicroAuthConfigurationError,
+    PermissionDenied,
+    TokenAuth,
+    User,
+    UserAuth,
+    refusal_response,
+)
 from microauth_fastapi._cookies import CHUNK_SIZE, CookieSealer, read_value, split_value
 from microauth_fastapi.login import safe_path, user_from_claims
 
@@ -36,8 +44,8 @@ LOGIN = "__Host-microauth-login"
 SAME_SITE = {"Origin": APP_URL}
 
 
-def build(fake: FakeIssuer, **options: Any) -> tuple[FastAPI, UserAuth]:
-    app = FastAPI()
+def build(fake: FakeIssuer, app: FastAPI | None = None, **options: Any) -> tuple[FastAPI, UserAuth]:
+    app = app or FastAPI()
     settings: dict[str, Any] = {
         "issuer": fake.issuer,
         "client_id": CLIENT_ID,
@@ -234,7 +242,10 @@ def test_sign_in_round_trip() -> None:
 
             me = await client.get("/api/me")
             assert me.status_code == 200
-            assert me.json() == {
+            body = me.json()
+            signed_in_at = body.pop("auth_time")
+            assert type(signed_in_at) is int and abs(signed_in_at - time.time()) < 60
+            assert body == {
                 "id": "user_1",
                 "email": "ada@example.com",
                 "email_verified": True,
@@ -243,6 +254,7 @@ def test_sign_in_round_trip() -> None:
                 "roles": ["editor"],
                 "permissions": ["posts:write"],
                 "session_id": "sid_1",
+                "amr": ["pwd"],
             }
             builtin = await client.get("/auth/me")
             assert builtin.json() == me.json()
@@ -524,7 +536,7 @@ def test_refresh_rotates_tokens_and_rewrites_the_cookie_on_any_response() -> Non
             before = jar_cookie(client, SESSION)
             assert before is not None
             old_value = before.value
-            first_refresh_token = next(iter(fake.refresh_tokens))
+            [first_refresh_token] = fake.issued_refresh_tokens
 
             fake.access_ttl = 600
             fake.user.roles = ["editor", "admin"]
@@ -534,7 +546,8 @@ def test_refresh_rotates_tokens_and_rewrites_the_cookie_on_any_response() -> Non
             assert SESSION in set_cookies(response)
             assert response.headers["cache-control"] == "no-store"
             assert fake.refreshes() == 1
-            assert fake.refresh_tokens[first_refresh_token]["used"] is True
+            assert fake.token_requests[-1]["refresh_token"] == first_refresh_token
+            assert len(fake.issued_refresh_tokens) == 2
             after = jar_cookie(client, SESSION)
             assert after is not None and after.value != old_value
 
@@ -592,12 +605,110 @@ def test_invalid_grant_on_refresh_signs_the_user_out() -> None:
         app, _ = build(fake)
         async with client_for(app) as client:
             await sign_in(client, fake)
-            for record in fake.refresh_tokens.values():
-                record["used"] = True
+            fake.end_sessions()
             response = await client.get("/api/me")
             assert response.status_code == 401
             assert "Max-Age=0" in set_cookies(response)[SESSION]
             assert jar_cookie(client, SESSION) is None
+
+    run(main)
+
+
+def test_a_refreshed_id_token_has_no_nonce_and_keeps_the_sign_in_details() -> None:
+    async def main() -> None:
+        fake = FakeIssuer()
+        fake.access_ttl = 1
+        fake.user.amr = ["pwd", "otp", "mfa"]
+        fake.last_sign_in = int(time.time()) - 120
+        issued: list[dict[str, Any]] = []
+
+        def record(fake: FakeIssuer, claims: dict[str, Any], header: dict[str, Any]) -> str:
+            issued.append(dict(claims))
+            return fake.sign(claims, typ=header["typ"])
+
+        fake.id_token_edit = record
+        app, _ = build(fake)
+        async with client_for(app) as client:
+            await sign_in(client, fake)
+            fake.access_ttl = 600
+            body = (await client.get("/api/me")).json()
+        assert fake.refreshes() == 1
+        assert "nonce" in issued[0] and "nonce" not in issued[1]
+        assert issued[1]["auth_time"] == issued[0]["auth_time"] == fake.last_sign_in
+        assert body["amr"] == ["mfa", "otp", "pwd"]
+        assert body["auth_time"] == fake.last_sign_in
+
+    run(main)
+
+
+def test_two_workers_refreshing_one_cookie_in_the_grace_window_both_stay_signed_in() -> None:
+    async def main() -> None:
+        fake = FakeIssuer()
+        fake.now = Clock()
+        fake.access_ttl = 1
+        first, _ = build(fake)
+        second, _ = build(fake)
+        async with client_for(first) as one, client_for(second) as two:
+            await sign_in(one, fake)
+            cookie = jar_cookie(one, SESSION)
+            assert cookie is not None
+            old = {"Cookie": f"{SESSION}={cookie.value}"}
+            fake.access_ttl = 600
+            assert (await one.get("/api/me")).status_code == 200
+            fake.now.advance(10)
+            assert (await two.get("/api/me", headers=old)).status_code == 200
+        assert fake.refreshes() == 2
+        # Inside the grace window the old token gets the same next token.
+        assert fake.issued_refresh_tokens[-1] == fake.issued_refresh_tokens[-2]
+
+    run(main)
+
+
+def test_reusing_an_old_refresh_token_later_signs_out_everywhere() -> None:
+    async def main() -> None:
+        fake = FakeIssuer()
+        fake.now = Clock()
+        fake.access_ttl = 1
+        first, _ = build(fake)
+        second, _ = build(fake)
+        async with client_for(first) as one, client_for(second) as two:
+            await sign_in(one, fake)
+            cookie = jar_cookie(one, SESSION)
+            assert cookie is not None
+            old = {"Cookie": f"{SESSION}={cookie.value}"}
+            assert (await one.get("/api/me")).status_code == 200
+            fake.now.advance(31)
+            replayed = await two.get("/api/me", headers=old)
+            assert replayed.status_code == 401
+            assert "Max-Age=0" in set_cookies(replayed)[SESSION]
+            # The reuse revoked the whole chain, so the rotated token is dead too.
+            after = await one.get("/api/me")
+            assert after.status_code == 401
+            assert jar_cookie(one, SESSION) is None
+        assert fake.refresh_families == {}
+
+    run(main)
+
+
+def test_optional_treats_a_cross_site_post_as_signed_out() -> None:
+    async def main() -> None:
+        fake = FakeIssuer()
+        app, auth = build(fake)
+
+        @app.post("/comment")
+        async def comment(user: User | None = Depends(auth.optional)) -> dict[str, Any]:
+            return {"user": user.id if user else None}
+
+        evil = {"Origin": "https://evil.example"}
+        async with client_for(app) as client:
+            await sign_in(client, fake)
+            cross_site = await client.post("/comment", headers=evil)
+            assert cross_site.status_code == 200
+            assert cross_site.json() == {"user": None}
+            assert "set-cookie" not in cross_site.headers
+            assert (await client.post("/comment", headers=SAME_SITE)).json() == {"user": "user_1"}
+            assert (await client.post("/posts", headers=evil)).status_code == 403
+            assert (await client.get("/api/me")).status_code == 200
 
     run(main)
 
@@ -698,13 +809,44 @@ def test_require_answers_403_problem_json() -> None:
     run(main)
 
 
+@pytest.mark.parametrize("registered", ["before", "after"])
+def test_an_app_can_render_its_own_refusal_pages(registered: str) -> None:
+    async def denied(request: Request, exc: Exception) -> Response:
+        if "text/html" in request.headers.get("accept", ""):
+            return HTMLResponse("<h1>No entry</h1>", status_code=403)
+        return await refusal_response(request, exc)
+
+    async def main() -> None:
+        fake = FakeIssuer()
+        app = FastAPI()
+        if registered == "before":
+            app.add_exception_handler(PermissionDenied, denied)
+        app, _ = build(fake, app)
+        if registered == "after":
+            app.add_exception_handler(PermissionDenied, denied)
+        async with client_for(app) as client:
+            await sign_in(client, fake)
+            page = await client.get("/admin", headers={"Accept": "text/html"})
+            assert page.status_code == 403
+            assert page.text == "<h1>No entry</h1>"
+            api = await client.delete("/posts/1", headers=SAME_SITE)
+            assert api.status_code == 403
+            assert api.headers["content-type"] == "application/problem+json"
+            assert api.json()["detail"] == "You don't have permission to do this"
+            signed_out = await client.post("/auth/logout", headers=SAME_SITE)
+            assert signed_out.status_code in (303, 307)
+            assert (await client.get("/api/me")).status_code == 401
+
+    run(main)
+
+
 def test_logout_revokes_and_ends_the_session_at_microauth() -> None:
     async def main() -> None:
         fake = FakeIssuer()
         app, _ = build(fake)
         async with client_for(app) as client:
             await sign_in(client, fake)
-            refresh_token = next(iter(fake.refresh_tokens))
+            [refresh_token] = fake.issued_refresh_tokens
 
             cross_site = await client.post(
                 "/auth/logout", headers={"Origin": "https://evil.example"}
@@ -804,17 +946,72 @@ def test_access_token_is_kept_for_server_side_calls() -> None:
         fake = FakeIssuer()
         app, auth = build(fake, keep_access_token=True, resource=API)
 
+        api = TokenAuth(issuer=fake.issuer, resource=API, http_client=fake.client())
+
         @app.get("/token-audience")
         async def audience(request: Request) -> dict[str, Any]:
             token = await auth.access_token(request)
             assert token is not None
             return {"aud": jwt.decode(token, options={"verify_signature": False})["aud"]}
 
+        @app.get("/call-api")
+        async def call_api(request: Request) -> dict[str, Any]:
+            token = await auth.access_token(request)
+            assert token is not None
+            claims = await api.verifier.verify(token)
+            return {"audience": list(claims.audience), "session_id": claims.session_id}
+
         async with client_for(app) as client:
             await sign_in(client, fake)
             assert fake.par_requests[0]["resource"] == API
             assert fake.token_requests[0]["resource"] == API
-            assert (await client.get("/token-audience")).json() == {"aud": API}
+            # The real server adds the issuer to aud when openid was granted.
+            assert (await client.get("/token-audience")).json() == {"aud": [API, fake.issuer]}
+            assert (await client.get("/call-api")).json() == {
+                "audience": [API, fake.issuer],
+                "session_id": "sid_1",
+            }
+
+    run(main)
+
+
+def test_offline_access_tokens_leave_out_sid_but_the_user_keeps_a_session_id() -> None:
+    async def main() -> None:
+        fake = FakeIssuer()
+        app, auth = build(
+            fake,
+            keep_access_token=True,
+            resource=API,
+            scopes=["openid", "profile", "email", "roles", "offline_access"],
+        )
+        api = TokenAuth(issuer=fake.issuer, resource=API, http_client=fake.client())
+
+        @app.get("/call-api")
+        async def call_api(request: Request, user: User = Depends(auth.user)) -> dict[str, Any]:
+            token = await auth.access_token(request)
+            assert token is not None
+            claims = await api.verifier.verify(token)
+            return {"token_session": claims.session_id, "user_session": user.session_id}
+
+        async with client_for(app) as client:
+            await sign_in(client, fake)
+            response = await client.get("/call-api")
+        assert response.json() == {"token_session": None, "user_session": "sid_1"}
+
+    run(main)
+
+
+def test_the_id_token_carries_only_the_claims_its_scopes_allow() -> None:
+    async def main() -> None:
+        fake = FakeIssuer()
+        app, _ = build(fake, scopes=["openid", "profile"])
+        async with client_for(app) as client:
+            await sign_in(client, fake)
+            body = (await client.get("/api/me")).json()
+        assert body["name"] == "Ada Lovelace"
+        assert body["email"] is None
+        assert body["email_verified"] is False
+        assert body["roles"] == [] and body["permissions"] == []
 
     run(main)
 

@@ -46,9 +46,9 @@ class ErrorDetail:
 class AccountAPIError(MicroAuthAPIError):
     """The Account API refused a request to manage API keys, or couldn't be reached.
 
-    ``status_code`` and ``detail`` come from MicroAuth's problem JSON
-    (RFC 9457), and ``errors`` says which fields were wrong. A
-    ``status_code`` of 0 means MicroAuth couldn't be reached at all.
+    ``detail`` is one or more full sentences you can show the person, built
+    from MicroAuth's problem JSON (RFC 9457). ``errors`` says which fields
+    were wrong, and ``status_code`` is the status MicroAuth answered with.
     """
 
     def __init__(
@@ -62,6 +62,19 @@ class AccountAPIError(MicroAuthAPIError):
         self.title = title
         self.errors = errors
         super().__init__(status_code, detail)
+
+
+class AccountAPIUnavailable(AccountAPIError):
+    """MicroAuth couldn't be reached, or failed on its side with a 5xx.
+
+    Trying again later may work. ``status_code`` is 503, ready for your app
+    to answer with. ``upstream_status`` is the status MicroAuth answered
+    with, or None when it couldn't be reached at all.
+    """
+
+    def __init__(self, upstream_status: int | None = None) -> None:
+        self.upstream_status = upstream_status
+        super().__init__(503, "API keys can't be managed right now. Please try again in a moment.")
 
 
 class MicroAuthResponseError(MicroAuthError):
@@ -179,8 +192,17 @@ class PlatformAllowanceExceeded(AuthDenied):
 
 
 class AuthUnavailable(AuthDenied):
-    def __init__(self) -> None:
-        super().__init__(status_code=503, detail="Authorization is temporarily unavailable")
+    """MicroAuth couldn't be reached to check the request.
+
+    ``retry_after`` becomes the ``Retry-After`` header, in seconds.
+    """
+
+    def __init__(self, retry_after: int | None = None) -> None:
+        super().__init__(
+            status_code=503,
+            detail="Authorization is temporarily unavailable",
+            headers=None if retry_after is None else {"Retry-After": str(retry_after)},
+        )
 
 
 class SignInRequired(AuthDenied):

@@ -33,7 +33,13 @@ USER_DENIALS = (
 TOKEN_DENIALS = (InvalidToken, InsufficientScope, TooManyRequests)
 
 
-async def problem_response(request: Request, exc: Exception) -> Response:
+async def refusal_response(request: Request, exc: Exception) -> Response:
+    """The response the SDK sends for one of its refusals.
+
+    Problem JSON (RFC 9457) for most, and a bare redirect for
+    ``SignInRedirect``. Call it from your own exception handler for the
+    requests you don't render yourself, such as API calls.
+    """
     status = getattr(exc, "status_code", 500)
     headers = dict(getattr(exc, "headers", None) or {})
     if isinstance(exc, SignInRedirect):
@@ -60,5 +66,8 @@ async def problem_response(request: Request, exc: Exception) -> Response:
 
 
 def install_handlers(app: Any, classes: tuple[type[Exception], ...]) -> None:
+    """Handle ``classes`` with ``refusal_response``, except the ones the app
+    already handles itself."""
     for cls in classes:
-        app.add_exception_handler(cls, problem_response)
+        if cls not in app.exception_handlers:
+            app.add_exception_handler(cls, refusal_response)

@@ -3,6 +3,7 @@ access tokens and your users' own API keys, and sell your API with keys,
 rate limits and metered billing, with a receipt for every request MicroAuth
 charges."""
 
+from ._problem import refusal_response
 from ._version import __version__
 from .api_keys import (
     APIKey,
@@ -16,6 +17,7 @@ from .api_keys import (
 )
 from .exceptions import (
     AccountAPIError,
+    AccountAPIUnavailable,
     AuthDenied,
     AuthUnavailable,
     CrossSiteRequest,
@@ -69,6 +71,7 @@ __all__ = [
     "APIKeyResourceOption",
     "APIKeys",
     "AccountAPIError",
+    "AccountAPIUnavailable",
     "AuthDenied",
     "AuthUnavailable",
     "CrossSiteRequest",
@@ -115,4 +118,5 @@ __all__ = [
     "UserAuth",
     "__version__",
     "current_identity",
+    "refusal_response",
 ]

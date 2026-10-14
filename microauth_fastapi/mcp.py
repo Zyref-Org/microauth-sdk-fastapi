@@ -2,10 +2,11 @@
 
 Quickstart::
 
+    from fastapi import FastAPI
     from mcp.server.mcpserver import MCPServer
     from microauth_fastapi import McpAuth, current_identity
 
-    mcp = MCPServer("Invoices")
+    mcp = MCPServer("Invoices", log_level="WARNING")
     auth = McpAuth(scopes=["invoices:read"])  # MICROAUTH_ISSUER and MICROAUTH_RESOURCE
 
     @mcp.tool()
@@ -13,15 +14,17 @@ Quickstart::
     async def list_invoices() -> list[dict]:
         return invoices_owned_by(current_identity().sub)
 
-    app = auth.wrap(mcp.streamable_http_app(stateless_http=True, json_response=True))
+    app = FastAPI()
+    auth.mount(app, mcp)
 
-This follows the MCP 2026-07-28 authorization spec. The wrapped server is an
-OAuth resource server: it publishes protected resource metadata (RFC 9728) at
-both well-known locations, answers requests without a valid token with
-``401`` and a challenge that tells the client where to get one, and checks
-every ``tools/call`` against the scopes declared for that tool. A token that
-is missing one gets ``403`` with ``error="insufficient_scope"`` and every
-scope the tool needs, so the client can step up in one round trip.
+This follows the MCP 2026-07-28 authorization spec. The protected server is
+an OAuth resource server: it publishes protected resource metadata (RFC 9728)
+at the well-known URL for its resource, answers requests without a valid
+token with ``401`` and a challenge that tells the client where to get one,
+and checks every request against ``scopes`` and every ``tools/call`` against
+the scopes declared for that tool. A token that is missing one gets ``403``
+with ``error="insufficient_scope"`` and every scope the request needs, so
+the client can step up in one round trip.
 
 Scopes only say what kind of thing a client may do. Whether this user may
 touch this record is still your code's call: read ``current_identity().sub``
@@ -40,32 +43,41 @@ import functools
 import json
 import logging
 import math
-from collections.abc import Callable, Iterable, Mapping
+import re
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, TypeVar
+from urllib.parse import urlsplit
 
 import httpx
 from starlette.authentication import AuthCredentials
 from starlette.datastructures import Headers
 from starlette.requests import Request
+from starlette.routing import Route
 
 from ._env import getenv
 from ._keys import DEFAULT_STALE_IF_ERROR, DEFAULT_UNKNOWN_KEY_LIMIT, KeyCheckUnavailable
 from ._limits import RequestThrottled
-from ._oidc import LEEWAY_SECONDS, TokenRejected, validate_issuer, validate_resource
+from ._oidc import (
+    LEEWAY_SECONDS,
+    OUTAGE_RETRY_AFTER,
+    TokenRejected,
+    validate_issuer,
+    validate_resource,
+)
 from .exceptions import MicroAuthConfigurationError, MicroAuthError
 from .tokens import (
-    METADATA_PREFIX,
     ClientAddress,
     TokenClaims,
+    Via,
     bearer_challenge,
     bearer_token,
     bearer_verifier,
     metadata_document,
     metadata_path,
     metadata_url,
-    missing_scope_detail,
     normalize_scopes,
 )
 
@@ -82,6 +94,13 @@ _PARSE_ERROR = -32700
 _INVALID_REQUEST = -32600
 _INVALID_PARAMS = -32602
 _HEADER_MISMATCH = -32020
+# MCP 2026-07-28 asks for codes outside the JSON-RPC reserved range when the
+# spec defines none, and it defines none for a missing scope.
+_INSUFFICIENT_SCOPE = 403
+# RFC 6750 error_description allows no quotes or backslashes, and the MCP
+# spec's own tool names are 1 to 128 of these characters.
+_SAFE_TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+_NO_MESSAGE = object()
 
 _identity: ContextVar[TokenClaims | None] = ContextVar("microauth_mcp_identity", default=None)
 
@@ -147,8 +166,24 @@ class _Reject(Exception):
         self.headers = list(headers)
 
 
-def _rpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+def _rpc_error(
+    request_id: Any, code: int, message: str, data: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": request_id, "error": error}
+
+
+def _missing_scopes_detail(what: str, missing: Iterable[str], via: Via) -> str:
+    """A sentence, without the final period, naming the scopes a caller lacks."""
+    names = sorted(missing)
+    word = "permission" if via == "api_key" else "scope"
+    credential = "API key" if via == "api_key" else "access token"
+    if len(names) == 1:
+        return f"{what} needs the {names[0]} {word}, and this {credential} doesn't have it"
+    listed = ", ".join(names[:-1]) + " and " + names[-1]
+    return f"{what} needs the {listed} {word}s, and this {credential} doesn't have them"
 
 
 def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -238,10 +273,12 @@ class McpAuth:
             ``@auth.tool(...)`` decorator.
         api_keys: Also accept API keys your users made for their accounts.
             Needs the server's credentials. Default False.
-        resource_client_id: The server credential ID, for checking keys.
-            Defaults to ``MICROAUTH_RESOURCE_CLIENT_ID``.
-        resource_secret: The server credential secret. Defaults to
-            ``MICROAUTH_RESOURCE_SECRET``.
+        resource_client_id: This MCP server's server credential ID, for
+            checking keys. Pass it with ``resource_secret`` when one app
+            protects more than one resource. Defaults to
+            ``MICROAUTH_RESOURCE_CLIENT_ID``.
+        resource_secret: This MCP server's server credential secret.
+            Defaults to ``MICROAUTH_RESOURCE_SECRET``.
         stale_if_error: Seconds an active key keeps working past its cached
             answer when MicroAuth can't be reached. 0 turns it off.
             Default 600.
@@ -302,7 +339,7 @@ class McpAuth:
             raise MicroAuthConfigurationError("client_address must be a function of the request")
         self._client_address = client_address
         self.metadata_url = metadata_url(self.resource)
-        self._metadata_paths = frozenset({metadata_path(self.resource), METADATA_PREFIX})
+        self._metadata_path = metadata_path(self.resource)
         self._bearer = bearer_verifier(
             issuer=self.issuer,
             resource=self.resource,
@@ -371,10 +408,97 @@ class McpAuth:
         return metadata_document(self.resource, self.issuer, self.scopes_supported)
 
     def wrap(self, app: Any) -> Callable[..., Any]:
-        """The MCP ASGI app, protected. Serve the result at the root of the host."""
+        """The MCP ASGI app, protected, for an MCP server that is the whole site.
+
+        Serve the result at the root of the host. To add the MCP server to an
+        app that has other routes, use ``mount()``.
+        """
         types = _mcp_auth_types()
         inner = types[2](app) if types is not None else app
         return _ProtectedApp(self, inner)
+
+    def mount(self, app: Any, server: Any, *, path: str | None = None) -> None:
+        """Serve a protected MCP server inside your FastAPI or Starlette app.
+
+        Adds the MCP endpoint at ``path`` and the protected resource metadata
+        at its well-known URL, starts and stops the MCP server with your app,
+        and closes this instance at shutdown. Your app's other routes and its
+        own lifespan keep working. Call it before the app starts::
+
+            mcp = MCPServer("Invoices", log_level="WARNING")
+            auth = McpAuth(scopes=["invoices:read"])
+            app = FastAPI()
+            auth.mount(app, mcp)
+
+        Args:
+            app: Your FastAPI or Starlette app.
+            server: An ``MCPServer``, which is served statelessly with JSON
+                responses and accepts only the Host and Origin of
+                ``resource``, or the app its ``streamable_http_app()``
+                returns when you want other transport settings. Build that
+                app with ``streamable_http_path`` set to ``path``.
+            path: Where the MCP endpoint lives. Defaults to the path of
+                ``resource``, or ``/mcp`` when the resource has none.
+        """
+        if path is None:
+            path = urlsplit(self.resource).path.rstrip("/") or "/mcp"
+        if not isinstance(path, str) or not path.startswith("/") or path == "/":
+            raise MicroAuthConfigurationError(
+                "mount() needs a path below the root, such as '/mcp'. Use wrap() to serve "
+                "the MCP server as the whole site."
+            )
+        router: Any = getattr(app, "router", None)
+        if not isinstance(getattr(router, "routes", None), list) or not hasattr(
+            router, "lifespan_context"
+        ):
+            raise MicroAuthConfigurationError("mount() needs a FastAPI or Starlette app")
+        if callable(getattr(server, "streamable_http_app", None)):
+            from mcp.server.transport_security import TransportSecuritySettings
+
+            # Without settings the MCP SDK accepts only localhost Host headers.
+            public = urlsplit(self.resource)
+            server = server.streamable_http_app(
+                streamable_http_path=path,
+                stateless_http=True,
+                json_response=True,
+                transport_security=TransportSecuritySettings(
+                    allowed_hosts=[public.netloc],
+                    allowed_origins=[f"{public.scheme}://{public.netloc}"],
+                ),
+            )
+        server_lifespan = getattr(getattr(server, "router", None), "lifespan_context", None)
+        if server_lifespan is None:
+            raise MicroAuthConfigurationError(
+                "mount() takes an MCPServer, or the app its streamable_http_app() returns"
+            )
+        served = [getattr(route, "path", None) for route in server.router.routes]
+        if path not in served:
+            raise MicroAuthConfigurationError(
+                f"The MCP app doesn't answer at {path}. Build it with "
+                f"streamable_http_app(streamable_http_path={path!r}), or pass the MCPServer "
+                "itself."
+            )
+        router.routes.append(Route(path, self.wrap(server), include_in_schema=False))
+        router.routes.append(
+            Route(self._metadata_path, _MetadataApp(self), include_in_schema=False)
+        )
+        app_lifespan = router.lifespan_context
+
+        @asynccontextmanager
+        async def lifespan(host: Any) -> AsyncIterator[Any]:
+            try:
+                async with app_lifespan(host) as state, server_lifespan(server):
+                    yield state
+            finally:
+                await self._close_quietly()
+
+        router.lifespan_context = lifespan
+
+    async def _close_quietly(self) -> None:
+        try:
+            await self.aclose()
+        except Exception:
+            logger.exception("microauth: closing McpAuth at shutdown failed")
 
     async def aclose(self) -> None:
         """Close the HTTP and Redis clients this instance created and empty
@@ -393,7 +517,7 @@ class McpAuth:
             await app(scope, receive, send)
             return
         method = scope["method"]
-        if scope["path"] in self._metadata_paths:
+        if scope["path"] == self._metadata_path:
             await self._serve_metadata(method, send)
             return
         if method == "OPTIONS":
@@ -406,6 +530,8 @@ class McpAuth:
                 body = await _read_body(receive, self.max_body_size)
                 self._check_message(body, Headers(scope=scope), claims)
                 receive = _replay(body, receive)
+            elif not self.required_scopes <= claims.scopes:
+                raise self._forbidden(_NO_MESSAGE, self.required_scopes, "This MCP server", claims)
         except _Reject as reject:
             await _send_json(send, reject.status, reject.body, reject.headers)
             return
@@ -425,10 +551,7 @@ class McpAuth:
     def _closing_on_shutdown(self, send: Any) -> Callable[[dict[str, Any]], Any]:
         async def lifespan_send(message: dict[str, Any]) -> None:
             if message["type"] == "lifespan.shutdown.complete":
-                try:
-                    await self.aclose()
-                except Exception:
-                    logger.exception("microauth: closing McpAuth at shutdown failed")
+                await self._close_quietly()
             await send(message)
 
         return lifespan_send
@@ -500,7 +623,7 @@ class McpAuth:
                 "error": "temporarily_unavailable",
                 "error_description": "Authorization is temporarily unavailable",
             },
-            [("Retry-After", "5")],
+            [("Retry-After", str(OUTAGE_RETRY_AFTER))],
         )
 
     def _unauthorized(self, reason: str | None) -> _Reject:
@@ -546,6 +669,8 @@ class McpAuth:
                 ),
             )
         if method != "tools/call":
+            if not self.required_scopes <= claims.scopes:
+                raise self._forbidden(request_id, self.required_scopes, "This MCP server", claims)
             return
         params = message.get("params")
         name = params.get("name") if isinstance(params, dict) else None
@@ -576,27 +701,35 @@ class McpAuth:
             )
         needed = self.scopes_for(name)
         if not needed <= claims.scopes:
-            scope = " ".join(sorted(needed))
-            description = f"The {name[:100]} tool needs these scopes: {scope}"
-            raise _Reject(
-                403,
-                {
-                    "error": "insufficient_scope",
-                    "error_description": description,
-                    "scope": scope,
-                },
-                [
-                    (
-                        "WWW-Authenticate",
-                        bearer_challenge(
-                            error="insufficient_scope",
-                            scope=scope,
-                            resource_metadata=self.metadata_url,
-                            error_description=missing_scope_detail(claims.via, "tool"),
-                        ),
-                    )
-                ],
+            what = f"The {name} tool" if _SAFE_TOOL_NAME.fullmatch(name) else "This tool"
+            raise self._forbidden(request_id, needed, what, claims)
+
+    def _forbidden(
+        self, request_id: Any, needed: frozenset[str], what: str, claims: TokenClaims
+    ) -> _Reject:
+        """``403`` naming every scope the request needs, for the client to step up.
+
+        With a ``request_id`` (any POST) the body is a JSON-RPC error, which
+        is what MCP clients show the person.
+        """
+        scope = " ".join(sorted(needed))
+        detail = _missing_scopes_detail(what, needed - claims.scopes, claims.via)
+        challenge = bearer_challenge(
+            error="insufficient_scope",
+            scope=scope,
+            resource_metadata=self.metadata_url,
+            error_description=detail,
+        )
+        if request_id is _NO_MESSAGE:
+            body = {"error": "insufficient_scope", "error_description": detail, "scope": scope}
+        else:
+            body = _rpc_error(
+                request_id,
+                _INSUFFICIENT_SCOPE,
+                detail + ".",
+                {"error": "insufficient_scope", "scope": scope},
             )
+        return _Reject(403, body, [("WWW-Authenticate", challenge)])
 
 
 class _ProtectedApp:
@@ -608,6 +741,16 @@ class _ProtectedApp:
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         await self.auth.serve(self.app, scope, receive, send)
+
+
+class _MetadataApp:
+    """The metadata route ``McpAuth.mount()`` adds."""
+
+    def __init__(self, auth: McpAuth) -> None:
+        self.auth = auth
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        await self.auth._serve_metadata(scope["method"], send)
 
 
 class MicroAuthTokenVerifier:
@@ -634,9 +777,12 @@ class MicroAuthTokenVerifier:
     are left to the SDK's settings so a missing scope stays a ``403``.
 
     With ``api_keys=True`` it accepts your users' API keys too. The MCP SDK
-    hands a verifier only the token, never the request, and has no way to
-    answer ``429``, so neither the unknown key throttle nor a key's
-    requests per minute applies here. Use ``McpAuth`` when you need them.
+    hands a verifier only the token, never the request, and can only answer
+    ``401``. So MicroAuth's per person requests per minute limit and the
+    unknown key throttle don't apply here, and when MicroAuth can't be
+    reached the client gets ``401`` rather than ``503``. ``McpAuth``
+    enforces both limits with ``429`` and ``Retry-After``; use it when you
+    accept keys.
 
     Args:
         issuer: Defaults to ``MICROAUTH_ISSUER``.

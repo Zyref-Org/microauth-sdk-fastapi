@@ -42,6 +42,7 @@ logger = logging.getLogger("microauth")
 T = TypeVar("T")
 
 LEEWAY_SECONDS = 60
+OUTAGE_RETRY_AFTER = 5
 DISCOVERY_PATH = "/.well-known/openid-configuration"
 _MAX_DOCUMENT_BYTES = 512 * 1024
 _MAX_TOKEN_LENGTH = 16 * 1024

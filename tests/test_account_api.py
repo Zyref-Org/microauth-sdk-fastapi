@@ -32,12 +32,13 @@ from oidc_fake import (
 
 from microauth_fastapi import (
     AccountAPIError,
+    AccountAPIUnavailable,
     MicroAuthConfigurationError,
     MicroAuthResponseError,
     UserAuth,
 )
 from microauth_fastapi._keys import display_prefix, key_problem
-from microauth_fastapi.api_keys import APIKeys, _key_path, parse_challenge
+from microauth_fastapi.api_keys import APIKeys, _key_path, parse_challenge, parse_problem, sentence
 
 SAME_SITE = {"Origin": APP_URL}
 SETTINGS = {"Origin": APP_URL, "Referer": f"{APP_URL}/settings/api-keys?tab=keys"}
@@ -402,27 +403,80 @@ def test_a_refusal_raises_account_api_error_with_the_details() -> None:
                 )
             error = caught.value
             assert error.status_code == 422
-            assert error.detail == "validation failed"
+            assert error.detail == "You can't give a key this permission."
             assert error.title == "Unprocessable Entity"
             assert len(error.errors) == 1
             assert error.errors[0].message == "You can't give a key this permission"
             assert error.errors[0].location == "body.permissions[0]"
             assert error.errors[0].value == "posts:publish"
+            assert not isinstance(error, AccountAPIUnavailable)
 
             missing = "00000000-0000-4000-8000-000000000000"
             with pytest.raises(AccountAPIError) as gone:
                 await client.patch(f"/keys/{missing}", json={"name": "x"}, headers=SAME_SITE)
             assert gone.value.status_code == 404
-            assert gone.value.detail == "There is no such API key"
+            assert gone.value.detail == "There is no such API key."
             assert gone.value.errors == ()
 
-            fake.account_canned[("GET", ACCOUNT_API)] = httpx.Response(500, text="oops")
-            with pytest.raises(AccountAPIError) as broken:
-                await client.get("/keys")
-            assert broken.value.status_code == 500
-            assert broken.value.detail == "the Account API answered 500"
+            fake.account_canned[("PATCH", f"{ACCOUNT_API}/{missing}")] = httpx.Response(409)
+            with pytest.raises(AccountAPIError) as bare:
+                await client.patch(f"/keys/{missing}", json={"name": "x"}, headers=SAME_SITE)
+            assert bare.value.status_code == 409
+            assert (
+                bare.value.detail == "The request to manage API keys was refused with status 409."
+            )
 
     run(main)
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_a_microauth_failure_raises_account_api_unavailable(
+    status: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def main() -> None:
+        fake = FakeIssuer()
+        app, _ = build(fake)
+        async with client_for(app) as client:
+            await sign_in(client, fake)
+            fake.account_canned[("GET", ACCOUNT_API)] = httpx.Response(
+                status, json={"title": "Internal Server Error", "status": status}
+            )
+            with pytest.raises(AccountAPIUnavailable) as caught:
+                await client.get("/keys")
+        assert caught.value.status_code == 503
+        assert caught.value.upstream_status == status
+        assert caught.value.detail == (
+            "API keys can't be managed right now. Please try again in a moment."
+        )
+        assert f"the Account API answered {status}" in caplog.text
+
+    run(main)
+
+
+@pytest.mark.parametrize(
+    ("words", "shown"),
+    [
+        ("validation failed", "Validation failed."),
+        ("can't do that", "Can't do that."),
+        ("posts:delete can't be given to a key", "posts:delete can't be given to a key."),
+        ("expected number <= 365", "Expected number <= 365."),
+        ("There is no such API key.", "There is no such API key."),
+        ("Really?", "Really?"),
+        ("  padded  ", "Padded."),
+        ("", ""),
+    ],
+)
+def test_problem_details_become_sentences(words: str, shown: str) -> None:
+    assert sentence(words) == shown
+
+
+def test_a_problem_without_words_still_reads_as_a_sentence() -> None:
+    assert parse_problem(404, None).detail == (
+        "The request to manage API keys was refused with status 404."
+    )
+    assert parse_problem(422, {"detail": "validation failed", "errors": []}).detail == (
+        "Validation failed."
+    )
 
 
 A_KEY = {
@@ -467,7 +521,9 @@ def test_an_unreadable_answer_raises_a_response_error(response: httpx.Response) 
     run(main)
 
 
-def test_an_unreachable_account_api_raises_account_api_error() -> None:
+def test_an_unreachable_account_api_raises_account_api_unavailable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     async def main() -> None:
         fake = FakeIssuer()
         app, auth = build(fake)
@@ -480,10 +536,14 @@ def test_an_unreachable_account_api_raises_account_api_error() -> None:
         auth._http._client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
         async with client_for(app) as client:
             await sign_in(client, fake)
-            with pytest.raises(AccountAPIError) as caught:
+            with pytest.raises(AccountAPIUnavailable) as caught:
                 await client.get("/keys")
-        assert caught.value.status_code == 0
-        assert "ConnectError" in caught.value.detail
+        assert isinstance(caught.value, AccountAPIError)
+        assert caught.value.status_code == 503
+        assert caught.value.upstream_status is None
+        assert caught.value.detail.endswith("Please try again in a moment.")
+        assert "ConnectError" in caplog.text
+        assert "Bearer" not in caplog.text
 
     run(main)
 

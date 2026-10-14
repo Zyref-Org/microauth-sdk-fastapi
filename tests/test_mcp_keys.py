@@ -11,9 +11,14 @@ from typing import Any
 
 import httpx
 import pytest
-from oidc_fake import MCP, MCP_CLIENT_ID, RESOURCE_SECRET, Clock, FakeIssuer, make_key
+from oidc_fake import MCP, MCP_CLIENT_ID, MCP_SECRET, Clock, FakeIssuer, make_key
 
-from microauth_fastapi import McpAuth, MicroAuthTokenVerifier, current_identity
+from microauth_fastapi import (
+    McpAuth,
+    MicroAuthConfigurationError,
+    MicroAuthTokenVerifier,
+    current_identity,
+)
 
 HOST = "https://mcp.example.com"
 PROTOCOL = "2026-07-28"
@@ -21,7 +26,7 @@ HAS_MCP = importlib.util.find_spec("mcp") is not None
 KEY_SETTINGS = {
     "api_keys": True,
     "resource_client_id": MCP_CLIENT_ID,
-    "resource_secret": RESOURCE_SECRET,
+    "resource_secret": MCP_SECRET,
 }
 
 
@@ -151,12 +156,24 @@ def test_a_key_missing_a_tool_scope_gets_403() -> None:
         key = fake.add_key(resources=[MCP], permissions=["invoices:read"])
         async with client_for(app) as client:
             response = await client.post("/mcp", **call("create_invoice", key.secret))
+            fake.add_key(resources=[MCP], permissions=["other"], name="Bare")
+            bare = fake.api_keys[list(fake.api_keys)[-1]]
+            nothing = await client.post("/mcp", **call("create_invoice", bare.secret))
         assert response.status_code == 403
         challenge = response.headers["www-authenticate"]
         assert 'error="insufficient_scope"' in challenge
         assert 'scope="invoices:read invoices:write"' in challenge
-        assert 'error_description="The API key is missing a scope this tool needs"' in challenge
-        assert response.json()["error"] == "insufficient_scope"
+        description = (
+            "The create_invoice tool needs the invoices:write permission, and this API key "
+            "doesn't have it"
+        )
+        assert f'error_description="{description}"' in challenge
+        assert response.json()["error"]["message"] == description + "."
+        assert response.json()["error"]["data"]["error"] == "insufficient_scope"
+        assert nothing.json()["error"]["message"] == (
+            "The create_invoice tool needs the invoices:read and invoices:write permissions, "
+            "and this API key doesn't have them."
+        )
         assert server.calls == []
 
     run(main)
@@ -263,6 +280,44 @@ def test_an_outage_answers_503() -> None:
     run(main)
 
 
+def test_tokens_keys_and_secrets_never_reach_the_logs(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    async def main() -> list[str]:
+        fake = FakeIssuer()
+        auth = make_auth(fake)
+        app = auth.wrap(StandInServer())
+        reader = fake.access_token(aud=MCP, scope="invoices:read")
+        expired = fake.access_token(aud=MCP, scope="invoices:read", exp=1)
+        elsewhere = fake.access_token(aud="https://other.example.com", scope="invoices:read")
+        key = fake.add_key(resources=[MCP], permissions=["invoices:read"])
+        unknown = make_key()
+        async with client_for(app) as client:
+            for tool, credential in [
+                ("list_invoices", reader),
+                ("create_invoice", reader),
+                ("list_invoices", expired),
+                ("list_invoices", elsewhere),
+                ("list_invoices", key.secret),
+                ("create_invoice", key.secret),
+                ("list_invoices", unknown),
+                ("list_invoices", reader[:-4]),
+            ]:
+                await client.post("/mcp", **call(tool, credential))
+            fake.introspect_failure = 502
+            other = fake.add_key(resources=[MCP], permissions=["invoices:read"])
+            refused = await client.post("/mcp", **call("list_invoices", other.secret))
+            assert refused.status_code == 503
+        await auth.aclose()
+        return [reader, expired, elsewhere, key.secret, unknown, other.secret, MCP_SECRET]
+
+    secrets = asyncio.run(main())
+    assert caplog.records
+    for secret in secrets:
+        assert secret not in caplog.text
+        assert secret[-12:] not in caplog.text
+
+
 def test_mcp_keys_are_off_by_default() -> None:
     async def main() -> None:
         fake = FakeIssuer()
@@ -279,6 +334,23 @@ def test_mcp_keys_are_off_by_default() -> None:
         assert fake.introspections == []
 
     run(main)
+
+
+@pytest.mark.parametrize(
+    "given", [{"resource_client_id": MCP_CLIENT_ID}, {"resource_secret": MCP_SECRET}]
+)
+def test_mcp_server_credentials_come_as_a_pair(
+    monkeypatch: pytest.MonkeyPatch, given: dict[str, str]
+) -> None:
+    fake = FakeIssuer()
+    monkeypatch.setenv("MICROAUTH_RESOURCE_CLIENT_ID", "rs_api")
+    monkeypatch.setenv("MICROAUTH_RESOURCE_SECRET", "the-api-secret")
+    classes: list[Any] = [McpAuth]
+    if HAS_MCP:
+        classes.append(MicroAuthTokenVerifier)
+    for cls in classes:
+        with pytest.raises(MicroAuthConfigurationError, match="together"):
+            cls(issuer=fake.issuer, resource=MCP, api_keys=True, **given)
 
 
 def test_shutdown_empties_the_key_cache() -> None:

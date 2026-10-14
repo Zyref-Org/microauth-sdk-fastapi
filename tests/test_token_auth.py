@@ -288,6 +288,7 @@ def test_an_unreachable_issuer_answers_503() -> None:
         async with client_for(app) as client:
             response = await client.get("/posts", headers=bearer(fake.access_token()))
         assert response.status_code == 503
+        assert response.headers["retry-after"] == "5"
 
     run(main)
 

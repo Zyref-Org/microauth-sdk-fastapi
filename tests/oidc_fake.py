@@ -5,6 +5,13 @@ MockTransport: discovery, JWKS, pushed authorization requests, the token
 endpoint with PKCE and refresh token rotation, revocation, API key
 introspection and the Account API for API keys. The browser's trip to the
 authorize page is simulated by ``FakeIssuer.authorize``.
+
+Tokens, discovery and refresh follow the real server
+(internal/server/oauth_tokens.go and internal/oidc): access tokens have no
+``nbf``, ``aud`` depends on the resource and on ``openid``, ``sid`` is left
+out of ``offline_access`` access tokens, ID tokens carry only the claims
+their scopes allow, and refresh tokens rotate with a 30 second grace window
+while any other reuse revokes the whole chain.
 """
 
 from __future__ import annotations
@@ -43,6 +50,27 @@ MCP = "https://mcp.example.com/mcp"
 RESOURCE_CLIENT_ID = "rs_blog_api"
 MCP_CLIENT_ID = "rs_invoices_mcp"
 RESOURCE_SECRET = "rs:secret/with+odd chars%"
+MCP_SECRET = "mcp:another/secret+for the MCP server%"
+REFRESH_GRACE_SECONDS = 30
+CLAIMS_SUPPORTED = [
+    "sub",
+    "iss",
+    "aud",
+    "exp",
+    "iat",
+    "auth_time",
+    "nonce",
+    "sid",
+    "amr",
+    "at_hash",
+    "name",
+    "picture",
+    "updated_at",
+    "email",
+    "email_verified",
+    "roles",
+    "permissions",
+]
 ACCOUNT_API = "/api/v1/me/api-keys"
 ACCOUNT_SCOPE = "microauth:api_keys"
 APP_NAME = "Blog CMS"
@@ -146,6 +174,32 @@ class FakeUser:
     name: str = "Ada Lovelace"
     roles: list[str] = field(default_factory=lambda: ["editor"])
     permissions: list[str] = field(default_factory=lambda: ["posts:write"])
+    amr: list[str] = field(default_factory=lambda: ["pwd"])
+
+
+@dataclass
+class RefreshFamily:
+    """One sign in's chain of refresh tokens, as the real server stores it."""
+
+    scope: str
+    resource: str | None
+    auth_time: int
+    amr: list[str]
+    sid: str
+    # Session bound chains end with the hosted session, and their access
+    # tokens carry sid. offline_access chains outlive it and leave sid out.
+    bound: bool
+    generation: int = 0
+    rotated_at: float | None = None
+
+
+def token_audience(issuer: str, scope: str, resource: str | None) -> str | list[str]:
+    """The resource, plus the issuer when openid was granted; the issuer alone without one."""
+    if resource is None:
+        return issuer
+    if "openid" in scope.split():
+        return [resource, issuer]
+    return resource
 
 
 class FakeIssuer:
@@ -173,7 +227,10 @@ class FakeIssuer:
         self.last_authorization: dict[str, str] = {}
         self._pushed: dict[str, dict[str, str]] = {}
         self._codes: dict[str, dict[str, Any]] = {}
-        self.refresh_tokens: dict[str, dict[str, Any]] = {}
+        # A used code remembers the chain it started, which its reuse revokes.
+        self._used_codes: dict[str, str | None] = {}
+        self.refresh_families: dict[str, RefreshFamily] = {}
+        self.issued_refresh_tokens: list[str] = []
         # When set, tokens carry this auth_time and sign ins that ask for a
         # max_age it doesn't meet make the person sign in again.
         self.last_sign_in: int | None = None
@@ -183,6 +240,8 @@ class FakeIssuer:
         # API keys
         self.now: Callable[[], float] = time.time
         self.resource_clients = {RESOURCE_CLIENT_ID: API, MCP_CLIENT_ID: MCP}
+        # Each resource has its own secret; ones not listed use RESOURCE_SECRET.
+        self.resource_secrets = {MCP_CLIENT_ID: MCP_SECRET}
         self.resource_names = {API: "Blog API", MCP: "Invoices MCP server"}
         self.api_keys: dict[str, FakeKey] = {}
         self.introspections: list[dict[str, str]] = []
@@ -242,9 +301,9 @@ class FakeIssuer:
                 return _oauth_error("invalid_client", 401)
             form = form_of(request)
             self.revoked.append(form)
-            record = self.refresh_tokens.get(form.get("token", ""))
-            if record is not None:
-                record["used"] = True
+            found = self._read_refresh_token(form.get("token", ""))
+            if found is not None:
+                self.refresh_families.pop(found[0], None)
             return httpx.Response(200)
         if path == "/oauth/introspect" and request.method == "POST":
             return await self._introspect(request)
@@ -262,12 +321,34 @@ class FakeIssuer:
             "end_session_endpoint": self.url("/oauth/logout"),
             "revocation_endpoint": self.url("/oauth/revoke"),
             "introspection_endpoint": self.url("/oauth/introspect"),
+            "scopes_supported": ["openid", "profile", "email", "offline_access", "roles"],
             "response_types_supported": ["code"],
+            "response_modes_supported": ["query", "form_post"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "code_challenge_methods_supported": ["S256"],
-            "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+            "token_endpoint_auth_methods_supported": [
+                "client_secret_basic",
+                "client_secret_post",
+                "none",
+            ],
+            "revocation_endpoint_auth_methods_supported": [
+                "client_secret_basic",
+                "client_secret_post",
+                "none",
+            ],
+            "introspection_endpoint_auth_methods_supported": [
+                "client_secret_basic",
+                "client_secret_post",
+            ],
+            "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
+            "claims_supported": list(CLAIMS_SUPPORTED),
+            "prompt_values_supported": ["none", "login", "consent", "create"],
             "authorization_response_iss_parameter_supported": True,
+            "require_pushed_authorization_requests": False,
+            "request_parameter_supported": False,
+            "request_uri_parameter_supported": False,
+            "claims_parameter_supported": False,
         }
         if self.par:
             document["pushed_authorization_request_endpoint"] = self.url("/oauth/par")
@@ -287,7 +368,8 @@ class FakeIssuer:
         header = request.headers.get("authorization", "")
         self.basic_headers.append(header)
         if not header.startswith("Basic "):
-            return False
+            form = form_of(request)
+            return form.get("client_id") == CLIENT_ID and form.get("client_secret") == CLIENT_SECRET
         raw_id, _, raw_secret = base64.b64decode(header[6:]).decode("utf-8").partition(":")
         return unquote_plus(raw_id) == CLIENT_ID and unquote_plus(raw_secret) == CLIENT_SECRET
 
@@ -314,7 +396,6 @@ class FakeIssuer:
             "aud": API,
             "exp": now + self.access_ttl,
             "iat": now,
-            "nbf": now,
             "jti": secrets.token_hex(8),
             "client_id": CLIENT_ID,
             "scope": "posts:read",
@@ -329,24 +410,33 @@ class FakeIssuer:
     ) -> str:
         return self.sign(self.access_token_claims(**overrides), typ=typ, kid=kid)
 
-    def id_token_claims(self, **overrides: Any) -> dict[str, Any]:
+    def id_token_claims(
+        self, scope: str = "openid profile email roles", **overrides: Any
+    ) -> dict[str, Any]:
+        """ID token claims, with only the user claims ``scope`` allows."""
         now = int(time.time())
         user = self.user
+        granted = scope.split()
         claims: dict[str, Any] = {
             "iss": self.issuer,
             "sub": user.sub,
             "aud": CLIENT_ID,
-            "exp": now + 600,
+            "exp": now + self.access_ttl,
             "iat": now,
             "auth_time": now,
             "sid": "sid_1",
-            "email": user.email,
-            "email_verified": True,
-            "name": user.name,
-            "picture": "https://cdn.example.com/ada.png",
-            "roles": list(user.roles),
-            "permissions": list(user.permissions),
+            "amr": list(user.amr),
         }
+        if "profile" in granted:
+            claims["name"] = user.name
+            claims["picture"] = "https://cdn.example.com/ada.png"
+            claims["updated_at"] = now - 86400
+        if "email" in granted:
+            claims["email"] = user.email
+            claims["email_verified"] = True
+        if "roles" in granted:
+            claims["roles"] = list(user.roles)
+            claims["permissions"] = list(user.permissions)
         claims.update(overrides)
         return claims
 
@@ -413,49 +503,115 @@ class FakeIssuer:
             return _oauth_error(self.token_error)
         grant = form.get("grant_type")
         if grant == "authorization_code":
-            params = self._codes.pop(form.get("code", ""), None)
-            if params is None or form.get("redirect_uri") != params["redirect_uri"]:
-                return _oauth_error("invalid_grant")
-            digest = hashlib.sha256(form.get("code_verifier", "").encode("ascii")).digest()
-            if b64url(digest) != params["code_challenge"]:
-                return _oauth_error("invalid_grant")
-            return self._issue(params["scope"], params.get("nonce"), params.get("resource"))
+            return self._exchange_code(form)
         if grant == "refresh_token":
-            record = self.refresh_tokens.get(form.get("refresh_token", ""))
-            if record is None or record["used"]:
-                return _oauth_error("invalid_grant")
-            record["used"] = True
-            return self._issue(record["scope"], None, record["resource"])
+            return self._refresh(form)
         return _oauth_error("unsupported_grant_type")
 
     def refreshes(self) -> int:
         return sum(1 for form in self.token_requests if form.get("grant_type") == "refresh_token")
 
-    def _issue(self, scope: str, nonce: str | None, resource: str | None) -> httpx.Response:
-        sign_in: dict[str, Any] = {}
-        if self.last_sign_in is not None:
-            sign_in["auth_time"] = self.last_sign_in
-        access = self.access_token(aud=resource or self.issuer, scope=scope, **sign_in)
+    def end_sessions(self) -> None:
+        """End every sign in at MicroAuth, so refresh tokens get invalid_grant."""
+        self.refresh_families.clear()
+
+    def _exchange_code(self, form: dict[str, str]) -> httpx.Response:
+        code = form.get("code", "")
+        if code in self._used_codes:
+            family_id = self._used_codes[code]
+            if family_id is not None:
+                self.refresh_families.pop(family_id, None)
+            return _oauth_error("invalid_grant")
+        params = self._codes.get(code)
+        if params is None or form.get("redirect_uri") != params["redirect_uri"]:
+            return _oauth_error("invalid_grant")
+        digest = hashlib.sha256(form.get("code_verifier", "").encode("ascii")).digest()
+        if b64url(digest) != params["code_challenge"]:
+            return _oauth_error("invalid_grant")
+        del self._codes[code]
+        scope = params["scope"]
+        sign_in = RefreshFamily(
+            scope=scope,
+            resource=params.get("resource"),
+            auth_time=self.last_sign_in if self.last_sign_in is not None else int(time.time()),
+            amr=list(self.user.amr),
+            sid="sid_1",
+            bound="offline_access" not in scope.split(),
+        )
+        refresh = None
+        family_id = None
+        if self.issue_refresh_tokens:
+            family_id = secrets.token_hex(12)
+            self.refresh_families[family_id] = sign_in
+            refresh = self._refresh_token(family_id, 0)
+        self._used_codes[code] = family_id
+        return self._issue(sign_in, params.get("nonce"), refresh)
+
+    def _refresh(self, form: dict[str, str]) -> httpx.Response:
+        found = self._read_refresh_token(form.get("refresh_token", ""))
+        family = self.refresh_families.get(found[0]) if found is not None else None
+        if found is None or family is None:
+            return _oauth_error("invalid_grant")
+        family_id, generation = found
+        now = self.now()
+        if generation == family.generation:
+            family.generation += 1
+            family.rotated_at = now
+        elif not (
+            generation == family.generation - 1
+            and family.rotated_at is not None
+            and now - family.rotated_at <= REFRESH_GRACE_SECONDS
+        ):
+            del self.refresh_families[family_id]
+            return _oauth_error("invalid_grant")
+        return self._issue(family, None, self._refresh_token(family_id, family.generation))
+
+    def _refresh_token(self, family_id: str, generation: int) -> str:
+        token = f"rt.{family_id}.{generation}"
+        self.issued_refresh_tokens.append(token)
+        return token
+
+    @staticmethod
+    def _read_refresh_token(token: str) -> tuple[str, int] | None:
+        parts = token.split(".")
+        if len(parts) != 3 or parts[0] != "rt" or not parts[2].isdigit():
+            return None
+        return parts[1], int(parts[2])
+
+    def _issue(
+        self, sign_in: RefreshFamily, nonce: str | None, refresh: str | None
+    ) -> httpx.Response:
+        scope = sign_in.scope
+        access = self.access_token(
+            aud=token_audience(self.issuer, scope, sign_in.resource),
+            scope=scope,
+            auth_time=sign_in.auth_time,
+            sid=sign_in.sid if sign_in.bound else None,
+        )
         self.issued_access_tokens.append(access)
-        claims = self.id_token_claims(at_hash=token_hash(access), **sign_in)
-        if nonce is not None:
-            claims["nonce"] = nonce
-        header: dict[str, Any] = {"typ": "JWT"}
-        if self.id_token_edit is not None:
-            id_token = self.id_token_edit(self, claims, header)
-        else:
-            id_token = self.sign(claims, typ=header["typ"])
         body: dict[str, Any] = {
             "access_token": access,
             "token_type": "Bearer",
             "expires_in": self.access_ttl,
-            "id_token": id_token,
             "scope": scope,
         }
-        if self.issue_refresh_tokens:
-            refresh = secrets.token_urlsafe(24)
-            self.refresh_tokens[refresh] = {"used": False, "scope": scope, "resource": resource}
+        if refresh is not None:
             body["refresh_token"] = refresh
+        if "openid" in scope.split():
+            claims = self.id_token_claims(
+                scope,
+                at_hash=token_hash(access),
+                auth_time=sign_in.auth_time,
+                amr=list(sign_in.amr),
+                sid=sign_in.sid,
+            )
+            if nonce is not None:
+                claims["nonce"] = nonce
+            header: dict[str, Any] = {"typ": "JWT"}
+            if self.id_token_edit is not None:
+                body["id_token"] = self.id_token_edit(self, claims, header)
+            else:
+                body["id_token"] = self.sign(claims, typ=header["typ"])
         return httpx.Response(200, json=body, headers={"Cache-Control": "no-store"})
 
     # API keys
@@ -488,9 +644,10 @@ class FakeIssuer:
         if not header.startswith("Basic "):
             return None
         raw_id, _, raw_secret = base64.b64decode(header[6:]).decode("utf-8").partition(":")
-        if unquote_plus(raw_secret) != RESOURCE_SECRET:
+        client_id = unquote_plus(raw_id)
+        if unquote_plus(raw_secret) != self.resource_secrets.get(client_id, RESOURCE_SECRET):
             return None
-        return self.resource_clients.get(unquote_plus(raw_id))
+        return self.resource_clients.get(client_id)
 
     def _find_key(self, secret: str, now: int) -> FakeKey | None:
         for key in self.api_keys.values():

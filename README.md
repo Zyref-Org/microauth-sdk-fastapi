@@ -18,9 +18,32 @@ pip install microauth-fastapi
 pip install "microauth-fastapi[mcp]"  # adds the MCP SDK for McpAuth
 ```
 
-Settings come from the environment, and any `MICROAUTH_*` value that is not
-set there is read from a `.env` file in the working directory. The SDK needs
-Python 3.10 or newer.
+The SDK needs Python 3.10 or newer.
+
+## Configuration
+
+Every setting can be passed to the constructor. Most also have a
+`MICROAUTH_*` environment variable, listed with each class below, that is
+used when you don't pass the argument. The SDK looks for those variables in
+two places:
+
+1. The process environment. A variable set there always wins, even when it
+   is empty.
+2. A `.env` file in the working directory, which is the directory the
+   server was started from. Only `MICROAUTH_*` lines are read. Other lines
+   are ignored, and nothing is copied into `os.environ`.
+
+The file takes `NAME=value` lines, optionally starting with `export`, with
+`#` comments and single or double quotes around values. Settings are read
+when each object is created, so a change to the file needs a restart. Keep
+`.env` out of version control, since it holds secrets. If you already load
+it with python-dotenv, Docker or your process manager, nothing changes:
+those values are in the environment, so they win.
+
+Pass arguments instead when one app needs two values for the same setting,
+such as an API and an MCP server that each have their own server
+credentials. See
+[An API and an MCP server in one app](#an-api-and-an-mcp-server-in-one-app).
 
 ## Sign users in
 
@@ -78,18 +101,55 @@ development, `http://localhost:8000` works as the app URL.
 Use these as dependencies:
 
 - `auth.user` gives the `User`, or answers `401`.
-- `auth.optional` gives the `User`, or `None` when nobody is signed in.
+- `auth.optional` gives the `User`, or `None` when nobody is signed in. A
+  POST, PUT, PATCH or DELETE from another site also gives `None`, so the
+  route runs as it would for a signed out visitor instead of failing.
 - `auth.login_required` gives the `User`, or redirects to sign in and back.
   Use it for pages.
 - `auth.require(permissions=..., roles=...)` gives the `User` when they hold
   every permission and role listed, and answers `403` otherwise. Add
   `redirect=True` for pages.
 
+`auth.user`, `auth.login_required` and `auth.require` refuse a cross site
+POST, PUT, PATCH or DELETE with `403`.
+
 `User` has `id`, `email`, `email_verified`, `name`, `picture`, `roles`,
-`permissions`, `session_id` and the raw `claims`, plus `has_role()` and
-`has_permission()`. Roles and permissions come from the `roles` scope.
+`permissions`, `session_id`, `amr`, `auth_time` and the raw `claims`, plus
+`has_role()` and `has_permission()`. Roles and permissions come from the
+`roles` scope. `amr` is the set of ways the person proved who they are at
+sign in, with RFC 8176 values such as `pwd` and `otp`, and `auth_time` is
+when that sign in happened, in Unix seconds. Refreshing the session doesn't
+change either, so `auth_time` tells you how long ago the person last
+actually signed in.
+
 `401` and `403` answers are problem JSON (RFC 9457) that keeps the `detail`
 field FastAPI clients already read.
+
+### Your own refusal pages
+
+To show your own page for a refusal, register an exception handler for that
+class, before or after `UserAuth(app)`. The SDK never replaces a handler
+your app registered. `refusal_response(request, exc)` builds the answer the
+SDK would have sent, so your handler can still use it for API calls:
+
+```python
+from fastapi import Request
+from microauth_fastapi import PermissionDenied, refusal_response
+
+
+@app.exception_handler(PermissionDenied)
+async def permission_denied(request: Request, exc: PermissionDenied):
+    if "text/html" in request.headers.get("accept", ""):
+        return templates.TemplateResponse(request, "403.html", status_code=403)
+    return await refusal_response(request, exc)
+```
+
+The classes are `SignInRequired` (401), `PermissionDenied` (403),
+`CrossSiteRequest` (403), `SignInRedirect` (303 to the sign in route) and
+`ReauthenticationRequired` (401 with `login_url`), and with `TokenAuth` also
+`InvalidToken` (401), `InsufficientScope` (403) and `TooManyRequests` (429).
+When you build your own response, copy `exc.headers` onto it, since they
+carry `WWW-Authenticate`, `Retry-After` and `Location`.
 
 How sessions work:
 
@@ -172,10 +232,14 @@ MicroAuth, such as `https://api.example.com`.
   `error="invalid_token"` when a token was sent. A token without a required
   scope gets `403` with `error="insufficient_scope"` and every scope the
   route needs.
+- When the issuer can't be reached to check a token, the answer is `503`
+  with `Retry-After: 5`.
 - The protected resource metadata (RFC 9728) is served at
   `/.well-known/oauth-protected-resource`, followed by the resource's path
   when it has one: `/.well-known/oauth-protected-resource/v1` for
-  `https://api.example.com/v1`.
+  `https://api.example.com/v1`. Only a resource without a path uses the
+  bare root URL, so several resources on one host each keep their own
+  document.
 - `TokenClaims` has `sub`, `via`, `client_id`, `scopes`, `audience`,
   `expires_at`, `issued_at`, `token_id`, `session_id`, `auth_time`, `key_id`
   and the raw `claims`. For an access token, `via` is `"access_token"`.
@@ -190,10 +254,11 @@ official MCP Python SDK, following the MCP 2026-07-28 authorization spec.
 Install it with `pip install "microauth-fastapi[mcp]"`.
 
 ```python
+from fastapi import FastAPI
 from mcp.server.mcpserver import MCPServer
 from microauth_fastapi import McpAuth, current_identity
 
-mcp = MCPServer("Invoices")
+mcp = MCPServer("Invoices", log_level="WARNING")
 auth = McpAuth(scopes=["invoices:read"])  # reads MICROAUTH_ISSUER and MICROAUTH_RESOURCE
 
 
@@ -208,26 +273,60 @@ def list_invoices() -> list[dict]:
 def create_invoice(customer: str, amount_cents: int) -> dict: ...
 
 
-app = auth.wrap(mcp.streamable_http_app(stateless_http=True, json_response=True))
+app = FastAPI()
+auth.mount(app, mcp)
 ```
 
-Serve `app` at the root of its host, with `MICROAUTH_RESOURCE` set to the
-server's URL, such as `https://mcp.example.com/mcp`.
+Set `MICROAUTH_RESOURCE` to the server's public URL, such as
+`https://mcp.example.com/mcp`. `auth.mount(app, mcp)` then does everything
+needed to serve the MCP server inside your app, next to its other routes:
 
-- Every request needs a valid token for that resource holding the `scopes`
-  given to `McpAuth`. Without one the client gets `401` with a challenge
-  that names the metadata URL and those scopes, which is how MCP clients
-  find out where to sign in.
+- It serves the MCP endpoint at the resource's path (`/mcp` here, and also
+  `/mcp` for a resource without a path), or at `path=` if you pass one.
+- It serves the protected resource metadata, described below.
+- It starts the MCP server's session manager when your app starts and stops
+  it at shutdown. Your app's own lifespan still runs around it.
+- It closes the HTTP and Redis clients `McpAuth` made when the app shuts
+  down.
+
+Call it once, before the app starts. An `MCPServer` is served statelessly
+with JSON responses, and the MCP SDK is told to accept only the Host and
+Origin headers of your resource URL. Without that the MCP SDK accepts only
+`localhost`, and every request to a real domain gets `421`. For other
+transport settings, build the app yourself and pass it instead:
+`auth.mount(app, mcp.streamable_http_app(streamable_http_path="/mcp", ...))`.
+When the MCP server is the whole site, `app = auth.wrap(mcp.streamable_http_app(...))`
+still works. Serve that at the root of its host.
+
+`log_level="WARNING"` matters. `MCPServer` configures Python's root logger
+at `INFO` unless you say otherwise, which makes the MCP SDK and httpx log a
+line for every request, including the calls `McpAuth` makes to MicroAuth.
+The level you pass only applies when the root logger has no handlers yet,
+so if your app sets up logging itself, do that before creating the
+`MCPServer`. The SDK itself never logs tokens, API keys or secrets, at any
+level.
+
+How requests are checked:
+
+- Every request, whatever its JSON-RPC method, needs a valid token for that
+  resource holding the `scopes` given to `McpAuth`. Without a token the
+  client gets `401` with a challenge that names the metadata URL and those
+  scopes, which is how MCP clients find out where to sign in. A token
+  without them gets `403`.
 - A `tools/call` also needs the scopes declared for that tool, with
   `@auth.tool(...)` (named after the function, or pass `name=`) or with
-  `McpAuth(tool_scopes={"create_invoice": ["invoices:write"]})`. A token
-  missing one gets `403` with `error="insufficient_scope"` and every scope
-  the tool needs, so the client asks the user once. Tools without declared
-  scopes need only the base scopes, and the SDK logs a warning the first
-  time one is called.
-- The protected resource metadata is served at both
-  `/.well-known/oauth-protected-resource/mcp` and
-  `/.well-known/oauth-protected-resource`.
+  `McpAuth(tool_scopes={"create_invoice": ["invoices:write"]})`. Tools
+  without declared scopes need only the base scopes, and the SDK logs a
+  warning the first time one is called.
+- A `403` names what is missing three ways. `WWW-Authenticate` has
+  `error="insufficient_scope"`, a `scope` with every scope the request needs
+  (so the client asks the user once) and an `error_description` such as
+  `The create_invoice tool needs the invoices:write scope, and this access
+  token doesn't have it`. The body is a JSON-RPC error with the same
+  sentence as its `message`, code `403`, and `error` and `scope` in `data`.
+  API keys get the same, with "permission" and "API key" in the wording.
+- When the issuer can't be reached the answer is `503`, and a caller over a
+  key limit gets `429`, both with `Retry-After`.
 - Each POST must carry one JSON-RPC message, as the 2026-07-28 transport
   sends them. Batches are refused, and the `Mcp-Method` and `Mcp-Name`
   headers must match the body.
@@ -237,6 +336,68 @@ server's URL, such as `https://mcp.example.com/mcp`.
   may touch. Check ownership in the tool, as
   [`examples/invoices_mcp.py`](https://github.com/Zyref-Org/microauth-sdk-fastapi/blob/main/examples/invoices_mcp.py)
   does.
+
+The protected resource metadata (RFC 9728) is served at the path inserted
+URL for the resource, `/.well-known/oauth-protected-resource/mcp` for
+`https://mcp.example.com/mcp`, and the `401` challenge points there. Only a
+resource without a path uses the bare `/.well-known/oauth-protected-resource`,
+so an API on the same host keeps its own document. MCP clients find it
+either way: the official Python client (2.3.0) tries the URL in the
+challenge first, then the path inserted URL, then the root.
+
+What MCP clients show for a missing scope today:
+
+- The official Python client (2.3.0), when it signed in with OAuth, treats
+  the `403` as a step up. It asks the user to approve the scopes in the
+  challenge, along with the ones it already had, and retries the request.
+- When it can't step up, for example because it sends an API key or a fixed
+  token, or when the retried request is refused again, it raises `MCPError`
+  with the sentence from the body. It reads the body only because it is a
+  JSON-RPC error. For any other body it can only say
+  `Server returned an error response`.
+- Other clients show either the `error_description` from the header or the
+  `message` from the body, which say the same thing.
+- A `401` body is an OAuth error, not JSON-RPC. A client that can't sign in,
+  such as one sending an unknown or revoked API key, shows only
+  `Server returned an error response`. The reason is in the body's
+  `error_description`, and for a bad credential in the header's too.
+
+### An API and an MCP server in one app
+
+An API and an MCP server can share one FastAPI app while staying separate
+MicroAuth resources, each with its own permissions and server credentials.
+Pass each one its resource and credentials, since the `MICROAUTH_RESOURCE*`
+variables can hold only one of each:
+
+```python
+app = FastAPI()
+api = TokenAuth(
+    app,
+    resource="https://example.com",
+    api_keys=True,
+    resource_client_id=os.environ["API_CLIENT_ID"],
+    resource_secret=os.environ["API_SECRET"],
+)
+mcp_auth = McpAuth(
+    resource="https://example.com/mcp",
+    scopes=["tasks:read"],
+    api_keys=True,
+    resource_client_id=os.environ["MCP_CLIENT_ID"],
+    resource_secret=os.environ["MCP_SECRET"],
+)
+mcp_auth.mount(app, mcp)
+```
+
+A token or key made for one is refused by the other, and each serves its
+own metadata: the API at `/.well-known/oauth-protected-resource` and the
+MCP server at `/.well-known/oauth-protected-resource/mcp`. Pass
+`resource_client_id` and `resource_secret` together or not at all. One
+argument never pairs with the other's environment variable, since that could
+match one resource's ID with another resource's secret.
+[`examples/api_and_mcp.py`](https://github.com/Zyref-Org/microauth-sdk-fastapi/blob/main/examples/api_and_mcp.py)
+is the whole app.
+
+### The MCP SDK's own auth settings
 
 If you would rather use the MCP SDK's own auth settings,
 `MicroAuthTokenVerifier` is a `TokenVerifier` that checks tokens exactly like
@@ -257,6 +418,12 @@ mcp = MCPServer(
     ),
 )
 ```
+
+The MCP SDK lets a verifier only accept or refuse a token, so some of what
+`McpAuth` does isn't possible this way. An issuer outage looks like a bad
+token (`401` instead of `503` with `Retry-After`), per tool scopes aren't
+checked, and with `api_keys=True` neither the per person key limit nor the
+unknown key throttle applies. Use `McpAuth` when you need any of those.
 
 ## Accept your users' API keys
 
@@ -284,6 +451,9 @@ MICROAUTH_RESOURCE_SECRET=...
 These are the API's server credentials, shown on its page under APIs and MCP
 servers in the dashboard. They let the SDK ask MicroAuth about keys and
 nothing else. Without them `TokenAuth(api_keys=True)` refuses to start.
+When one app has several resources, give each its own with
+`resource_client_id=` and `resource_secret=`, as in
+[An API and an MCP server in one app](#an-api-and-an-mcp-server-in-one-app).
 Callers send a key the way they send a token:
 
 ```bash
@@ -312,10 +482,11 @@ How a key is checked:
   within that time. Parallel requests with the same key share one check.
 - When MicroAuth can't be reached, a key that was active keeps working for
   `stale_if_error` seconds past its cached answer: 10 minutes by default, and
-  0 turns this off. A key the SDK hasn't seen before gets `503`. Errors are
-  never cached.
+  0 turns this off. A key the SDK hasn't seen before gets `503` with
+  `Retry-After: 5`. Errors are never cached.
 - When MicroAuth refuses the server credentials, callers with keys get `503`
-  and the SDK logs an error naming the two settings to check.
+  and the SDK logs an error naming where the credentials came from: the two
+  environment variables, or the arguments.
 - Raw keys never reach logs, caches or Redis.
 
 `TokenClaims` for a key has `via="api_key"`. `sub` is the person who made the
@@ -357,6 +528,7 @@ Settings for keys, with their defaults in brackets:
 - `api_keys` (`False`): accept keys.
 - `resource_client_id` (`$MICROAUTH_RESOURCE_CLIENT_ID`) and
   `resource_secret` (`$MICROAUTH_RESOURCE_SECRET`): the server credentials.
+  Pass both or neither. Passing only one is refused at startup.
 - `stale_if_error` (`600`): seconds an active key outlives its cached answer
   during an outage.
 - `unknown_key_limit` (`20`): unknown keys one address may send per minute.
@@ -457,7 +629,17 @@ When something goes wrong:
   `SignInRequired`, and a stale session is cleared.
 - A refusal, such as an unknown key id, a name that's too long or a
   permission the person can't give, raises `AccountAPIError` with
-  `status_code`, MicroAuth's `detail` and `errors`, one per problem field.
+  `status_code`, `detail` and `errors`, one per problem field. `detail` is
+  written to be shown to the person as it is: one or more full sentences,
+  such as `posts:delete can't be given to a key for Blog MCP server.
+  Expected number <= 365.`
+- When MicroAuth can't be reached, or fails with a `5xx` of its own, the
+  helper raises `AccountAPIUnavailable`, a subclass of `AccountAPIError`
+  with `status_code` 503 and the `detail` `API keys can't be managed right
+  now. Please try again in a moment.` Its `upstream_status` is the status
+  MicroAuth answered, or `None` when it couldn't be reached. The SDK logs a
+  warning with the reason. Catch it before `AccountAPIError` if you want to
+  treat outages differently.
 - When MicroAuth won't let this app manage keys at all, the helper raises
   `MicroAuthConfigurationError`.
 
@@ -876,5 +1058,8 @@ admins delete them. Its `/api/posts` takes the editor page's session and API
 keys alike, and `/settings/api-keys` lets people make keys with
 `auth.api_keys`.
 [`examples/invoices_mcp.py`](https://github.com/Zyref-Org/microauth-sdk-fastapi/blob/main/examples/invoices_mcp.py)
-is an MCP server with a scope per tool and an ownership check in each one,
-and it takes API keys too. Their docstrings say how to set them up.
+is an MCP server mounted in a FastAPI app, with a scope per tool and an
+ownership check in each one, and it takes API keys too.
+[`examples/api_and_mcp.py`](https://github.com/Zyref-Org/microauth-sdk-fastapi/blob/main/examples/api_and_mcp.py)
+serves an API and an MCP server from one app, each its own resource with
+its own server credentials. Their docstrings say how to set them up.
