@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.1.0
+## 3.1.0 (2026-10-15)
 
 Sign users in, and protect APIs and MCP servers with access tokens and with
 API keys your users make for their own accounts, all against your MicroAuth
@@ -50,8 +50,18 @@ service. Nothing changes for `MicroAuth` and the API keys you sell.
   is a JSON-RPC error with the same sentence, so the official MCP client
   shows it.
 - A POST refused with `401`, `429` or `503` gets a JSON-RPC error body too,
-  so a client holding a revoked API key shows why. OAuth discovery after a
-  `401` works as before. `503` and `429` carry `Retry-After`.
+  with the reason as its `message` and the OAuth error code in `data`, so a
+  client holding a revoked API key shows why. A POST that sent no token at
+  all gets no `data`, since its `WWW-Authenticate` header names no error
+  either (RFC 6750 section 3.1). OAuth discovery after a `401` works as
+  before. `503` and `429` carry `Retry-After`.
+- `McpAuth` reads each POST before the MCP server does, up to
+  `max_body_size` (4 MiB by default). A larger body gets `413`. A body that
+  isn't one JSON-RPC message gets `400` with a JSON-RPC error: `-32700` for
+  invalid JSON or a duplicated key, `-32600` for a batch or anything that
+  isn't an object, `-32602` for a `tools/call` without `params.name`, and
+  `-32020` when the `Mcp-Method` or `Mcp-Name` header doesn't match the
+  body.
 - `auth.mount(app, mcp)` serves an `MCPServer` inside a FastAPI or
   Starlette app: the MCP endpoint, the metadata, the session manager in the
   app's lifespan, and closing `McpAuth` at shutdown. `auth.wrap()` still
@@ -70,7 +80,9 @@ service. Nothing changes for `MicroAuth` and the API keys you sell.
   credentials, `MICROAUTH_RESOURCE_CLIENT_ID` and
   `MICROAUTH_RESOURCE_SECRET`, or `resource_client_id=` and
   `resource_secret=` so each resource in one app can have its own. The two
-  arguments must come together.
+  arguments must come together. Without credentials, `TokenAuth` refuses to
+  start and points to the API's page in the dashboard, while `McpAuth` and
+  `MicroAuthTokenVerifier` point to the MCP server's Server credentials.
 - A key with the wrong shape or checksum is refused without a network call.
   Answers are cached by the key's SHA-256 for as long as MicroAuth's
   `Cache-Control` allows, at most 5 minutes, and an active key keeps working
@@ -82,8 +94,12 @@ service. Nothing changes for `MicroAuth` and the API keys you sell.
   finds the real address behind a proxy.
 - `TokenClaims` gains `via` (`"access_token"`, `"api_key"` or `"session"`)
   and `key_id`. `client_id` and `expires_at` can be `None`.
-- `MicroAuthTokenVerifier(api_keys=True)` accepts keys too, without the
-  limits.
+- `MicroAuthTokenVerifier(api_keys=True)` accepts keys too. The MCP SDK
+  only lets a verifier accept or refuse a token, so it doesn't enforce
+  MicroAuth's per person requests per minute limit or the unknown key
+  throttle, and an outage looks like a bad key (`401`, not `503`). The
+  README and its docstring say so, and it logs a warning the first time a
+  key comes with a limit it can't enforce. Use `McpAuth` to enforce both.
 
 ### One route for sessions and keys
 
@@ -114,6 +130,7 @@ service. Nothing changes for `MicroAuth` and the API keys you sell.
   `InsufficientScope`, `ReauthenticationRequired` and `TooManyRequests`.
   `AccountAPIError` is a `MicroAuthAPIError` that lists each problem field
   as an `ErrorDetail`.
+- `AuthUnavailable` takes an optional `retry_after`, sent as `Retry-After`.
 - `TokenAuth` and `McpAuth` close the HTTP and Redis clients they made when
   the app shuts down.
 - `cryptography` and `PyJWT[crypto]` are now dependencies. The new `mcp`
@@ -128,6 +145,8 @@ service. Nothing changes for `MicroAuth` and the API keys you sell.
   exported it.
 - The tests' fake OpenID provider now behaves like the real server, from
   discovery and audiences to refresh token rotation.
+- The MIT license text ships in the repository, the source distribution and
+  the wheel.
 
 ## 3.0.0
 
