@@ -370,10 +370,12 @@ What MCP clients show when a request is refused:
   with the HTTP status as its `code`, the reason as its `message` and the
   OAuth `error` in `data`. Its `id` is `null`, since the message wasn't read.
   So a client that can't sign in, such as one sending a revoked API key,
-  shows `The API key is unknown, revoked or expired.` The `401` still starts
-  OAuth discovery as before, because clients look only at its status and
-  `WWW-Authenticate` header. A GET or DELETE gets a plain OAuth error body
-  with `error` and `error_description`.
+  shows `The API key is unknown, revoked or expired.` A request that sent no
+  token at all gets no `data`, just as its `WWW-Authenticate` header names
+  no `error` (RFC 6750 section 3.1). The `401` still starts OAuth discovery
+  as before, because clients look only at its status and `WWW-Authenticate`
+  header. A GET or DELETE gets a plain OAuth error body with `error` and
+  `error_description`.
 
 ### An API and an MCP server in one app
 

@@ -119,12 +119,13 @@ def call(tool: str, credential: str | None) -> dict[str, Any]:
     return {"json": message, "headers": headers}
 
 
-def refused(response: httpx.Response) -> tuple[str, str]:
-    """The OAuth error code and the sentence of a JSON-RPC refusal."""
+def refused(response: httpx.Response) -> tuple[str | None, str]:
+    """The OAuth error code, or None without one, and the sentence of a JSON-RPC refusal."""
     body = response.json()
     assert body["jsonrpc"] == "2.0" and body["id"] is None
     assert body["error"]["code"] == response.status_code
-    return body["error"]["data"]["error"], body["error"]["message"]
+    data = body["error"].get("data")
+    return (None if data is None else data["error"]), body["error"]["message"]
 
 
 def run(test: Callable[[], Any]) -> None:
@@ -202,10 +203,14 @@ def test_an_unknown_key_gets_invalid_token() -> None:
         )
         assert 'error_description="The API key is unknown' in unknown.headers["www-authenticate"]
         assert mistyped.status_code == 401
+        assert refused(mistyped)[0] == "invalid_token"
         assert "mistyped" in refused(mistyped)[1]
-        assert refused(missing)[1] == (
-            "Send a MicroAuth access token or API key in the Authorization header."
+        assert 'error="invalid_token"' in mistyped.headers["www-authenticate"]
+        assert refused(missing) == (
+            None,
+            "Send a MicroAuth access token or API key in the Authorization header.",
         )
+        assert "error=" not in missing.headers["www-authenticate"]
         assert len(fake.introspections) == 1
 
     run(main)
@@ -336,7 +341,10 @@ def test_mcp_keys_are_off_by_default() -> None:
             response = await client.post("/mcp", **call("list_invoices", key.secret))
             missing = await client.post("/mcp", **call("list_invoices", None))
         assert response.status_code == 401
-        assert refused(missing)[1] == "Send a MicroAuth access token in the Authorization header."
+        assert refused(missing) == (
+            None,
+            "Send a MicroAuth access token in the Authorization header.",
+        )
         assert fake.introspections == []
 
     run(main)

@@ -139,13 +139,14 @@ def test_no_token_gets_401_with_the_metadata_url_and_scope() -> None:
         assert response.headers["www-authenticate"] == (
             f'Bearer resource_metadata="{METADATA}", scope="invoices:read"'
         )
+        # No token means no error code, in the challenge (RFC 6750 section 3.1)
+        # and so in the JSON-RPC error.
         assert response.json() == {
             "jsonrpc": "2.0",
             "id": None,
             "error": {
                 "code": 401,
                 "message": "Send a MicroAuth access token in the Authorization header.",
-                "data": {"error": "invalid_token"},
             },
         }
         assert server.calls == []
@@ -176,6 +177,15 @@ def test_a_token_for_another_resource_gets_invalid_token() -> None:
             'error_description="The token was issued for a different audience", '
             f'resource_metadata="{METADATA}", scope="invoices:read"'
         )
+        assert response.json() == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {
+                "code": 401,
+                "message": "The token was issued for a different audience.",
+                "data": {"error": "invalid_token"},
+            },
+        }
         assert server.calls == []
 
     run(main)

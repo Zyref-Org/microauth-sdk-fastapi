@@ -166,12 +166,20 @@ class _Reject(Exception):
     """A response McpAuth sends itself instead of calling the MCP server."""
 
     def __init__(
-        self, status: int, body: dict[str, Any], headers: Iterable[tuple[str, str]] = ()
+        self,
+        status: int,
+        body: dict[str, Any],
+        headers: Iterable[tuple[str, str]] = (),
+        *,
+        error_code: bool = True,
     ) -> None:
         super().__init__(status)
         self.status = status
         self.body = body
         self.headers = list(headers)
+        # False when the challenge carries no error code, which RFC 6750
+        # section 3.1 asks for when the request sent no token at all.
+        self.error_code = error_code
 
 
 def _rpc_error(
@@ -183,12 +191,16 @@ def _rpc_error(
     return {"jsonrpc": "2.0", "id": request_id, "error": error}
 
 
-def _rpc_refusal(status: int, body: dict[str, Any]) -> dict[str, Any]:
-    """An OAuth style error ``body`` as a JSON-RPC error, which MCP clients show."""
+def _rpc_refusal(status: int, body: dict[str, Any], error_code: bool) -> dict[str, Any]:
+    """An OAuth style error ``body`` as a JSON-RPC error, which MCP clients show.
+
+    Without ``error_code`` the JSON-RPC error has no ``data``, so it agrees
+    with a ``WWW-Authenticate`` challenge that names no error.
+    """
     message = body["error_description"]
     if not message.endswith((".", "!", "?")):
         message += "."
-    return _rpc_error(None, status, message, {"error": body["error"]})
+    return _rpc_error(None, status, message, {"error": body["error"]} if error_code else None)
 
 
 def _missing_scopes_detail(what: str, missing: Iterable[str], via: Via) -> str:
@@ -554,7 +566,7 @@ class McpAuth:
         except _Reject as reject:
             answer = reject.body
             if method == "POST" and reject.status in _AUTH_REFUSALS:
-                answer = _rpc_refusal(reject.status, answer)
+                answer = _rpc_refusal(reject.status, answer, reject.error_code)
             await _send_json(send, reject.status, answer, reject.headers)
             return
         except _ClientGone:
@@ -659,6 +671,7 @@ class McpAuth:
             401,
             {"error": "invalid_token", "error_description": reason or self._missing},
             [("WWW-Authenticate", challenge)],
+            error_code=bool(reason),
         )
 
     def _check_message(self, body: bytes, headers: Headers, claims: TokenClaims) -> None:
