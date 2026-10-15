@@ -58,7 +58,12 @@ from starlette.requests import Request
 from starlette.routing import Route
 
 from ._env import getenv
-from ._keys import DEFAULT_STALE_IF_ERROR, DEFAULT_UNKNOWN_KEY_LIMIT, KeyCheckUnavailable
+from ._keys import (
+    DEFAULT_STALE_IF_ERROR,
+    DEFAULT_UNKNOWN_KEY_LIMIT,
+    MCP_CREDENTIALS_MISSING,
+    KeyCheckUnavailable,
+)
 from ._limits import RequestThrottled
 from ._oidc import (
     LEEWAY_SECONDS,
@@ -283,7 +288,7 @@ class McpAuth:
         tool_scopes: Scopes per tool name, as an alternative to the
             ``@auth.tool(...)`` decorator.
         api_keys: Also accept API keys your users made for their accounts.
-            Needs the server's credentials. Default False.
+            Needs this MCP server's server credentials. Default False.
         resource_client_id: This MCP server's server credential ID, for
             checking keys. Pass it with ``resource_secret`` when one app
             protects more than one resource. Defaults to
@@ -365,6 +370,7 @@ class McpAuth:
             unknown_key_limit=unknown_key_limit,
             redis_url=redis_url,
             redis_client=redis_client,
+            credentials_missing=MCP_CREDENTIALS_MISSING,
         )
         self.verifier = self._bearer.access
         self.key_checks = self._bearer.keys
@@ -857,6 +863,7 @@ class MicroAuthTokenVerifier:
             redis_url=redis_url,
             redis_client=redis_client,
             enforce_limits=False,
+            credentials_missing=MCP_CREDENTIALS_MISSING,
         )
         self.verifier = self._bearer.access
         self.key_checks = self._bearer.keys

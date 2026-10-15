@@ -53,6 +53,17 @@ DEFAULT_STALE_IF_ERROR = 600
 MAX_STALE_IF_ERROR = 86_400
 DEFAULT_UNKNOWN_KEY_LIMIT = 20
 CREDENTIAL_SETTINGS = "MICROAUTH_RESOURCE_CLIENT_ID and MICROAUTH_RESOURCE_SECRET"
+API_CREDENTIALS_MISSING = (
+    f"API keys need this API's server credentials. Set {CREDENTIAL_SETTINGS}, or "
+    "pass resource_client_id= and resource_secret=. They're on the API's page "
+    "under APIs and MCP servers in the MicroAuth dashboard."
+)
+MCP_CREDENTIALS_MISSING = (
+    f"API keys need this MCP server's server credentials. Set {CREDENTIAL_SETTINGS}, "
+    "or pass resource_client_id= and resource_secret=. They're on the MCP server's "
+    "page in the MicroAuth dashboard: open APIs and MCP servers, then the server, "
+    "then Server credentials."
+)
 INACTIVE_REASON = "The API key is unknown, revoked or expired"
 _MAX_ANSWER_BYTES = 64 * 1024
 _MAX_MEMORY_ANSWERS = 10_000
@@ -594,15 +605,12 @@ class KeyChecks:
         redis_client: Any | None,
         enforce_limits: bool = True,
         credential_settings: str = CREDENTIAL_SETTINGS,
+        credentials_missing: str = API_CREDENTIALS_MISSING,
     ) -> None:
         client_id = (client_id or "").strip()
         client_secret = (client_secret or "").strip()
         if not client_id or not client_secret:
-            raise MicroAuthConfigurationError(
-                f"API keys need this API's server credentials. Set {CREDENTIAL_SETTINGS}, or "
-                "pass resource_client_id= and resource_secret=. They're on the API's page "
-                "under APIs and MCP servers in the MicroAuth dashboard."
-            )
+            raise MicroAuthConfigurationError(credentials_missing)
         if (
             isinstance(stale_if_error, bool)
             or not isinstance(stale_if_error, (int, float))

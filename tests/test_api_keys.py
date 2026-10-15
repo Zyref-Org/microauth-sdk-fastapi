@@ -947,8 +947,11 @@ def test_keys_need_the_server_credentials(monkeypatch: pytest.MonkeyPatch) -> No
     fake = FakeIssuer()
     with pytest.raises(MicroAuthConfigurationError) as caught:
         TokenAuth(issuer=fake.issuer, resource=API, api_keys=True)
-    assert "MICROAUTH_RESOURCE_CLIENT_ID" in str(caught.value)
-    assert "MICROAUTH_RESOURCE_SECRET" in str(caught.value)
+    assert str(caught.value) == (
+        "API keys need this API's server credentials. Set MICROAUTH_RESOURCE_CLIENT_ID and "
+        "MICROAUTH_RESOURCE_SECRET, or pass resource_client_id= and resource_secret=. They're "
+        "on the API's page under APIs and MCP servers in the MicroAuth dashboard."
+    )
     with pytest.raises(MicroAuthConfigurationError):
         TokenAuth(issuer=fake.issuer, resource=API, api_keys=True, resource_client_id="id")
     monkeypatch.setenv("MICROAUTH_RESOURCE_CLIENT_ID", RESOURCE_CLIENT_ID)

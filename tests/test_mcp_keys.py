@@ -342,6 +342,23 @@ def test_mcp_keys_are_off_by_default() -> None:
     run(main)
 
 
+def test_mcp_keys_need_the_mcp_servers_credentials() -> None:
+    fake = FakeIssuer()
+    classes: list[Any] = [McpAuth]
+    if HAS_MCP:
+        classes.append(MicroAuthTokenVerifier)
+    for cls in classes:
+        with pytest.raises(MicroAuthConfigurationError) as caught:
+            cls(issuer=fake.issuer, resource=MCP, api_keys=True)
+        assert str(caught.value) == (
+            "API keys need this MCP server's server credentials. Set "
+            "MICROAUTH_RESOURCE_CLIENT_ID and MICROAUTH_RESOURCE_SECRET, or pass "
+            "resource_client_id= and resource_secret=. They're on the MCP server's page in "
+            "the MicroAuth dashboard: open APIs and MCP servers, then the server, then "
+            "Server credentials."
+        )
+
+
 @pytest.mark.parametrize(
     "given", [{"resource_client_id": MCP_CLIENT_ID}, {"resource_secret": MCP_SECRET}]
 )

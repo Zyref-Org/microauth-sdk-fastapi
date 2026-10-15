@@ -45,6 +45,7 @@ from fastapi.security import HTTPBearer
 
 from ._env import getenv
 from ._keys import (
+    API_CREDENTIALS_MISSING,
     CREDENTIAL_SETTINGS,
     DEFAULT_STALE_IF_ERROR,
     DEFAULT_UNKNOWN_KEY_LIMIT,
@@ -362,6 +363,7 @@ def bearer_verifier(
     redis_url: str | None,
     redis_client: Any | None,
     enforce_limits: bool = True,
+    credentials_missing: str = API_CREDENTIALS_MISSING,
 ) -> BearerVerifier:
     if (resource_client_id is None) != (resource_secret is None):
         raise MicroAuthConfigurationError(
@@ -392,6 +394,7 @@ def bearer_verifier(
             client_id=resource_client_id,
             client_secret=resource_secret,
             credential_settings=settings,
+            credentials_missing=credentials_missing,
             timeout=timeout,
             leeway=leeway,
             stale_if_error=stale_if_error,
