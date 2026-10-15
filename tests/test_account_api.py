@@ -38,6 +38,7 @@ from microauth_fastapi import (
     UserAuth,
 )
 from microauth_fastapi._keys import display_prefix, key_problem
+from microauth_fastapi._time import parse_iso8601
 from microauth_fastapi.api_keys import APIKeys, _key_path, parse_challenge, parse_problem, sentence
 
 SAME_SITE = {"Origin": APP_URL}
@@ -111,7 +112,7 @@ NEW_KEY = {
 
 
 def when(value: str | None) -> datetime | None:
-    return None if value is None else datetime.fromisoformat(value)
+    return None if value is None else parse_iso8601(value)
 
 
 def test_the_session_asks_for_the_scope_and_keeps_the_access_token() -> None:

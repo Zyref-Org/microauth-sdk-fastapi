@@ -5,6 +5,7 @@ Run with:
 """
 
 import random
+from typing import TypedDict
 
 from fastapi import FastAPI, HTTPException, Security
 
@@ -15,7 +16,13 @@ app = FastAPI(title="ProWeather API", version="1.0.0")
 # Reads MICROAUTH_SECRET_KEY, and MICROAUTH_REDIS_URL when it is set.
 auth = MicroAuth(app)
 
-CITIES = {
+
+class Weather(TypedDict):
+    temp_c: int
+    condition: str
+
+
+CITIES: dict[str, Weather] = {
     "amsterdam": {"temp_c": 14, "condition": "cloudy"},
     "dubai": {"temp_c": 41, "condition": "sunny"},
     "islamabad": {"temp_c": 31, "condition": "clear"},
