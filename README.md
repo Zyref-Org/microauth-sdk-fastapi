@@ -547,7 +547,10 @@ Limits:
   limits can't be checked, so callers with keys get `503` unless both
   limits are off.
 
-MCP servers take the same settings with `McpAuth(api_keys=True)`. A key's
+MCP servers take the same settings with `McpAuth(api_keys=True)`, using the
+MCP server's own server credentials: in the dashboard, open APIs and MCP
+servers, then the server, then Server credentials. Without them `McpAuth`
+refuses to start and its error says where to find them. A key's
 permissions act as its scopes, so per tool scopes apply to keys too, and
 `current_identity().via` is `"api_key"`. The MCP SDK's `AccessToken` gets the
 key's id as its `client_id`. `MicroAuthTokenVerifier(api_keys=True)` accepts
