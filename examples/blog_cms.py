@@ -1,7 +1,7 @@
 """A small blog CMS where people sign in with MicroAuth.
 
 Anyone can read posts. Signed in users holding the posts:write permission
-(give it to an "editor" role in the MicroAuth dashboard) can write them, and
+(give it to an "Editor" role in the MicroAuth dashboard) can write them, and
 only users with the "admin" role can delete them.
 
 POST /api/posts takes a signed in browser and an API key alike, so editors
@@ -16,16 +16,22 @@ Setup:
     1. In the MicroAuth dashboard, create a web application with the redirect
        URI http://localhost:8000/auth/callback and the sign out URL
        http://localhost:8000/.
-    2. Under APIs and MCP servers, register an API with the identifier
-       http://localhost:8000/api and the permission posts:write. Turn on
-       "API keys for your users" and copy the API's server credentials.
+    2. Under Roles and permissions, add the permission posts:write first,
+       and a role called Editor that has it. Then, under APIs and MCP
+       servers, register an API with the identifier
+       http://localhost:8000/api that exposes posts:write. Turn on "API keys
+       for your users" and copy the API's server credentials.
     3. Set MICROAUTH_ISSUER, MICROAUTH_CLIENT_ID, MICROAUTH_CLIENT_SECRET,
        MICROAUTH_APP_URL=http://localhost:8000, a MICROAUTH_COOKIE_SECRET
        from python -c 'import secrets; print(secrets.token_urlsafe(32))',
        MICROAUTH_RESOURCE=http://localhost:8000/api, and the server
        credentials as MICROAUTH_RESOURCE_CLIENT_ID and
-       MICROAUTH_RESOURCE_SECRET.
-    4. Run uvicorn examples.blog_cms:app and open http://localhost:8000.
+       MICROAUTH_RESOURCE_SECRET, in the environment or in a .env file next
+       to blog_cms.py.
+    4. Install with pip install "fastapi[standard]" microauth-fastapi, then
+       run it with fastapi dev blog_cms.py in the folder that holds this
+       file, like the quickstart, and open http://localhost:8000.
+    5. Sign up, then give yourself the Editor role under Users to write posts.
 """
 
 import html
