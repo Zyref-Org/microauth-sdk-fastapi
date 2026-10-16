@@ -667,12 +667,12 @@ class McpAuth:
             resource_metadata=self.metadata_url,
             scope=" ".join(sorted(self.scopes_supported)) or None,
         )
-        return _Reject(
-            401,
-            {"error": "invalid_token", "error_description": reason or self._missing},
-            [("WWW-Authenticate", challenge)],
-            error_code=bool(reason),
+        body = (
+            {"error": "invalid_token", "error_description": reason}
+            if reason
+            else {"error_description": self._missing}
         )
+        return _Reject(401, body, [("WWW-Authenticate", challenge)], error_code=bool(reason))
 
     def _check_message(self, body: bytes, headers: Headers, claims: TokenClaims) -> None:
         try:

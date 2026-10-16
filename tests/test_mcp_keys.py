@@ -216,6 +216,25 @@ def test_an_unknown_key_gets_invalid_token() -> None:
     run(main)
 
 
+def test_a_key_of_a_paused_service_shows_microauths_reason() -> None:
+    reason = "Acme is paused, so its API keys don't work right now"
+
+    async def main() -> None:
+        fake = FakeIssuer()
+        app = make_auth(fake).wrap(StandInServer())
+        key = fake.add_key(resources=[MCP], permissions=["invoices:read"])
+        fake.introspect_edit = lambda document: {"active": False, "reason_description": reason}
+        async with client_for(app) as client:
+            response = await client.post("/mcp", **call("list_invoices", key.secret))
+            stream = await client.get("/mcp", headers={"Authorization": f"Bearer {key.secret}"})
+        assert response.status_code == 401
+        assert refused(response) == ("invalid_token", reason + ".")
+        assert f'error_description="{reason}"' in response.headers["www-authenticate"]
+        assert stream.json() == {"error": "invalid_token", "error_description": reason}
+
+    run(main)
+
+
 def test_a_key_for_another_server_is_refused() -> None:
     async def main() -> None:
         fake = FakeIssuer()

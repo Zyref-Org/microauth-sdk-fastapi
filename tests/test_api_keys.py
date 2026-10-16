@@ -25,14 +25,21 @@ from oidc_fake import (
 
 from microauth_fastapi import MicroAuthConfigurationError, TokenAuth, TokenClaims
 from microauth_fastapi._keys import (
+    MAX_REASON_LENGTH,
     cache_lifetime,
     display_prefix,
     key_checksum,
     key_problem,
+    refusal_reason,
 )
 
 METADATA = f"{API}/.well-known/oauth-protected-resource"
 INACTIVE = "The API key is unknown, revoked or expired"
+PAUSED = "Acme API is paused, so its API keys don't work right now. Ask its team."
+
+
+def paused(document: dict[str, Any]) -> dict[str, Any]:
+    return {"active": False, "reason": "service_paused", "reason_description": PAUSED}
 
 
 def build(
@@ -331,6 +338,67 @@ def test_a_revoked_key_stops_working_once_its_answer_expires() -> None:
             assert revoked.json()["detail"] == INACTIVE
 
     run(main)
+
+
+def test_a_key_of_a_paused_service_gets_microauths_reason() -> None:
+    async def main() -> None:
+        fake = FakeIssuer()
+        app, _ = build(fake)
+        key = fake.add_key()
+        fake.introspect_edit = paused
+        async with client_for(app) as client:
+            for _ in range(2):
+                refused = await client.get("/posts", headers=bearer(key.secret))
+                assert refused.status_code == 401
+                assert refused.json()["detail"] == PAUSED
+                assert refused.headers["www-authenticate"] == (
+                    f'Bearer error="invalid_token", error_description="{PAUSED}", '
+                    f'resource_metadata="{METADATA}"'
+                )
+            # The second answer came from the cache, reason and all.
+            assert len(fake.introspections) == 1
+            unknown = await client.get("/posts", headers=bearer(make_key()))
+            assert unknown.json()["detail"] == INACTIVE
+
+    run(main)
+
+
+@pytest.mark.parametrize(
+    "description",
+    [None, "", "   ", 42, ["paused"], "Back\\slash", "Null\x00byte", "\u6682\u505c\u4e2d"],
+)
+def test_a_reason_that_cant_be_shown_safely_keeps_the_usual_detail(description: Any) -> None:
+    assert refusal_reason(description) is None
+
+    async def main() -> None:
+        fake = FakeIssuer()
+        app, _ = build(fake)
+        key = fake.add_key()
+        fake.introspect_edit = lambda document: {"active": False, "reason_description": description}
+        async with client_for(app) as client:
+            refused = await client.get("/posts", headers=bearer(key.secret))
+        assert refused.status_code == 401
+        assert refused.json()["detail"] == INACTIVE
+
+    run(main)
+
+
+def test_a_reason_is_plain_text_on_one_line() -> None:
+    assert (
+        refusal_reason("Caf\u00e9 API\u2019s keys\n\tare  paused.") == "Cafe API's keys are paused."
+    )
+    assert refusal_reason('Say \u201chi\u201d or "bye" \u2014 later') == "Say 'hi' or 'bye' - later"
+    assert refusal_reason("<b>Paused</b>") == "<b>Paused</b>"
+
+
+def test_a_long_reason_is_cut_at_a_word() -> None:
+    text = "This service is paused, " * 40
+    reason = refusal_reason(text)
+    assert reason is not None and reason.endswith("...")
+    assert len(reason) <= MAX_REASON_LENGTH
+    kept = reason[:-3]
+    assert text.startswith(kept) and text[len(kept)] in " ,"
+    assert refusal_reason("x" * 1000) == "x" * (MAX_REASON_LENGTH - 3) + "..."
 
 
 @pytest.mark.parametrize(

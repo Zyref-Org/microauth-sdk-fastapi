@@ -375,7 +375,8 @@ What MCP clients show when a request is refused:
   no `error` (RFC 6750 section 3.1). The `401` still starts OAuth discovery
   as before, because clients look only at its status and `WWW-Authenticate`
   header. A GET or DELETE gets a plain OAuth error body with `error` and
-  `error_description`.
+  `error_description`, or only `error_description` when it sent no token,
+  so it agrees with the header the same way.
 
 ### An API and an MCP server in one app
 
@@ -507,6 +508,12 @@ How a key is checked:
   issuer, using the server credentials. MicroAuth answers whether the key
   works at this API, whose it is, which permissions it carries right now,
   and how many requests a minute you allow each person.
+- A key MicroAuth doesn't accept gets `401` with
+  `The API key is unknown, revoked or expired`. When MicroAuth says why,
+  as it does for a key whose service is paused, its `reason_description`
+  is the detail instead. It is treated as plain text on one line, up to 200
+  characters, and the usual sentence is used when it can't be shown safely
+  in the `WWW-Authenticate` header.
 - Answers are cached by the key's SHA-256, never the key itself, for as long
   as MicroAuth's `Cache-Control` allows: 30 seconds today and never more
   than 5 minutes. A revoked key, or a person who lost a role, stops working
@@ -1026,8 +1033,8 @@ statuses. The fix column is what you, or your customer, can do about it.
 | `403` | `This account is suspended` | You suspended the customer | Reactivate the customer in the dashboard |
 | `403` | `This account is waiting for approval` | Sign ups need your approval and this customer is still waiting | Approve the customer in the dashboard |
 | `429` | `Rate limit exceeded` | More requests per second than the customer's RPS. Has `Retry-After` | Slow down, or raise the plan's RPS |
-| `429` | `Monthly request quota exceeded` | The customer used their monthly request quota | Wait for the next period or upgrade the plan |
-| `429` | `Platform monthly request allowance exhausted` | Your MicroAuth plan's monthly allowance is used up | Upgrade your MicroAuth plan |
+| `429` | `Monthly request quota exceeded. It resets on 2026-11-01 at 00:00 UTC` | The customer used their monthly request quota, which resets at the end of the calendar month in UTC. `Retry-After` is the seconds until then | Wait for the reset, or upgrade the plan |
+| `429` | `Platform monthly request allowance exhausted. It resets on 2026-11-01 at 00:00 UTC` | Your MicroAuth plan's monthly allowance is used up, or the API is paused. `Retry-After` is the seconds until the month resets, though a paused API stays paused | Upgrade your MicroAuth plan |
 | `503` | `Authorization is temporarily unavailable` | Snapshot too stale, Redis down while enforcing shared limits, or usage queue full | Check connectivity to MicroAuth and Redis. Run `python -m microauth_fastapi check` |
 
 Customers never see your MicroAuth secret or internal state in these

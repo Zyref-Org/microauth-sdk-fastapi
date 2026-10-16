@@ -40,6 +40,16 @@ def load(name: str) -> ModuleType:
     return module
 
 
+def test_blog_cms_setup_runs_it_like_the_quickstart() -> None:
+    text = (EXAMPLES / "blog_cms.py").read_text(encoding="utf-8")
+    steps = " ".join(text.split("Setup:", 1)[1].split('"""', 1)[0].split())
+    assert "fastapi dev blog_cms.py" in steps
+    assert "uvicorn" not in steps
+    step_two = steps.split(" 2. ", 1)[1].split(" 3. ", 1)[0]
+    assert step_two.startswith("Under Roles and permissions, add the permission posts:write first")
+    assert step_two.index("Roles and permissions") < step_two.index("APIs and MCP servers")
+
+
 def test_blog_cms_example(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeIssuer()
     monkeypatch.setenv("MICROAUTH_ISSUER", fake.issuer)

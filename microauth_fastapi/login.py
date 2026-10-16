@@ -281,6 +281,31 @@ class _TokenEndpointError(MicroAuthAPIError):
         super().__init__(status_code, detail)
 
 
+def _one_line(value: str, limit: int) -> str:
+    text = " ".join(value.split())
+    return "".join(ch for ch in text if ch.isprintable())[:limit]
+
+
+def _oauth_refusal(response: httpx.Response) -> str | None:
+    """``error: error_description`` from an OAuth error answer, for the log.
+
+    ``invalid_client`` also names the settings to check, never their values.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict) or not isinstance(body.get("error"), str):
+        return None
+    text = _one_line(body["error"], 100)
+    description = body.get("error_description")
+    if isinstance(description, str) and description.strip():
+        text = f"{text}: {_one_line(description, 300).rstrip('.')}"
+    if body["error"] == "invalid_client":
+        text += ". Check MICROAUTH_CLIENT_SECRET and MICROAUTH_CLIENT_ID"
+    return text
+
+
 class _RequestState:
     """What one request read from, and will write to, the auth cookies.
 
@@ -1193,9 +1218,10 @@ class UserAuth:
         """Push the authorization request (RFC 9126) and return its request_uri."""
         response = await self._post_form(endpoint, params)
         if response.status_code not in (200, 201):
+            detail = f"the pushed authorization request was refused ({response.status_code})"
+            refusal = _oauth_refusal(response)
             raise MicroAuthAPIError(
-                response.status_code,
-                f"the pushed authorization request was refused ({response.status_code})",
+                response.status_code, f"{detail}: {refusal}" if refusal else detail
             )
         try:
             body = response.json()

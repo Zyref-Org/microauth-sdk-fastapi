@@ -7,7 +7,9 @@ renders them as regular JSON error responses and they show up in OpenAPI.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
@@ -181,14 +183,56 @@ class TooManyRequests(RateLimited):
         self.detail = detail
 
 
+def _until_reset(detail: str, reset_at: datetime | None) -> str:
+    if reset_at is None:
+        return detail
+    at = reset_at.astimezone(timezone.utc)
+    return f"{detail}. It resets on {at:%Y-%m-%d} at {at:%H:%M} UTC"
+
+
+def _retry_until(reset_at: datetime | None, retry_after: float | None) -> dict[str, str] | None:
+    if retry_after is None:
+        if reset_at is None:
+            return None
+        retry_after = reset_at.timestamp() - time.time()
+    return {"Retry-After": str(max(1, math.ceil(retry_after)))}
+
+
 class QuotaExceeded(AuthDenied):
-    def __init__(self) -> None:
-        super().__init__(status_code=429, detail="Monthly request quota exceeded")
+    """The customer used up their monthly request quota.
+
+    ``reset_at`` is when the quota resets, at the end of the calendar month
+    in UTC, and the detail names it. ``Retry-After`` is the seconds until
+    then, or ``retry_after`` when given. Without ``reset_at`` there is no
+    ``Retry-After``.
+    """
+
+    def __init__(
+        self, reset_at: datetime | None = None, *, retry_after: float | None = None
+    ) -> None:
+        self.reset_at = reset_at
+        super().__init__(
+            status_code=429,
+            detail=_until_reset("Monthly request quota exceeded", reset_at),
+            headers=_retry_until(reset_at, retry_after),
+        )
 
 
 class PlatformAllowanceExceeded(AuthDenied):
-    def __init__(self) -> None:
-        super().__init__(status_code=429, detail="Platform monthly request allowance exhausted")
+    """Your MicroAuth plan's monthly request allowance is used up.
+
+    ``reset_at`` and ``Retry-After`` work as for ``QuotaExceeded``.
+    """
+
+    def __init__(
+        self, reset_at: datetime | None = None, *, retry_after: float | None = None
+    ) -> None:
+        self.reset_at = reset_at
+        super().__init__(
+            status_code=429,
+            detail=_until_reset("Platform monthly request allowance exhausted", reset_at),
+            headers=_retry_until(reset_at, retry_after),
+        )
 
 
 class AuthUnavailable(AuthDenied):

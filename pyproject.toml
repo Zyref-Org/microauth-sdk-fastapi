@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "microauth-fastapi"
-version = "3.1.0"
+version = "3.1.1"
 description = "MicroAuth SDK for FastAPI: user sign in, access tokens for APIs and MCP servers, and API keys with metered billing"
 readme = "README.md"
 license = "MIT"

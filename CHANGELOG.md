@@ -1,5 +1,55 @@
 # Changelog
 
+## 3.1.1 (2026-10-16)
+
+Fixes from a review against the live MicroAuth service. Callers learn when a
+used up quota resets and why a paused service's key is refused, and a wrong
+client secret is easier to spot in the log. The two quota `429` details gain
+a sentence with the reset date, so code that compares them exactly should
+compare how they start.
+
+### Limits and refusals
+
+- `QuotaExceeded` and `PlatformAllowanceExceeded` send `Retry-After` with
+  the seconds until the monthly count resets, at the end of the calendar
+  month in UTC (the snapshot's `platform_period_end`), counted on
+  MicroAuth's clock. The detail names the moment, such as
+  `Monthly request quota exceeded. It resets on 2026-11-01 at 00:00 UTC`.
+  Both take optional `reset_at` and `retry_after` and expose `reset_at`,
+  and raised with no arguments they behave as before. `RateLimited` keeps
+  its per second `Retry-After`.
+- When introspection refuses a key with a `reason_description`, as
+  MicroAuth does for a key whose service is paused, `TokenAuth` and
+  `McpAuth` use it as the `401` reason instead of
+  `The API key is unknown, revoked or expired`. It is plain text on one
+  line, cut at a word after 200 characters, and the usual sentence stays
+  when the text can't be sent safely in `WWW-Authenticate`. The status is
+  still `401`. The reason is cached with the answer, in Redis too, where
+  3.1.0 workers sharing the cache skip it.
+- A GET or DELETE that reaches `McpAuth` with no token gets a body with
+  only `error_description`, matching its `WWW-Authenticate` header, the way
+  a POST without a token already did.
+
+### Sign in
+
+- When MicroAuth refuses the pushed authorization request, the log line
+  keeps its OAuth error and description. A wrong client secret logs
+  `invalid_client` with MicroAuth's reason and names
+  `MICROAUTH_CLIENT_SECRET` and `MICROAUTH_CLIENT_ID` to check, never their
+  values.
+
+### Other changes
+
+- `examples/blog_cms.py` runs with `fastapi dev blog_cms.py`, like the
+  quickstart, and its setup adds `posts:write` under Roles and permissions
+  first.
+- CI and the release workflow use `actions/checkout` v7,
+  `actions/setup-python` v7, `actions/upload-artifact` v7 and
+  `actions/download-artifact` v8, which run on Node 24. They stay on
+  `ubuntu-latest`, which becomes Ubuntu 26.04 on 2026-10-19 and has builds
+  of Python 3.10 to 3.14.
+- A test checks that `__version__` matches the version in `pyproject.toml`.
+
 ## 3.1.0 (2026-10-15)
 
 Sign users in, and protect APIs and MCP servers with access tokens and with

@@ -638,10 +638,10 @@ class MicroAuth:
                 raise RateLimited() from exc
             if exc.reason == DENIED_BALANCE:
                 raise PaymentRequired() from exc
-            if exc.reason == DENIED_QUOTA:
-                raise QuotaExceeded() from exc
-            if exc.reason == DENIED_PLATFORM:
-                raise PlatformAllowanceExceeded() from exc
+            if exc.reason in (DENIED_QUOTA, DENIED_PLATFORM):
+                reset_at, retry_after = self._period_reset(snap)
+                used_up = QuotaExceeded if exc.reason == DENIED_QUOTA else PlatformAllowanceExceeded
+                raise used_up(reset_at, retry_after=retry_after) from exc
             raise AuthUnavailable() from exc
         except LimitBackendUnavailable as exc:
             self._reporter.release(usage_reservation)
@@ -677,6 +677,17 @@ class MicroAuth:
         )
         setattr(request.state, _STATE_ATTR, usage_context)
         return principal
+
+    def _period_reset(self, snap: Snapshot) -> tuple[datetime | None, float | None]:
+        """When the monthly counts reset, and the seconds until then on MicroAuth's clock.
+
+        MicroAuth counts each customer's quota and your plan's allowance over
+        the same calendar month in UTC, which ends at ``platform_period_end``.
+        """
+        allowance = snap.platform_allowance
+        if allowance is None:
+            return None, None
+        return allowance.period_end, allowance.period_end.timestamp() - self._clock.time()
 
     def _policy_expired(self, customer: CustomerState) -> bool:
         return customer.policy_valid_until <= self._clock.now()

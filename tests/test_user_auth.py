@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import html
+import logging
 import secrets
 import time
 from collections.abc import Callable
@@ -37,7 +38,7 @@ from microauth_fastapi import (
     refusal_response,
 )
 from microauth_fastapi._cookies import CHUNK_SIZE, CookieSealer, read_value, split_value
-from microauth_fastapi.login import safe_path, user_from_claims
+from microauth_fastapi.login import _oauth_refusal, safe_path, user_from_claims
 
 SESSION = "__Host-microauth"
 LOGIN = "__Host-microauth-login"
@@ -170,6 +171,51 @@ def test_login_without_par_puts_the_request_in_the_redirect() -> None:
         assert fake.par_requests == []
 
     run(main)
+
+
+def test_a_wrong_client_secret_logs_microauths_reason(caplog: pytest.LogCaptureFixture) -> None:
+    wrong = "not-the-secret-" + secrets.token_urlsafe(12)
+
+    async def main() -> None:
+        fake = FakeIssuer()
+        app, _ = build(fake, client_secret=wrong)
+        async with client_for(app) as client:
+            with caplog.at_level(logging.ERROR, logger="microauth"):
+                response = await client.get("/auth/login")
+        assert response.status_code == 503
+        assert "Sign in is unavailable" in page(response)
+
+    run(main)
+    assert (
+        "the pushed authorization request was refused (401): invalid_client: fake "
+        "invalid_client. Check MICROAUTH_CLIENT_SECRET and MICROAUTH_CLIENT_ID"
+    ) in caplog.text
+    assert wrong not in caplog.text
+    assert CLIENT_SECRET not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("body", "logged"),
+    [
+        (
+            {"error": "invalid_client", "error_description": "The client secret is wrong."},
+            (
+                "invalid_client: The client secret is wrong. "
+                "Check MICROAUTH_CLIENT_SECRET and MICROAUTH_CLIENT_ID"
+            ),
+        ),
+        (
+            {"error": "invalid_request", "error_description": "Two\nlines\x00 here"},
+            "invalid_request: Two lines here",
+        ),
+        ({"error": "invalid_scope"}, "invalid_scope"),
+        ({"error": 5}, None),
+        (["invalid_client"], None),
+    ],
+)
+def test_an_oauth_refusal_is_logged_on_one_line(body: Any, logged: str | None) -> None:
+    assert _oauth_refusal(httpx.Response(400, json=body)) == logged
+    assert _oauth_refusal(httpx.Response(502, text="Bad gateway")) is None
 
 
 @pytest.mark.parametrize(
