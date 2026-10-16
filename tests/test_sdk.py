@@ -1726,6 +1726,17 @@ def test_api_client_sends_user_agent_and_revalidates_snapshots() -> None:
     assert "If-None-Match" not in seen[3].headers
 
 
+def test_the_package_reports_the_version_it_was_released_as() -> None:
+    import re
+
+    from microauth_fastapi import __version__
+
+    pyproject = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text("utf-8")
+    released = re.search(r'^version = "([^"]+)"$', pyproject, re.MULTILINE)
+    assert released is not None
+    assert __version__ == released.group(1)
+
+
 def test_verified_keys_never_mutate_a_published_snapshot() -> None:
     new_key = "map_verified_later"
     new_hash = hashlib.sha256(new_key.encode()).hexdigest()
