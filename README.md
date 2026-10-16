@@ -375,7 +375,8 @@ What MCP clients show when a request is refused:
   no `error` (RFC 6750 section 3.1). The `401` still starts OAuth discovery
   as before, because clients look only at its status and `WWW-Authenticate`
   header. A GET or DELETE gets a plain OAuth error body with `error` and
-  `error_description`.
+  `error_description`, or only `error_description` when it sent no token,
+  so it agrees with the header the same way.
 
 ### An API and an MCP server in one app
 

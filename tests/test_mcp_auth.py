@@ -152,10 +152,31 @@ def test_no_token_gets_401_with_the_metadata_url_and_scope() -> None:
         assert server.calls == []
         async with client_for(app) as client:
             stream = await client.get("/mcp", headers=headers("tools/list"))
+            ended = await client.delete("/mcp", headers=headers("tools/list"))
+        # The plain body names no error either, just like the header.
+        for plain in (stream, ended):
+            assert plain.status_code == 401
+            assert plain.headers["www-authenticate"] == response.headers["www-authenticate"]
+            assert plain.json() == {
+                "error_description": "Send a MicroAuth access token in the Authorization header",
+            }
+        assert server.calls == []
+
+    run(main)
+
+
+def test_a_get_with_a_refused_token_names_the_error_in_the_body() -> None:
+    async def main() -> None:
+        fake = FakeIssuer()
+        app = make_auth(fake).wrap(StandInServer())
+        other = fake.access_token(aud="https://api.example.com", scope="invoices:read")
+        async with client_for(app) as client:
+            stream = await client.get("/mcp", headers=headers("tools/list", None, other))
         assert stream.status_code == 401
+        assert 'error="invalid_token"' in stream.headers["www-authenticate"]
         assert stream.json() == {
             "error": "invalid_token",
-            "error_description": "Send a MicroAuth access token in the Authorization header",
+            "error_description": "The token was issued for a different audience",
         }
 
     run(main)
