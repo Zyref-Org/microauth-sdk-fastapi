@@ -26,6 +26,7 @@ import logging
 import math
 import re
 import time
+import unicodedata
 import zlib
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
@@ -65,6 +66,20 @@ MCP_CREDENTIALS_MISSING = (
     "then Server credentials."
 )
 INACTIVE_REASON = "The API key is unknown, revoked or expired"
+MAX_REASON_LENGTH = 200
+# What RFC 6750 allows in error_description, where the reason goes too.
+_CHALLENGE_TEXT = re.compile(r"[\x20\x21\x23-\x5b\x5d-\x7e]*")
+_PLAIN_PUNCTUATION = str.maketrans(
+    {
+        '"': "'",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": "'",
+        "\u201d": "'",
+        "\u2013": "-",
+        "\u2014": "-",
+    }
+)
 _MAX_ANSWER_BYTES = 64 * 1024
 _MAX_MEMORY_ANSWERS = 10_000
 _MAX_WARNED_KEYS = 1024
@@ -205,6 +220,28 @@ def parse_active(document: Mapping[str, Any], *, issuer: str, resource: str) -> 
     )
 
 
+def refusal_reason(raw: Any) -> str | None:
+    """MicroAuth's ``reason_description`` for an inactive key, as plain text
+    that is safe in a ``WWW-Authenticate`` challenge, or None.
+
+    Accents and curly quotes are dropped or made plain, runs of whitespace
+    become one space, and text over ``MAX_REASON_LENGTH`` is cut at a word.
+    Text that still holds anything RFC 6750 doesn't allow there gives None,
+    and so does text that ends up empty.
+    """
+    if not isinstance(raw, str):
+        return None
+    text = unicodedata.normalize("NFKD", raw[: MAX_REASON_LENGTH * 4])
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = " ".join(text.translate(_PLAIN_PUNCTUATION).split())
+    if not text or not _CHALLENGE_TEXT.fullmatch(text):
+        return None
+    if len(text) > MAX_REASON_LENGTH:
+        cut = text[: MAX_REASON_LENGTH - 3].rsplit(" ", 1)[0]
+        text = cut.rstrip(" ,;:.") + "..."
+    return text
+
+
 class KeyRejected(TokenRejected):
     """A malformed, mistyped or inactive key. These count toward the unknown key throttle."""
 
@@ -229,6 +266,8 @@ class _Entry:
     answer: KeyAnswer | None
     fresh_until: float
     stale_until: float
+    # MicroAuth's reason for an inactive key, already made safe to show.
+    reason: str | None = None
 
 
 class AnswerCache(Protocol):
@@ -305,21 +344,23 @@ class RedisAnswers:
             return None
         if stale_until <= now:
             return None
-        return _Entry(answer, fresh_until, stale_until)
+        reason = refusal_reason(stored.get("r")) if answer is None else None
+        return _Entry(answer, fresh_until, stale_until, reason)
 
     async def put(self, digest: str, entry: _Entry, now: float) -> None:
         ttl_ms = math.ceil((entry.stale_until - now) * 1000)
         if ttl_ms <= 0:
             return
-        value = json.dumps(
-            {
-                "v": _ANSWER_VERSION,
-                "f": entry.fresh_until,
-                "s": entry.stale_until,
-                "a": None if entry.answer is None else dict(entry.answer.claims),
-            },
-            separators=(",", ":"),
-        )
+        stored: dict[str, Any] = {
+            "v": _ANSWER_VERSION,
+            "f": entry.fresh_until,
+            "s": entry.stale_until,
+            "a": None if entry.answer is None else dict(entry.answer.claims),
+        }
+        # Workers on 3.1.0 read the same entries and skip "r".
+        if entry.reason is not None:
+            stored["r"] = entry.reason
+        value = json.dumps(stored, separators=(",", ":"))
         await self._redis().set(self.name(digest), value, px=ttl_ms)
 
     async def delete(self, digest: str) -> None:
@@ -399,7 +440,7 @@ class KeyIntrospector:
         self.leeway = leeway
         self.stale_if_error = stale_if_error
         self.clock: Callable[[], float] = time.time
-        self._flights: dict[str, asyncio.Future[KeyAnswer | None]] = {}
+        self._flights: dict[str, asyncio.Future[_Entry]] = {}
         self._warned: OrderedDict[str, None] = OrderedDict()
         self._logged: dict[str, float] = {}
 
@@ -412,19 +453,20 @@ class KeyIntrospector:
         problem = key_problem(key)
         if problem is not None:
             raise KeyRejected(problem)
-        answer = await self._answer(key_hash(key), key)
+        entry = await self._answer(key_hash(key), key)
+        answer = entry.answer
         if answer is None:
-            raise KeyRejected(INACTIVE_REASON)
+            raise KeyRejected(entry.reason or INACTIVE_REASON)
         if answer.expires_at is not None and answer.expires_at + self.leeway < self.clock():
             raise KeyRejected("The API key has expired")
         return answer
 
-    async def _answer(self, digest: str, key: str) -> KeyAnswer | None:
+    async def _answer(self, digest: str, key: str) -> _Entry:
         if isinstance(self.answers, MemoryAnswers):
             now = self.clock()
             entry = self.answers.peek(digest, now)
             if entry is not None and now < entry.fresh_until:
-                return entry.answer
+                return entry
         flight = self._flights.get(digest)
         if flight is None:
             flight = asyncio.ensure_future(self._resolve(digest, key))
@@ -432,18 +474,18 @@ class KeyIntrospector:
             flight.add_done_callback(functools.partial(self._landed, digest))
         return await asyncio.shield(flight)
 
-    def _landed(self, digest: str, flight: asyncio.Future[KeyAnswer | None]) -> None:
+    def _landed(self, digest: str, flight: asyncio.Future[_Entry]) -> None:
         if self._flights.get(digest) is flight:
             del self._flights[digest]
         if not flight.cancelled():
             flight.exception()
 
-    async def _resolve(self, digest: str, key: str) -> KeyAnswer | None:
+    async def _resolve(self, digest: str, key: str) -> _Entry:
         entry = await self._cached(digest)
         if entry is not None and self.clock() < entry.fresh_until:
-            return entry.answer
+            return entry
         try:
-            answer, lifetime = await self._introspect(key, digest)
+            answer, lifetime, reason = await self._introspect(key, digest)
         except KeyCheckMisconfigured as exc:
             if self._should_log("misconfigured"):
                 logger.error(
@@ -461,12 +503,11 @@ class KeyIntrospector:
                         exc,
                         self.stale_if_error,
                     )
-                return entry.answer
+                return entry
             if self._should_log("outage"):
                 logger.error("microauth: API keys can't be checked right now (%s)", exc)
             raise KeyCheckUnavailable(str(exc)) from None
-        await self._store(digest, answer, lifetime)
-        return answer
+        return await self._store(digest, answer, lifetime, reason)
 
     async def _cached(self, digest: str) -> _Entry | None:
         try:
@@ -479,22 +520,26 @@ class KeyIntrospector:
                 )
             return None
 
-    async def _store(self, digest: str, answer: KeyAnswer | None, lifetime: int) -> None:
+    async def _store(
+        self, digest: str, answer: KeyAnswer | None, lifetime: int, reason: str | None
+    ) -> _Entry:
         now = self.clock()
+        fresh_until = now + max(0, lifetime)
+        stale_until = fresh_until + (self.stale_if_error if answer is not None else 0)
+        entry = _Entry(answer, fresh_until, stale_until, reason)
         try:
             if lifetime <= 0:
                 await self.answers.delete(digest)
-                return
-            fresh_until = now + lifetime
-            stale_until = fresh_until + (self.stale_if_error if answer is not None else 0)
-            await self.answers.put(digest, _Entry(answer, fresh_until, stale_until), now)
+            else:
+                await self.answers.put(digest, entry, now)
         except Exception as exc:  # noqa: BLE001 - a broken cache only costs a call to MicroAuth
             if self._should_log("cache"):
                 logger.warning(
                     "microauth: the API key cache can't be written (%s)", type(exc).__name__
                 )
+        return entry
 
-    async def _introspect(self, key: str, digest: str) -> tuple[KeyAnswer | None, int]:
+    async def _introspect(self, key: str, digest: str) -> tuple[KeyAnswer | None, int, str | None]:
         try:
             metadata = await self._issuer.metadata()
         except MicroAuthError as exc:
@@ -536,15 +581,16 @@ class KeyIntrospector:
             raise _Outage("the introspection answer has no active member")
         lifetime = cache_lifetime(response.headers.get("cache-control"))
         if document["active"] is False:
-            return None, lifetime
+            # MicroAuth explains some refusals, such as a key whose service is paused.
+            return None, lifetime, refusal_reason(document.get("reason_description"))
         try:
             answer = parse_active(document, issuer=self._issuer.issuer, resource=self._resource)
             if answer.expires_at is not None and answer.expires_at + self.leeway < self.clock():
                 raise _Refused("its exp has passed")
         except _Refused as exc:
             self._warn_once(digest, document, exc.reason)
-            return None, lifetime
-        return answer, lifetime
+            return None, lifetime, None
+        return answer, lifetime, None
 
     def _warn_once(self, digest: str, document: Mapping[str, Any], reason: str) -> None:
         if digest in self._warned:

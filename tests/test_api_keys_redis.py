@@ -113,6 +113,41 @@ def test_answers_are_shared_between_workers() -> None:
 
 
 @needs_redis
+def test_microauths_reason_for_a_paused_key_is_shared_between_workers() -> None:
+    reason = "Acme API is paused, so its API keys don't work right now."
+
+    async def main() -> None:
+        async with isolated() as (fake, client, namespace):
+            clock = Clock()
+            first, one = build(fake, clock)
+            second, two = build(fake, clock)
+            key = fake.add_key()
+            fake.introspect_edit = lambda document: {
+                "active": False,
+                "reason": "service_paused",
+                "reason_description": reason,
+            }
+            async with client_for(first) as a, client_for(second) as b:
+                for worker in (a, b):
+                    refused = await worker.get("/posts", headers=bearer(key.secret))
+                    assert refused.json()["detail"] == reason
+                assert len(fake.introspections) == 1
+                name = f"{namespace}:answer:{hashlib.sha256(key.secret.encode()).hexdigest()}"
+                stored = json.loads(await client.get(name))
+                assert stored["a"] is None
+                assert stored["r"] == reason
+                # A reason changed in Redis is checked like MicroAuth's own.
+                stored["r"] = "Bad\\reason"
+                await client.set(name, json.dumps(stored), px=60_000)
+                again = await b.get("/posts", headers=bearer(key.secret))
+                assert again.json()["detail"] == "The API key is unknown, revoked or expired"
+            await one.aclose()
+            await two.aclose()
+
+    run(main)
+
+
+@needs_redis
 def test_limits_are_shared_between_workers() -> None:
     async def main() -> None:
         async with isolated() as (fake, _, _):

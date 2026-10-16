@@ -507,6 +507,12 @@ How a key is checked:
   issuer, using the server credentials. MicroAuth answers whether the key
   works at this API, whose it is, which permissions it carries right now,
   and how many requests a minute you allow each person.
+- A key MicroAuth doesn't accept gets `401` with
+  `The API key is unknown, revoked or expired`. When MicroAuth says why,
+  as it does for a key whose service is paused, its `reason_description`
+  is the detail instead. It is treated as plain text on one line, up to 200
+  characters, and the usual sentence is used when it can't be shown safely
+  in the `WWW-Authenticate` header.
 - Answers are cached by the key's SHA-256, never the key itself, for as long
   as MicroAuth's `Cache-Control` allows: 30 seconds today and never more
   than 5 minutes. A revoked key, or a person who lost a role, stops working
