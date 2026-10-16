@@ -29,9 +29,9 @@ jobs:
       # Runs the Lua scripts against a real Redis instead of skipping them.
       MICROAUTH_TEST_REDIS_URL: redis://localhost:6379/15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
