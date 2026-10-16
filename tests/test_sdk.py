@@ -437,7 +437,7 @@ def test_nonbillable_outcomes_release_money_but_consume_quota() -> None:
                 for _ in range(3)
             ]
         assert [response.status_code for response in responses] == [200, 200, 429]
-        assert responses[2].json()["detail"] == "Monthly request quota exceeded"
+        assert responses[2].json()["detail"].startswith("Monthly request quota exceeded. ")
         await auth._reporter.flush()
         await auth.aclose()
         await control.aclose()
@@ -491,12 +491,96 @@ def test_nonbillable_outcome_does_not_release_platform_allowance() -> None:
             )
         assert first.status_code == 200
         assert second.status_code == 429
-        assert second.json()["detail"] == ("Platform monthly request allowance exhausted")
+        assert second.json()["detail"].startswith("Platform monthly request allowance exhausted. ")
         await auth._reporter.flush()
         await auth.aclose()
         await control.aclose()
 
     run(exercise())
+
+
+async def _metered(
+    plane: ControlPlane, *, calls: int, clock_ahead: float = 0.0
+) -> list[httpx.Response]:
+    """``calls`` requests with the test key, with MicroAuth's clock
+    ``clock_ahead`` seconds ahead of this host's."""
+    control = httpx.AsyncClient(transport=httpx.MockTransport(plane))
+    app = FastAPI()
+    auth = MicroAuth(app, secret_key=SECRET, http_client=control, persist_usage=False)
+    await auth._apply_snapshot(_parse_snapshot(plane.snapshot))
+    auth._started = True
+    if clock_ahead:
+        host_time = auth._clock.time
+        auth._clock.time = lambda: host_time() + clock_ahead  # type: ignore[method-assign]
+
+    @app.get("/metered")
+    async def metered(customer: Customer = Security(auth)) -> dict[str, bool]:
+        return {"ok": True}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as caller:
+        responses = [
+            await caller.get("/metered", headers={"X-API-Key": API_KEY}) for _ in range(calls)
+        ]
+    await auth.aclose()
+    await control.aclose()
+    return responses
+
+
+@pytest.mark.parametrize(
+    ("options", "detail"),
+    [
+        ({"quota": 50, "month_requests": 50}, "Monthly request quota exceeded"),
+        (
+            {"platform_limit": 1000, "platform_used": 1000},
+            "Platform monthly request allowance exhausted",
+        ),
+    ],
+)
+def test_used_up_monthly_counts_say_when_they_reset(options: dict[str, int], detail: str) -> None:
+    plane = ControlPlane(snapshot_payload(**options))
+    period_end = _parse_snapshot(plane.snapshot).platform_allowance.period_end  # type: ignore[union-attr]
+
+    [response] = run(_metered(plane, calls=1, clock_ahead=60))
+
+    assert response.status_code == 429
+    assert response.json()["detail"] == (
+        f"{detail}. It resets on {period_end:%Y-%m-%d} at 00:00 UTC"
+    )
+    # Counted on MicroAuth's clock, which runs a minute ahead here.
+    expected = max(1, period_end.timestamp() - time.time() - 60)
+    assert abs(int(response.headers["retry-after"]) - expected) <= 5
+
+
+def test_the_per_second_limit_still_says_retry_after_one_second() -> None:
+    plane = ControlPlane(snapshot_payload(rps=1, quota=50))
+
+    # Three quick requests put at least two in the same second.
+    refused = [r for r in run(_metered(plane, calls=3)) if r.status_code == 429]
+
+    assert refused
+    for response in refused:
+        assert response.json()["detail"] == "Rate limit exceeded"
+        assert response.headers["retry-after"] == "1"
+
+
+def test_quota_exceptions_raised_by_hand_work_as_before_or_with_a_reset() -> None:
+    from microauth_fastapi import PlatformAllowanceExceeded, QuotaExceeded
+
+    assert QuotaExceeded().detail == "Monthly request quota exceeded"
+    assert QuotaExceeded().headers is None
+    assert PlatformAllowanceExceeded().headers is None
+
+    reset_at = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    later = QuotaExceeded(reset_at, retry_after=0.2)
+    assert later.reset_at == reset_at
+    assert later.headers == {"Retry-After": "1"}
+    assert later.detail == "Monthly request quota exceeded. It resets on 2026-11-01 at 00:00 UTC"
+
+    soon = PlatformAllowanceExceeded(datetime.now(timezone.utc) + timedelta(seconds=90))
+    assert soon.headers is not None
+    assert 85 <= int(soon.headers["Retry-After"]) <= 90
 
 
 def test_150_concurrent_requests_report_as_one_counted_item() -> None:

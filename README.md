@@ -1026,8 +1026,8 @@ statuses. The fix column is what you, or your customer, can do about it.
 | `403` | `This account is suspended` | You suspended the customer | Reactivate the customer in the dashboard |
 | `403` | `This account is waiting for approval` | Sign ups need your approval and this customer is still waiting | Approve the customer in the dashboard |
 | `429` | `Rate limit exceeded` | More requests per second than the customer's RPS. Has `Retry-After` | Slow down, or raise the plan's RPS |
-| `429` | `Monthly request quota exceeded` | The customer used their monthly request quota | Wait for the next period or upgrade the plan |
-| `429` | `Platform monthly request allowance exhausted` | Your MicroAuth plan's monthly allowance is used up | Upgrade your MicroAuth plan |
+| `429` | `Monthly request quota exceeded. It resets on 2026-11-01 at 00:00 UTC` | The customer used their monthly request quota, which resets at the end of the calendar month in UTC. `Retry-After` is the seconds until then | Wait for the reset, or upgrade the plan |
+| `429` | `Platform monthly request allowance exhausted. It resets on 2026-11-01 at 00:00 UTC` | Your MicroAuth plan's monthly allowance is used up, or the API is paused. `Retry-After` is the seconds until the month resets, though a paused API stays paused | Upgrade your MicroAuth plan |
 | `503` | `Authorization is temporarily unavailable` | Snapshot too stale, Redis down while enforcing shared limits, or usage queue full | Check connectivity to MicroAuth and Redis. Run `python -m microauth_fastapi check` |
 
 Customers never see your MicroAuth secret or internal state in these
